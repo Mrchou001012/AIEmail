@@ -1,7 +1,8 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 
-from app.db import MailboxCursor, SessionLocal
+from app.db import MailboxCursor, MailboxDailyUsage, SessionLocal
 from app.history import reconcile_email_history
 from app.mail import GmailIMAPClient
 from app.services import ingest_raw_email
@@ -16,10 +17,23 @@ async def poll_folder_once(client: GmailIMAPClient, folder: str, direction: str)
     mailbox = settings.gmail_address
     if not mailbox or not settings.gmail_app_password:
         return 0
+    usage_date = datetime.now(UTC).date()
+    daily_limit_bytes = settings.imap_daily_download_limit_mb * 1024 * 1024
     async with SessionLocal() as session:
         cursor = await session.get(MailboxCursor, (mailbox, folder))
         last_uid = cursor.last_uid if cursor else 0
         expected_uid_validity = cursor.uid_validity if cursor else None
+        usage = await session.get(MailboxDailyUsage, (mailbox, usage_date))
+        used_bytes = usage.imap_download_bytes if usage else 0
+    remaining_bytes = max(0, daily_limit_bytes - used_bytes)
+    if remaining_bytes == 0:
+        logger.warning(
+            "IMAP daily download budget exhausted mailbox=%s used_mb=%.1f limit_mb=%s",
+            mailbox,
+            used_bytes / 1024 / 1024,
+            settings.imap_daily_download_limit_mb,
+        )
+        return 0
 
     uid_validity, highest_uid, messages = await asyncio.to_thread(
         client.fetch_after,
@@ -27,7 +41,22 @@ async def poll_folder_once(client: GmailIMAPClient, folder: str, direction: str)
         expected_uid_validity,
         folder=folder,
         limit=settings.imap_batch_size,
+        max_bytes=remaining_bytes,
     )
+    downloaded_bytes = sum(len(raw) for _, raw in messages)
+    if downloaded_bytes:
+        async with SessionLocal() as session:
+            usage = await session.get(MailboxDailyUsage, (mailbox, usage_date), with_for_update=True)
+            if usage is None:
+                usage = MailboxDailyUsage(
+                    mailbox=mailbox,
+                    usage_date=usage_date,
+                    imap_download_bytes=0,
+                )
+                session.add(usage)
+            usage.imap_download_bytes += downloaded_bytes
+            usage.updated_at = datetime.now(UTC)
+            await session.commit()
     async with SessionLocal() as session:
         cursor = await session.get(MailboxCursor, (mailbox, folder))
         if cursor is None:
@@ -86,6 +115,7 @@ async def poll_once() -> int:
     client = GmailIMAPClient(settings)
     total = 0
     succeeded = 0
+    errors: list[tuple[str, Exception]] = []
     # Sent is intentionally synchronized first so Inbox replies can resolve
     # their In-Reply-To/References chain during the same polling cycle.
     for folder, direction in (
@@ -95,7 +125,8 @@ async def poll_once() -> int:
         try:
             total += await poll_folder_once(client, folder, direction)
             succeeded += 1
-        except Exception:
+        except Exception as exc:
+            errors.append((folder, exc))
             logger.exception("IMAP folder poll failed: %s", folder)
     if succeeded == 0:
         raise RuntimeError("all configured IMAP folders failed")
@@ -108,7 +139,24 @@ async def poll_once() -> int:
             result.replies_waiting_review,
             result.no_reply_cases_paused,
         )
+    if errors:
+        failed_folders = ", ".join(folder for folder, _ in errors)
+        raise RuntimeError(f"IMAP folder polling partially failed: {failed_folders}") from errors[0][1]
     return total
+
+
+def _imap_backoff_seconds(settings, failure_count: int, exc: Exception) -> int:
+    delay = settings.imap_poll_seconds * (2 ** min(failure_count, 8))
+    messages: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        messages.append(str(current).lower())
+        current = current.__cause__
+    detail = " ".join(messages)
+    throttle_markers = ("rate limit", "too many", "throttl", "bandwidth", "4.7.28", "temporarily unavailable")
+    if any(marker in detail for marker in throttle_markers):
+        delay = max(delay, 600)
+    return min(settings.imap_max_backoff_seconds, delay)
 
 
 async def main() -> None:
@@ -120,12 +168,18 @@ async def main() -> None:
         settings.imap_sent_folder,
         settings.imap_batch_size,
     )
+    failure_count = 0
     while True:
         try:
             await poll_once()
-        except Exception:
-            logger.exception("IMAP poll failed")
-        await asyncio.sleep(settings.imap_poll_seconds)
+        except Exception as exc:
+            failure_count += 1
+            delay = _imap_backoff_seconds(settings, failure_count, exc)
+            logger.exception("IMAP poll failed; retrying in %s seconds", delay)
+        else:
+            failure_count = 0
+            delay = settings.imap_poll_seconds
+        await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":

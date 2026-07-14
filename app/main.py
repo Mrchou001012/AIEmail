@@ -14,7 +14,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     get_settings().ensure_runtime()
-    generate_templates(Path("assets/import_templates"))
+    template_dir = Path("assets/import_templates")
+    required_templates = (
+        template_dir / "customer_list_template.xlsx",
+        template_dir / "price_list_template.xlsx",
+    )
+    if not all(path.exists() for path in required_templates):
+        generate_templates(template_dir)
     yield
 
 

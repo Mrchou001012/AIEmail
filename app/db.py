@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -192,6 +193,26 @@ class MailboxCursor(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class MailboxDailyUsage(Base):
+    __tablename__ = "mailbox_daily_usage"
+    mailbox: Mapped[str] = mapped_column(String(320), primary_key=True)
+    usage_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    imap_download_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
+
+
+class MailboxThrottle(Base):
+    __tablename__ = "mailbox_throttles"
+    mailbox: Mapped[str] = mapped_column(String(320), primary_key=True)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
+
+
 class Quote(Base):
     __tablename__ = "quotes"
     __table_args__ = (UniqueConstraint("case_id", "round_number", name="uq_quote_case_round"),)
@@ -263,6 +284,7 @@ class Outbox(Base):
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_via: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 

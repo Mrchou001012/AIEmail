@@ -458,9 +458,13 @@
 
     function renderConfig(data) {
       const r = data.runtime;
+      const limits = r.rate_limits || {};
       const yesNo = (label, value) => `<span class="chip">${esc(label)} ${pill(value ? "ACTIVE" : "OFF")}</span>`;
       $("#config-row").innerHTML = [
         `<span class="chip">AI <strong>${esc(r.ai_provider)}</strong></span>`,
+        `<span class="chip">SMTP guard <strong>${esc(limits.max_sends_per_hour ?? "—")}/h · ${esc(limits.max_sends_per_day ?? "—")}/24h · ${esc(limits.min_send_interval_seconds ?? "—")}-${esc(limits.max_send_interval_seconds ?? "—")}s</strong></span>`,
+        `<span class="chip">IMAP guard <strong>${esc(limits.imap_poll_seconds ?? "—")}s · ${esc(limits.imap_batch_size ?? "—")}/batch · ${esc(limits.imap_downloaded_today_mb ?? 0)}/${esc(limits.imap_daily_download_limit_mb ?? "—")}MB</strong></span>`,
+        limits.cooldown_until ? `<span class="chip">Gmail cooldown ${pill("PAUSED")} until ${esc(fmt(limits.cooldown_until))}</span>` : `<span class="chip">Gmail cooldown ${pill("OFF")}</span>`,
         `<span class="chip">发件方式 <strong>${esc(r.mail_transport)}</strong></span>`,
         `<span class="chip">钉钉 <strong>${esc(r.dingtalk_transport)}</strong></span>`,
         yesNo("Gmail 凭据", r.credentials.gmail),

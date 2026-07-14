@@ -1,4 +1,5 @@
 import hashlib
+import smtplib
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email.message import EmailMessage as MIMEMessage
@@ -13,10 +14,13 @@ from app.db import (
     AuditEvent,
     CaseStage,
     CaseStatus,
+    DeliveryStatus,
     EmailMessage,
     Handoff,
     Job,
     MailboxCursor,
+    MailboxDailyUsage,
+    MailboxThrottle,
     Outbox,
     Quote,
     SalesCase,
@@ -33,8 +37,9 @@ from app.services import (
     ingest_raw_email,
     process_inbound,
     seed_demo_data,
+    send_one_outbox,
 )
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -365,10 +370,11 @@ async def test_imap_cursor_marks_initial_batch_as_history_and_later_mail_as_live
     class FakeClient:
         calls = 0
 
-        def fetch_after(self, last_uid, expected_uid_validity, *, folder, limit):
+        def fetch_after(self, last_uid, expected_uid_validity, *, folder, limit, max_bytes):
             self.calls += 1
             assert folder == "[Gmail]/Sent Mail"
             assert limit == settings.imap_batch_size
+            assert max_bytes <= settings.imap_daily_download_limit_mb * 1024 * 1024
             if self.calls == 1:
                 assert last_uid == 0
                 return 99, 2, [(1, raw_message(1)), (2, raw_message(2))]
@@ -395,6 +401,129 @@ async def test_imap_cursor_marks_initial_batch_as_history_and_later_mail_as_live
         assert cursor.last_uid == 3
         assert cursor.history_cutoff_uid == 2
         assert cursor.history_complete is True
+        usage = await db_session.get(
+            MailboxDailyUsage,
+            ("sales-agent@example.com", datetime.now(UTC).date()),
+        )
+        assert usage is not None
+        assert usage.imap_download_bytes == sum(len(raw_message(number)) for number in (1, 2, 3))
     finally:
         settings.gmail_address = original_address
         settings.gmail_app_password = original_password
+
+
+async def test_mailbox_sent_history_enforces_spacing_without_calling_smtp(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    now = datetime.now(UTC)
+    db_session.add(
+        EmailMessage(
+            direction="OUTBOUND",
+            mailbox="sales-agent@example.com",
+            mailbox_folder="[Gmail]/Sent Mail",
+            message_id="<manual-send@example.com>",
+            from_address="sales-agent@example.com",
+            to_addresses=["buyer@example.com"],
+            subject="Manual send",
+            body_text="Manual send",
+            raw_sha256=hashlib.sha256(b"manual-send").hexdigest(),
+            received_at=now - timedelta(seconds=30),
+        )
+    )
+    pending = Outbox(
+        business_key="spacing-test",
+        message_id="<spacing-test@example.com>",
+        recipient="buyer@example.com",
+        raw_message="Subject: spacing\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=now - timedelta(seconds=1),
+    )
+    db_session.add(pending)
+    await db_session.commit()
+    monkeypatch.setattr("app.services.transport_for", lambda settings: pytest.fail("SMTP must not be called"))
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        gmail_address="sales-agent@example.com",
+        gmail_app_password="test-only",
+        min_send_interval_seconds=120,
+        send_interval_jitter_seconds=0,
+        max_sends_per_hour=5,
+        max_sends_per_day=20,
+    )
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(pending)
+
+    assert pending.status == DeliveryStatus.PENDING
+    assert pending.attempts == 0
+    assert pending.last_error == "mailbox-wide send spacing deferred message"
+    assert pending.available_at >= now + timedelta(seconds=89)
+
+
+async def test_gmail_rate_error_sets_durable_mailbox_cooldown(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    class RateLimitedTransport:
+        def send(self, raw_message, message_id, recipient):
+            nonlocal calls
+            calls += 1
+            raise smtplib.SMTPDataError(421, b"4.7.28 Rate limit exceeded")
+
+    monkeypatch.setattr("app.services.transport_for", lambda settings: RateLimitedTransport())
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        gmail_address="sales-agent@example.com",
+        gmail_app_password="test-only",
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+        max_sends_per_hour=5,
+        max_sends_per_day=20,
+        gmail_transient_cooldown_seconds=600,
+    )
+    first = Outbox(
+        business_key="cooldown-first",
+        message_id="<cooldown-first@example.com>",
+        recipient="buyer@example.com",
+        raw_message="Subject: first\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(first)
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(first)
+    throttle = await db_session.get(MailboxThrottle, "sales-agent@example.com")
+
+    assert calls == 1
+    assert first.status == DeliveryStatus.PENDING
+    assert first.attempts == 0
+    assert throttle is not None
+    assert throttle.cooldown_until >= datetime.now(UTC) + timedelta(minutes=9)
+
+    second = Outbox(
+        business_key="cooldown-second",
+        message_id="<cooldown-second@example.com>",
+        recipient="buyer@example.com",
+        raw_message="Subject: second\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(second)
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(second)
+    assert calls == 1
+    assert second.status == DeliveryStatus.PENDING
+    assert second.available_at == throttle.cooldown_until

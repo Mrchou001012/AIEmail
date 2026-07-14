@@ -103,6 +103,42 @@ def test_imap_fetch_returns_sequential_partial_batch_after_retries(monkeypatch) 
     assert len(clients) == 3
 
 
+def test_imap_fetch_stops_after_download_budget(monkeypatch) -> None:
+    class FakeIMAP:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def login(self, address, password):
+            return "OK", []
+
+        def select(self, folder, readonly):
+            return "OK", [b"3"]
+
+        def response(self, name):
+            return name, [b"77"]
+
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"1 2 3"]
+            uid = args[0]
+            return "OK", [(b"RFC822", b"12345" + uid)]
+
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr("app.mail.imaplib.IMAP4_SSL", FakeIMAP)
+    settings = Settings(
+        _env_file=None,
+        gmail_address="sales@example.com",
+        gmail_app_password="app-password",
+    )
+
+    _, highest_uid, messages = GmailIMAPClient(settings).fetch_after(0, limit=100, max_bytes=10)
+
+    assert highest_uid == 3
+    assert messages == [(1, b"123451"), (2, b"123452")]
+
+
 def test_mime_prefers_plain_and_records_attachment() -> None:
     message = EmailMessage()
     message["From"] = "Buyer <buyer@example.com>"

@@ -326,6 +326,7 @@ class GmailIMAPClient:
         *,
         folder: str | None = None,
         limit: int | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[int, int, list[tuple[int, bytes]]]:
         if not self.settings.gmail_address or not self.settings.gmail_app_password:
             return 0, 0, []
@@ -341,6 +342,7 @@ class GmailIMAPClient:
             available_uids = data[0].split() if data and data[0] else []
             highest_uid = max((int(item) for item in available_uids), default=search_after)
             result: list[tuple[int, bytes]] = []
+            downloaded_bytes = 0
             for uid_bytes in available_uids[:batch_limit]:
                 last_error: Exception | None = None
                 for attempt in range(3):
@@ -358,6 +360,7 @@ class GmailIMAPClient:
                         if not isinstance(raw_message, bytes):
                             raise imaplib.IMAP4.abort(f"missing RFC822 body for UID {uid_bytes!r}")
                         result.append((int(uid_bytes), raw_message))
+                        downloaded_bytes += len(raw_message)
                         last_error = None
                         break
                     except (imaplib.IMAP4.abort, OSError, ssl.SSLError) as exc:
@@ -375,6 +378,8 @@ class GmailIMAPClient:
                         uid_bytes.decode(errors="replace"),
                         len(result),
                     )
+                    break
+                if max_bytes is not None and downloaded_bytes >= max_bytes:
                     break
             return uid_validity, highest_uid, result
         finally:

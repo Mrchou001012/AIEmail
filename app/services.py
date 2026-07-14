@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import logging
 import smtplib
@@ -7,7 +8,7 @@ from decimal import Decimal
 from email.utils import parseaddr
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -25,6 +26,7 @@ from app.db import (
     Handoff,
     Job,
     JobStatus,
+    MailboxThrottle,
     Outbox,
     PricePolicy,
     Product,
@@ -962,9 +964,93 @@ async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
         await session.commit()
 
 
+def _message_activity_key(source: str, row_id: int, message_id: str | None) -> str:
+    normalized = (message_id or "").strip().lower()
+    return f"message-id:{normalized}" if normalized else f"{source}:{row_id}"
+
+
+async def _mailbox_sent_events_since(
+    session: AsyncSession,
+    mailbox: str,
+    since: datetime,
+    until: datetime,
+) -> dict[str, datetime]:
+    events: dict[str, datetime] = {}
+    email_rows = await session.execute(
+        select(EmailMessage.id, EmailMessage.message_id, EmailMessage.received_at).where(
+            EmailMessage.mailbox == mailbox,
+            EmailMessage.direction == "OUTBOUND",
+            EmailMessage.received_at >= since,
+            EmailMessage.received_at <= until,
+        )
+    )
+    for row_id, message_id, occurred_at in email_rows:
+        key = _message_activity_key("email", row_id, message_id)
+        events[key] = max(events.get(key, occurred_at), occurred_at)
+
+    outbox_rows = await session.execute(
+        select(Outbox.id, Outbox.message_id, Outbox.sent_at).where(
+            Outbox.sent_via == "smtp",
+            Outbox.sent_at >= since,
+            Outbox.sent_at <= until,
+        )
+    )
+    for row_id, message_id, sent_at in outbox_rows:
+        if sent_at is None:
+            continue
+        key = _message_activity_key("outbox", row_id, message_id)
+        events[key] = max(events.get(key, sent_at), sent_at)
+    return events
+
+
+def _send_interval_seconds(settings: Settings, message_id: str) -> int:
+    if settings.send_interval_jitter_seconds == 0:
+        return settings.min_send_interval_seconds
+    digest = hashlib.sha256(message_id.encode("utf-8")).digest()
+    jitter = int.from_bytes(digest[:4], "big") % (settings.send_interval_jitter_seconds + 1)
+    return settings.min_send_interval_seconds + jitter
+
+
+def _smtp_rate_limit_cooldown_seconds(exc: smtplib.SMTPResponseException, settings: Settings) -> int | None:
+    detail = exc.smtp_error.decode(errors="replace") if isinstance(exc.smtp_error, bytes) else str(exc.smtp_error)
+    normalized = detail.lower()
+    daily_markers = ("5.4.5", "daily user sending limit", "daily smtp", "daily limit")
+    rate_markers = ("4.7.28", "rate limit", "too many", "quota", "temporarily deferred")
+    if any(marker in normalized for marker in daily_markers):
+        return settings.gmail_daily_cooldown_seconds
+    if exc.smtp_code in {550, 554} and ("limit" in normalized or "quota" in normalized):
+        return settings.gmail_daily_cooldown_seconds
+    if 400 <= exc.smtp_code < 500 or any(marker in normalized for marker in rate_markers):
+        return settings.gmail_transient_cooldown_seconds
+    return None
+
+
+async def _set_mailbox_cooldown(
+    session: AsyncSession,
+    mailbox: str,
+    cooldown_until: datetime,
+    reason: str,
+) -> None:
+    throttle = await session.get(MailboxThrottle, mailbox, with_for_update=True)
+    if throttle is None:
+        session.add(
+            MailboxThrottle(
+                mailbox=mailbox,
+                cooldown_until=cooldown_until,
+                reason=reason,
+            )
+        )
+        return
+    if throttle.cooldown_until is None or throttle.cooldown_until < cooldown_until:
+        throttle.cooldown_until = cooldown_until
+        throttle.reason = reason
+    throttle.updated_at = datetime.now(UTC)
+
+
 async def send_one_outbox(session: AsyncSession, settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
-    stale_before = datetime.now(UTC) - timedelta(seconds=settings.outbox_lease_seconds)
+    now = datetime.now(UTC)
+    stale_before = now - timedelta(seconds=settings.outbox_lease_seconds)
     row = await session.scalar(
         select(Outbox)
         .where(
@@ -972,7 +1058,7 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
                 Outbox.status.in_([DeliveryStatus.PENDING, DeliveryStatus.FAILED]),
                 and_(Outbox.status == DeliveryStatus.CLAIMED, Outbox.locked_at < stale_before),
             ),
-            Outbox.available_at <= datetime.now(UTC),
+            Outbox.available_at <= now,
         )
         .order_by(Outbox.id)
         .with_for_update(skip_locked=True)
@@ -998,10 +1084,15 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
         row.last_error = "stale SMTP claim requires Sent-folder reconciliation"
         await session.commit()
         return True
-    row.status = DeliveryStatus.CLAIMED
-    row.locked_at = datetime.now(UTC)
-    row.attempts += 1
-    await session.commit()
+    mailbox = (settings.gmail_address or parseaddr(settings.mail_from)[1]).lower()
+    if settings.mail_transport == "smtp":
+        throttle = await session.get(MailboxThrottle, mailbox)
+        if throttle and throttle.cooldown_until and throttle.cooldown_until > now:
+            row.status = DeliveryStatus.PENDING
+            row.available_at = throttle.cooldown_until
+            row.last_error = f"mailbox cooldown active: {throttle.reason or 'Gmail rate limit'}"[:2000]
+            await session.commit()
+            return True
     if row.case_id:
         case = await session.scalar(
             select(SalesCase)
@@ -1042,21 +1133,40 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
             row.last_error = "AUTO_SEND_ENABLED is false"
             await session.commit()
             return True
-        since_hour = datetime.now(UTC) - timedelta(hours=1)
-        since_day = datetime.now(UTC) - timedelta(days=1)
-        hourly = await session.scalar(select(func.count()).select_from(Outbox).where(Outbox.sent_at >= since_hour))
-        daily = await session.scalar(select(func.count()).select_from(Outbox).where(Outbox.sent_at >= since_day))
-        if int(hourly or 0) >= settings.max_sends_per_hour or int(daily or 0) >= settings.max_sends_per_day:
+        since_hour = now - timedelta(hours=1)
+        since_day = now - timedelta(days=1)
+        sent_events = await _mailbox_sent_events_since(session, mailbox, since_day, now)
+        hourly_events = {key: value for key, value in sent_events.items() if value >= since_hour}
+        if len(hourly_events) >= settings.max_sends_per_hour:
             row.status = DeliveryStatus.PENDING
-            row.attempts = max(0, row.attempts - 1)
-            row.available_at = datetime.now(UTC) + timedelta(hours=1)
-            row.last_error = "send rate limit deferred message"
+            row.available_at = min(hourly_events.values()) + timedelta(hours=1)
+            row.last_error = "mailbox-wide hourly send limit deferred message"
             await session.commit()
             return True
+        if len(sent_events) >= settings.max_sends_per_day:
+            row.status = DeliveryStatus.PENDING
+            row.available_at = min(sent_events.values()) + timedelta(days=1)
+            row.last_error = "mailbox-wide rolling 24-hour send limit deferred message"
+            await session.commit()
+            return True
+        if sent_events:
+            last_sent_at = max(sent_events.values())
+            next_send_at = last_sent_at + timedelta(seconds=_send_interval_seconds(settings, row.message_id))
+            if next_send_at > now:
+                row.status = DeliveryStatus.PENDING
+                row.available_at = next_send_at
+                row.last_error = "mailbox-wide send spacing deferred message"
+                await session.commit()
+                return True
+    row.status = DeliveryStatus.CLAIMED
+    row.locked_at = datetime.now(UTC)
+    row.attempts += 1
+    await session.commit()
     try:
         transport_for(settings).send(row.raw_message, row.message_id, row.recipient)
         row.status = DeliveryStatus.SENT
         row.sent_at = datetime.now(UTC)
+        row.sent_via = settings.mail_transport
         row.last_error = None
         await audit(
             session,
@@ -1068,6 +1178,28 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
     except (smtplib.SMTPServerDisconnected, ConnectionResetError, TimeoutError) as exc:
         row.status = DeliveryStatus.UNKNOWN
         row.last_error = f"ambiguous transport outcome: {exc}"
+    except smtplib.SMTPResponseException as exc:
+        cooldown_seconds = _smtp_rate_limit_cooldown_seconds(exc, settings)
+        detail = exc.smtp_error.decode(errors="replace") if isinstance(exc.smtp_error, bytes) else str(exc.smtp_error)
+        if cooldown_seconds is None:
+            row.status = DeliveryStatus.FAILED
+            row.last_error = f"SMTP {exc.smtp_code}: {detail}"[:2000]
+            row.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**row.attempts))
+        else:
+            cooldown_until = datetime.now(UTC) + timedelta(seconds=cooldown_seconds)
+            reason = f"Gmail SMTP {exc.smtp_code}: {detail}"[:2000]
+            await _set_mailbox_cooldown(session, mailbox, cooldown_until, reason)
+            row.status = DeliveryStatus.PENDING
+            row.attempts = max(0, row.attempts - 1)
+            row.available_at = cooldown_until
+            row.last_error = reason
+            await audit(
+                session,
+                "outbox.gmail_cooldown",
+                case_id=row.case_id,
+                actor="smtp",
+                data={"outbox_id": row.id, "smtp_code": exc.smtp_code, "cooldown_seconds": cooldown_seconds},
+            )
     except Exception as exc:
         row.status = DeliveryStatus.FAILED
         row.last_error = str(exc)[:2000]
@@ -1104,6 +1236,7 @@ async def reconcile_unknown_outbox(session: AsyncSession, settings: Settings | N
     if found:
         row.status = DeliveryStatus.SENT
         row.sent_at = datetime.now(UTC)
+        row.sent_via = "smtp"
         row.last_error = None
         await audit(
             session,

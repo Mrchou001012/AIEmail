@@ -24,8 +24,10 @@ class Settings(BaseSettings):
     imap_sync_enabled: bool = False
     imap_folder: str = "INBOX"
     imap_sent_folder: str = "[Gmail]/Sent Mail"
-    imap_poll_seconds: int = 20
-    imap_batch_size: int = 100
+    imap_poll_seconds: int = 60
+    imap_batch_size: int = 50
+    imap_daily_download_limit_mb: int = 1500
+    imap_max_backoff_seconds: int = 1800
     job_lease_seconds: int = 900
     outbox_lease_seconds: int = 600
     smtp_host: str = "smtp.gmail.com"
@@ -38,8 +40,12 @@ class Settings(BaseSettings):
     safe_mode: bool = True
     auto_send_enabled: bool = False
     recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
-    max_sends_per_hour: int = 10
-    max_sends_per_day: int = 30
+    max_sends_per_hour: int = 5
+    max_sends_per_day: int = 20
+    min_send_interval_seconds: int = 120
+    send_interval_jitter_seconds: int = 180
+    gmail_transient_cooldown_seconds: int = 600
+    gmail_daily_cooldown_seconds: int = 86400
 
     admin_username: str = "admin"
     admin_password: str = "change-me-locally"
@@ -82,6 +88,28 @@ class Settings(BaseSettings):
     def valid_imap_batch_size(cls, value: int) -> int:
         if not 1 <= value <= 1000:
             raise ValueError("IMAP_BATCH_SIZE must be between 1 and 1000")
+        return value
+
+    @field_validator(
+        "imap_poll_seconds",
+        "imap_daily_download_limit_mb",
+        "imap_max_backoff_seconds",
+        "max_sends_per_hour",
+        "max_sends_per_day",
+        "gmail_transient_cooldown_seconds",
+        "gmail_daily_cooldown_seconds",
+    )
+    @classmethod
+    def positive_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("rate and bandwidth limits must be positive")
+        return value
+
+    @field_validator("min_send_interval_seconds", "send_interval_jitter_seconds")
+    @classmethod
+    def nonnegative_interval(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("send intervals cannot be negative")
         return value
 
     def ensure_runtime(self) -> None:

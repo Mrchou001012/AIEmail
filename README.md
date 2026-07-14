@@ -131,12 +131,23 @@ GMAIL_APP_PASSWORD=...
 IMAP_SYNC_ENABLED=false
 IMAP_FOLDER=INBOX
 IMAP_SENT_FOLDER=[Gmail]/Sent Mail
-IMAP_BATCH_SIZE=100
+IMAP_POLL_SECONDS=60
+IMAP_BATCH_SIZE=50
+IMAP_DAILY_DOWNLOAD_LIMIT_MB=1500
+IMAP_MAX_BACKOFF_SECONDS=1800
 MAIL_FROM=...
 MAIL_TRANSPORT=file
+MAX_SENDS_PER_HOUR=5
+MAX_SENDS_PER_DAY=20
+MIN_SEND_INTERVAL_SECONDS=120
+SEND_INTERVAL_JITTER_SECONDS=180
+GMAIL_TRANSIENT_COOLDOWN_SECONDS=600
+GMAIL_DAILY_COOLDOWN_SECONDS=86400
 DINGTALK_TRANSPORT=log
 DINGTALK_WEBHOOK_URL=...
 ```
+
+The mailbox guards are deliberately below Gmail's published hard limits. IMAP is single-connection, UID-incremental, byte-metered per UTC day, and exponentially backs off on failures. SMTP sends are spaced by a stable 2-5 minute interval and capped across the entire mailbox by combining synchronized Gmail Sent history with local SMTP delivery records. Gmail transient throttling pauses the whole mailbox for at least 10 minutes; a daily-limit response pauses it for 24 hours. The dashboard shows the active limits, today's IMAP usage, and any mailbox cooldown.
 
 ### Existing Gmail/OpenClaw history
 

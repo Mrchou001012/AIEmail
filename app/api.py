@@ -22,6 +22,8 @@ from app.db import (
     Handoff,
     Job,
     MailboxCursor,
+    MailboxDailyUsage,
+    MailboxThrottle,
     Outbox,
     Product,
     Quote,
@@ -214,6 +216,11 @@ async def dashboard_data(
     ai_failure_count = await session.scalar(
         select(func.count()).select_from(AIInvocation).where(AIInvocation.success.is_(False))
     )
+    mailbox_usage = None
+    mailbox_throttle = None
+    if settings.gmail_address:
+        mailbox_usage = await session.get(MailboxDailyUsage, (settings.gmail_address, now.date()))
+        mailbox_throttle = await session.get(MailboxThrottle, settings.gmail_address.lower())
 
     return {
         "generated_at": now.isoformat(),
@@ -225,6 +232,27 @@ async def dashboard_data(
             "safe_mode": settings.safe_mode,
             "auto_send_enabled": settings.auto_send_enabled,
             "imap_sync_enabled": settings.imap_sync_enabled,
+            "rate_limits": {
+                "max_sends_per_hour": settings.max_sends_per_hour,
+                "max_sends_per_day": settings.max_sends_per_day,
+                "min_send_interval_seconds": settings.min_send_interval_seconds,
+                "max_send_interval_seconds": (
+                    settings.min_send_interval_seconds + settings.send_interval_jitter_seconds
+                ),
+                "imap_poll_seconds": settings.imap_poll_seconds,
+                "imap_batch_size": settings.imap_batch_size,
+                "imap_daily_download_limit_mb": settings.imap_daily_download_limit_mb,
+                "imap_downloaded_today_mb": round(
+                    (mailbox_usage.imap_download_bytes if mailbox_usage else 0) / 1024 / 1024,
+                    2,
+                ),
+                "cooldown_until": (
+                    mailbox_throttle.cooldown_until.isoformat()
+                    if mailbox_throttle and mailbox_throttle.cooldown_until
+                    else None
+                ),
+                "cooldown_reason": mailbox_throttle.reason if mailbox_throttle else None,
+            },
             "credentials": {
                 "ai": bool(settings.anthropic_api_key),
                 "gmail": bool(settings.gmail_address and settings.gmail_app_password),
