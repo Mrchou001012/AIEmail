@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-sales-agent"
+version = "0.1.0"
+description = "Bounded AI sales email and deterministic quoting MVP"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "sqlalchemy[asyncio]>=2.0.36,<3",
+  "asyncpg>=0.30,<1",
+  "psycopg[binary]>=3.2,<4",
+  "alembic>=1.14,<2",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "anthropic>=0.116,<1",
+  "openpyxl>=3.1.5,<4",
+  "PyYAML>=6.0.2,<7",
+  "Jinja2>=3.1.5,<4",
+  "email-validator>=2.2,<3",
+  "python-multipart>=0.0.20,<1",
+  "httpx>=0.28,<1",
+  "beautifulsoup4>=4.12,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "integration: requires a dedicated PostgreSQL database whose name ends with _test",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008", "UP042"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+check_untyped_defs = true
+ignore_missing_imports = true

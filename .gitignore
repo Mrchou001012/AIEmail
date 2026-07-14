@@ -1,0 +1,48 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+credentials*.json
+token*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python and editor state
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.agents/
+.codegraph/
+
+# Runtime mail, logs, generated messages, and local databases
+runtime/*
+!runtime/.gitkeep
+postgres_data/
+*.log
+*.db
+*.sqlite3
+
+# Customer/business data is local by default. Keep only committed demo fixtures.
+*.eml
+!assets/demo_counteroffer.eml
+!assets/demo_sample_request.eml
+*.xls
+*.xlsx
+*.csv
+*.tsv
+!assets/import_templates/customer_list_template.xlsx
+!assets/import_templates/price_list_template.xlsx
+
+# Other local tooling
+node_modules/
+.DS_Store

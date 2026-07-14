@@ -1,0 +1,434 @@
+import csv
+import hashlib
+import re
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+import yaml
+from email_validator import EmailNotValidError, validate_email
+from openpyxl import Workbook, load_workbook
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import CaseStatus, Contact, Customer, PricePolicy, Product, SalesCase
+from app.history import reconcile_email_history
+from app.settings import get_settings
+
+CUSTOMER_HEADERS = [
+    "company_name",
+    "contact_name",
+    "email",
+    "language",
+    "product_code",
+    "currency",
+    "auto_send_allowed",
+    "consent_basis",
+    "do_not_contact",
+]
+PRICE_HEADERS = [
+    "product_code",
+    "product_name",
+    "approved_text_key",
+    "currency",
+    "unit",
+    "standard_price",
+    "absolute_floor",
+    "max_discount_pct",
+    "max_negotiation_rounds",
+    "concession_step_pct",
+    "min_quantity",
+    "max_quantity",
+    "quote_valid_days",
+    "standard_incoterm",
+    "allowed_incoterms",
+    "standard_payment_term",
+    "allowed_payment_terms",
+    "valid_from",
+    "valid_to",
+]
+
+
+@dataclass
+class ImportResult:
+    source_hash: str
+    total_rows: int = 0
+    valid_rows: int = 0
+    applied_rows: int = 0
+    errors: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+@dataclass(frozen=True)
+class ContentBundle:
+    company_profile: str
+    product_snippets: dict[str, str]
+    compliance_snippets: dict[str, str]
+    signature_text: str
+    signature_html: str
+
+
+def load_content(content_dir: Path) -> ContentBundle:
+    return ContentBundle(
+        company_profile=(content_dir / "company_profile.md").read_text(encoding="utf-8"),
+        product_snippets=yaml.safe_load((content_dir / "approved_product_text.yaml").read_text(encoding="utf-8")),
+        compliance_snippets=yaml.safe_load((content_dir / "compliance_whitelist.yaml").read_text(encoding="utf-8")),
+        signature_text=(content_dir / "email_signature.txt").read_text(encoding="utf-8"),
+        signature_html=(content_dir / "email_signature.html").read_text(encoding="utf-8"),
+    )
+
+
+def generate_templates(target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    customer = Workbook()
+    ws = customer.active
+    ws.title = "customers"
+    ws.append(CUSTOMER_HEADERS)
+    ws.append(
+        [
+            "Demo Industrial Ltd",
+            "Alex Buyer",
+            "buyer@example.com",
+            "en",
+            "WIDGET-100",
+            "USD",
+            False,
+            "existing business relationship",
+            False,
+        ]
+    )
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:I2"
+    customer.save(target_dir / "customer_list_template.xlsx")
+
+    prices = Workbook()
+    ws = prices.active
+    ws.title = "prices"
+    ws.append(PRICE_HEADERS)
+    ws.append(
+        [
+            "WIDGET-100",
+            "Industrial Widget 100",
+            "widget_100",
+            "USD",
+            "piece",
+            "100.00",
+            "82.00",
+            "0.15",
+            2,
+            "0.03",
+            10,
+            10000,
+            30,
+            "EXW",
+            "EXW,FCA,FOB",
+            "100% before shipment",
+            "100% before shipment,30% deposit / 70% before shipment",
+            date.today(),
+            None,
+        ]
+    )
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:S2"
+    prices.save(target_dir / "price_list_template.xlsx")
+
+
+def _hash_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle) if any(value not in {None, ""} for value in row.values())]
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    ws = workbook.active
+    values = list(ws.iter_rows(values_only=True))
+    if not values:
+        return []
+    headers = [str(value).strip() if value is not None else "" for value in values[0]]
+    return [dict(zip(headers, row, strict=False)) for row in values[1:] if any(v is not None for v in row)]
+
+
+def _bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _date(value: Any) -> date | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+async def import_customers(path: Path, session: AsyncSession, apply: bool = False) -> ImportResult:
+    rows = _rows(path)
+    result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
+    parsed: list[dict[str, Any]] = []
+    for number, row in enumerate(rows, start=2):
+        errors: list[str] = []
+        company = str(row.get("company_name") or "").strip()
+        name = str(row.get("contact_name") or "").strip()
+        product_code = str(row.get("product_code") or "").strip().upper()
+        currency = str(row.get("currency") or "USD").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            errors.append("currency must be a three-letter code")
+        try:
+            address = validate_email(str(row.get("email") or ""), check_deliverability=False).normalized
+        except EmailNotValidError as exc:
+            errors.append(f"invalid email: {exc}")
+            address = ""
+        product = await session.scalar(select(Product).where(Product.code == product_code, Product.active.is_(True)))
+        if not company:
+            errors.append("company_name is required")
+        if not name:
+            errors.append("contact_name is required")
+        if product is None:
+            errors.append(f"missing or inactive product: {product_code}")
+        else:
+            today = date.today()
+            policy = await session.scalar(
+                select(PricePolicy.id).where(
+                    PricePolicy.product_id == product.id,
+                    PricePolicy.currency == currency,
+                    PricePolicy.active.is_(True),
+                    PricePolicy.valid_from <= today,
+                    or_(PricePolicy.valid_to.is_(None), PricePolicy.valid_to >= today),
+                )
+            )
+            if policy is None:
+                errors.append(f"no active {currency} price policy for product: {product_code}")
+        if errors:
+            result.errors.append({"row": number, "errors": errors})
+            continue
+        parsed.append({**row, "email": address, "product": product, "company": company, "name": name})
+    result.valid_rows = len(parsed)
+    if apply and result.ok:
+        for row in parsed:
+            customer = await session.scalar(select(Customer).where(Customer.company_name == row["company"]))
+            row_auto_send = _bool(row.get("auto_send_allowed"))
+            row_do_not_contact = _bool(row.get("do_not_contact"))
+            row_consent = str(row.get("consent_basis") or "") or None
+            if customer is None:
+                customer = Customer(
+                    company_name=row["company"],
+                    auto_send_allowed=row_auto_send,
+                    consent_basis=row_consent,
+                    do_not_contact=row_do_not_contact,
+                )
+                session.add(customer)
+                await session.flush()
+            else:
+                # Merge repeated company rows conservatively: any suppression wins,
+                # and every row must explicitly allow automation.
+                customer.auto_send_allowed = customer.auto_send_allowed and row_auto_send
+                customer.do_not_contact = customer.do_not_contact or row_do_not_contact
+                customer.consent_basis = customer.consent_basis or row_consent
+            customer.language = str(row.get("language") or "en")
+            contact = await session.scalar(select(Contact).where(Contact.customer_id == customer.id, Contact.email == row["email"]))
+            if contact is None:
+                contact = Contact(
+                    customer_id=customer.id,
+                    name=row["name"],
+                    email=row["email"],
+                    language=str(row.get("language") or "en"),
+                )
+                session.add(contact)
+                await session.flush()
+            else:
+                contact.name = row["name"]
+                contact.language = str(row.get("language") or "en")
+            currency = str(row.get("currency") or "USD").strip().upper()
+            sales_case = await session.scalar(
+                select(SalesCase).where(
+                    SalesCase.customer_id == customer.id,
+                    SalesCase.contact_id == contact.id,
+                    SalesCase.product_id == row["product"].id,
+                    SalesCase.currency == currency,
+                    SalesCase.status.in_(
+                        [
+                            CaseStatus.ACTIVE,
+                            CaseStatus.WAITING_HUMAN,
+                            CaseStatus.PAUSED,
+                            CaseStatus.HUMAN_TAKEOVER,
+                        ]
+                    ),
+                )
+            )
+            if sales_case is None:
+                session.add(
+                    SalesCase(
+                        customer_id=customer.id,
+                        contact_id=contact.id,
+                        product_id=row["product"].id,
+                        currency=currency,
+                        subject_key=f"{row['product'].name} quotation".lower(),
+                    )
+                )
+            result.applied_rows += 1
+        await session.commit()
+        await reconcile_email_history(session)
+    return result
+
+
+async def import_prices(path: Path, session: AsyncSession, apply: bool = False) -> ImportResult:
+    rows = _rows(path)
+    result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
+    content = load_content(get_settings().content_dir)
+    parsed: list[dict[str, Any]] = []
+    for number, row in enumerate(rows, start=2):
+        errors: list[str] = []
+        code = str(row.get("product_code") or "").strip().upper()
+        currency = str(row.get("currency") or "").strip().upper()
+        approved_text_key = str(row.get("approved_text_key") or code.lower().replace("-", "_")).strip()
+        if not approved_text_key or not str(content.product_snippets.get(approved_text_key) or "").strip():
+            errors.append(f"approved product text is missing for key: {approved_text_key or '<empty>'}")
+        try:
+            standard = Decimal(str(row.get("standard_price")))
+            floor = Decimal(str(row.get("absolute_floor")))
+            max_discount = Decimal(str(row.get("max_discount_pct") or "0"))
+            concession = Decimal(str(row.get("concession_step_pct") or "0"))
+        except (InvalidOperation, TypeError):
+            errors.append("price and percentage fields must be decimals")
+            standard = floor = max_discount = concession = Decimal("0")
+        try:
+            valid_from = _date(row.get("valid_from")) or date.today()
+            valid_to = _date(row.get("valid_to"))
+        except ValueError:
+            errors.append("valid_from and valid_to must be ISO dates")
+            valid_from = date.today()
+            valid_to = None
+        try:
+            max_rounds = int(row.get("max_negotiation_rounds") or 2)
+            min_quantity = int(row.get("min_quantity") or 1)
+            max_quantity = int(row["max_quantity"]) if row.get("max_quantity") else None
+            quote_valid_days = int(row.get("quote_valid_days") or 30)
+            if max_rounds < 0 or min_quantity < 1 or quote_valid_days < 1:
+                raise ValueError
+            if max_quantity is not None and max_quantity < min_quantity:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append("round, quantity, and validity fields must be valid positive integers")
+            max_rounds, min_quantity, max_quantity, quote_valid_days = 2, 1, None, 30
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            errors.append("currency must be a three-letter code")
+        if standard <= 0 or floor <= 0 or floor > standard:
+            errors.append("prices must be positive and floor cannot exceed standard price")
+        if not Decimal("0") <= max_discount < Decimal("1"):
+            errors.append("max_discount_pct must be between 0 and 1")
+        if valid_to and valid_to < valid_from:
+            errors.append("valid_to cannot precede valid_from")
+        product = await session.scalar(select(Product).where(Product.code == code))
+        if product is None and not str(row.get("product_name") or "").strip():
+            errors.append("new product requires product_name")
+        if product is not None and product.approved_text_key != approved_text_key:
+            errors.append(
+                f"approved_text_key must match existing product key: {product.approved_text_key}"
+            )
+        if product is not None:
+            overlap = await session.scalar(
+                select(PricePolicy.id).where(
+                    PricePolicy.product_id == product.id,
+                    PricePolicy.currency == currency,
+                    PricePolicy.active.is_(True),
+                    or_(PricePolicy.valid_to.is_(None), PricePolicy.valid_to >= valid_from),
+                    True if valid_to is None else PricePolicy.valid_from <= valid_to,
+                )
+            )
+            if overlap:
+                errors.append("overlapping active price policy")
+        for prior in parsed:
+            if prior["code"] == code and (
+                prior["product_name_value"] != str(row.get("product_name") or "").strip()
+                or prior["unit_value"] != str(row.get("unit") or "unit").strip()
+                or prior["approved_text_key"] != approved_text_key
+            ):
+                errors.append("repeated product rows must use the same name, unit, and approved_text_key")
+                break
+            prior_end = prior["valid_to_value"] or date.max
+            current_end = valid_to or date.max
+            if (
+                prior["code"] == code
+                and prior["currency"] == currency
+                and prior["valid_from_value"] <= current_end
+                and valid_from <= prior_end
+            ):
+                errors.append("overlapping price policy within workbook")
+                break
+        if errors:
+            result.errors.append({"row": number, "errors": errors})
+            continue
+        parsed.append(
+            {
+                **row,
+                "code": code,
+                "currency": currency,
+                "approved_text_key": approved_text_key,
+                "product_name_value": str(row.get("product_name") or "").strip(),
+                "unit_value": str(row.get("unit") or "unit").strip(),
+                "standard": standard,
+                "floor": floor,
+                "max_discount": max_discount,
+                "concession": concession,
+                "max_rounds": max_rounds,
+                "min_quantity_value": min_quantity,
+                "max_quantity_value": max_quantity,
+                "quote_valid_days_value": quote_valid_days,
+                "valid_from_value": valid_from,
+                "valid_to_value": valid_to,
+                "product": product,
+            }
+        )
+    result.valid_rows = len(parsed)
+    if apply and result.ok:
+        product_cache = {
+            row["code"]: row["product"]
+            for row in parsed
+            if row["product"] is not None
+        }
+        for row in parsed:
+            product = product_cache.get(row["code"])
+            if product is None:
+                product = Product(
+                    code=row["code"],
+                    name=row["product_name_value"],
+                    unit=row["unit_value"],
+                    approved_text_key=row["approved_text_key"],
+                )
+                session.add(product)
+                await session.flush()
+                product_cache[row["code"]] = product
+            session.add(
+                PricePolicy(
+                    product_id=product.id,
+                    currency=row["currency"],
+                    standard_price=row["standard"],
+                    absolute_floor=row["floor"],
+                    max_discount_pct=row["max_discount"],
+                    max_negotiation_rounds=row["max_rounds"],
+                    concession_step_pct=row["concession"],
+                    min_quantity=row["min_quantity_value"],
+                    max_quantity=row["max_quantity_value"],
+                    quote_valid_days=row["quote_valid_days_value"],
+                    standard_incoterm=str(row.get("standard_incoterm") or "EXW"),
+                    allowed_incoterms=[v.strip() for v in str(row.get("allowed_incoterms") or "EXW").split(",")],
+                    standard_payment_term=str(row.get("standard_payment_term") or "100% before shipment"),
+                    allowed_payment_terms=[v.strip() for v in str(row.get("allowed_payment_terms") or "").split(",") if v.strip()],
+                    valid_from=row["valid_from_value"],
+                    valid_to=row["valid_to_value"],
+                    source_hash=result.source_hash,
+                )
+            )
+            result.applied_rows += 1
+        await session.commit()
+    return result

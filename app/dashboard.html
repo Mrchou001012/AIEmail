@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 发信运行台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6fa;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --line: #e2e8f0;
+      --line-strong: #cbd5e1;
+      --text: #172033;
+      --muted: #64748b;
+      --brand: #3157d5;
+      --brand-soft: #eef2ff;
+      --green: #16794b;
+      --green-soft: #e9f8f0;
+      --amber: #a15c06;
+      --amber-soft: #fff5df;
+      --red: #b42318;
+      --red-soft: #fff0ee;
+      --shadow: 0 10px 28px rgba(30, 41, 59, 0.07);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    button, input { font: inherit; }
+
+    .shell {
+      width: min(1560px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-mark {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      color: #fff;
+      background: linear-gradient(145deg, #2449c7, #5776e7);
+      box-shadow: 0 8px 18px rgba(49, 87, 213, 0.25);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 20px; letter-spacing: -0.02em; }
+    h2 { font-size: 15px; letter-spacing: -0.01em; }
+    .subtitle { color: var(--muted); margin-top: 2px; font-size: 13px; }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .refresh {
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      padding: 8px 13px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .refresh:hover { border-color: var(--brand); color: var(--brand); }
+    .refresh:disabled { cursor: wait; opacity: 0.55; }
+
+    .notice {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 48px;
+      margin-bottom: 18px;
+      padding: 12px 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .notice.safe { background: var(--green-soft); border-color: #b7e4ca; color: #145c3c; }
+    .notice.warn { background: var(--amber-soft); border-color: #f3d29a; color: #7a4608; }
+    .notice.danger { background: var(--red-soft); border-color: #ffc9c2; color: #8f1d14; }
+    .notice.error { background: var(--red-soft); border-color: #ffc9c2; color: var(--red); }
+
+    .notice-dot, .live-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: currentColor;
+      flex: 0 0 auto;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .metric {
+      min-height: 112px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { margin: 12px 0 3px; font-size: 28px; font-weight: 720; letter-spacing: -0.04em; }
+    .metric-note { color: var(--muted); font-size: 11px; }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel + .panel { margin-top: 16px; }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 55px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-head small { color: var(--muted); }
+
+    .config-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 14px 16px;
+    }
+
+    .chip, .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+
+    .chip {
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface-soft);
+      color: #475569;
+      font-size: 12px;
+    }
+
+    .pill { padding: 3px 8px; font-size: 11px; font-weight: 650; }
+    .pill.good { color: var(--green); background: var(--green-soft); }
+    .pill.warn { color: var(--amber); background: var(--amber-soft); }
+    .pill.bad { color: var(--red); background: var(--red-soft); }
+    .pill.info { color: var(--brand); background: var(--brand-soft); }
+    .pill.neutral { color: #526074; background: #eef2f6; }
+
+    .sync-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      padding: 14px 16px 16px;
+    }
+
+    .sync-item {
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-soft);
+    }
+
+    .sync-title { display: flex; justify-content: space-between; gap: 10px; font-weight: 650; }
+    .sync-meta { margin-top: 7px; color: var(--muted); font-size: 11px; }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .two-col .panel { margin-top: 0; }
+
+    .table-wrap { overflow: auto; max-height: 430px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 680px;
+    }
+
+    th, td {
+      padding: 11px 13px;
+      border-bottom: 1px solid #edf0f4;
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      color: var(--muted);
+      background: #fbfcfe;
+      font-size: 11px;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: #fafbff; }
+    td { font-size: 12px; }
+    .cell-main { display: block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cell-sub { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+    .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+
+    .link-btn {
+      display: inline-block;
+      max-width: 360px;
+      padding: 0;
+      border: 0;
+      color: #2347b3;
+      background: transparent;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: left;
+    }
+
+    .link-btn:hover { text-decoration: underline; }
+    .empty { padding: 28px 16px; color: var(--muted); text-align: center; }
+
+    .audit-list { max-height: 430px; overflow: auto; padding: 4px 16px 10px; }
+    .audit-item { display: grid; grid-template-columns: 150px 1fr; gap: 14px; padding: 12px 0; border-bottom: 1px solid #edf0f4; }
+    .audit-time { color: var(--muted); font-size: 11px; }
+    .audit-title { font-weight: 650; }
+    .audit-data { margin-top: 4px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+
+    dialog {
+      width: min(860px, calc(100% - 28px));
+      max-height: calc(100vh - 48px);
+      padding: 0;
+      border: 0;
+      border-radius: 16px;
+      color: var(--text);
+      background: var(--surface);
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.28);
+    }
+
+    dialog::backdrop { background: rgba(15, 23, 42, 0.48); }
+    .dialog-head { display: flex; justify-content: space-between; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+    .dialog-close { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 9px; background: #fff; cursor: pointer; }
+    .dialog-meta { padding: 12px 18px; color: var(--muted); background: var(--surface-soft); border-bottom: 1px solid var(--line); font-size: 12px; white-space: pre-wrap; }
+    .dialog-body { margin: 0; padding: 18px; max-height: 62vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.65 "SFMono-Regular", Consolas, monospace; }
+
+    @media (max-width: 1180px) {
+      .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .two-col { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 680px) {
+      .shell { width: min(100% - 20px, 1560px); padding-top: 14px; }
+      .topbar { align-items: flex-start; }
+      .top-actions { flex-direction: column; align-items: flex-end; gap: 6px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+      .metric { min-height: 100px; padding: 13px; }
+      .metric-value { font-size: 24px; }
+      .audit-item { grid-template-columns: 1fr; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">AI</div>
+        <div>
+          <h1>发信运行台</h1>
+          <p class="subtitle">邮件同步、报价、发件和人工接管的只读监控</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="updated-at">正在读取状态…</span>
+        <button class="refresh" id="refresh" type="button">刷新</button>
+      </div>
+    </header>
+
+    <div class="notice" id="safety-notice" role="status">
+      <span class="notice-dot"></span>
+      <span>正在检查自动发信安全状态…</span>
+    </div>
+
+    <section class="metrics" aria-label="关键指标">
+      <article class="metric"><div class="metric-label">24 小时收件</div><div class="metric-value" id="m-inbound">—</div><div class="metric-note">进入系统的新邮件</div></article>
+      <article class="metric"><div class="metric-label">24 小时发件</div><div class="metric-value" id="m-sent">—</div><div class="metric-note">确认已发送</div></article>
+      <article class="metric"><div class="metric-label">等待发件</div><div class="metric-value" id="m-outbox">—</div><div class="metric-note">含待处理和重试</div></article>
+      <article class="metric"><div class="metric-label">待人工</div><div class="metric-value" id="m-handoffs">—</div><div class="metric-note">开放接管记录</div></article>
+      <article class="metric"><div class="metric-label">失败任务</div><div class="metric-value" id="m-jobs">—</div><div class="metric-note">已停止自动重试</div></article>
+      <article class="metric"><div class="metric-label">未匹配历史</div><div class="metric-value" id="m-history">—</div><div class="metric-note">尚未关联客户</div></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>运行配置</h2><small>只显示是否配置，不显示密钥</small></div>
+      <div class="config-row" id="config-row"><span class="chip">正在加载…</span></div>
+      <div class="sync-grid" id="sync-grid"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>最近邮件</h2><small>点击主题查看正文；最多显示 40 封</small></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>方向</th><th>时间</th><th>主题</th><th>发件人 / 收件人</th><th>归属</th></tr></thead>
+          <tbody id="emails-body"><tr><td colspan="5" class="empty">正在加载…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <section class="panel">
+        <div class="panel-head"><h2>待人工与异常</h2><small>最近 30 条</small></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>原因</th><th>摘要</th><th>钉钉</th></tr></thead>
+            <tbody id="handoffs-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>发件队列</h2><small>最近 30 条</small></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>收件人</th><th>状态</th><th>重试</th></tr></thead>
+            <tbody id="outbox-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="two-col">
+      <section class="panel">
+        <div class="panel-head"><h2>最近报价</h2><small>最近 30 条</small></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>客户 / 产品</th><th>数量</th><th>价格</th><th>有效期</th></tr></thead>
+            <tbody id="quotes-body"><tr><td colspan="5" class="empty">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>后台任务</h2><small>最近 30 条</small></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>任务</th><th>状态</th><th>尝试</th></tr></thead>
+            <tbody id="jobs-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head"><h2>业务审计时间线</h2><small>最近 40 条系统决定</small></div>
+      <div class="audit-list" id="audit-list"><div class="empty">正在加载…</div></div>
+    </section>
+  </main>
+
+  <dialog id="detail-dialog">
+    <div class="dialog-head">
+      <div><h2 id="dialog-title">详情</h2><p class="subtitle">只读查看</p></div>
+      <button class="dialog-close" id="dialog-close" aria-label="关闭" type="button">×</button>
+    </div>
+    <div class="dialog-meta" id="dialog-meta"></div>
+    <pre class="dialog-body" id="dialog-body">正在加载…</pre>
+  </dialog>
+
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[char]);
+    const short = (value, limit = 90) => {
+      const text = String(value ?? "").replace(/\s+/g, " ").trim();
+      return text.length > limit ? `${text.slice(0, limit)}…` : text;
+    };
+    const fmt = (value) => {
+      if (!value) return "—";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat("zh-CN", {
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false
+      }).format(date);
+    };
+    const pill = (value) => {
+      const text = String(value ?? "UNKNOWN");
+      const good = ["SENT", "DONE", "RESOLVED", "ACTIVE"];
+      const bad = ["FAILED", "UNKNOWN", "CANCELLED"];
+      const warning = ["PENDING", "CLAIMED", "RUNNING", "OPEN", "WAITING_HUMAN", "PAUSED"];
+      const kind = good.includes(text) ? "good" : bad.includes(text) ? "bad" : warning.includes(text) ? "warn" : "neutral";
+      return `<span class="pill ${kind}">${esc(text)}</span>`;
+    };
+    const empty = (cols, text = "暂无记录") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
+
+    function renderSafety(runtime) {
+      const notice = $("#safety-notice");
+      if (!runtime.auto_send_enabled) {
+        notice.className = "notice safe";
+        notice.innerHTML = '<span class="notice-dot"></span><span><strong>自动发送已关闭。</strong> 系统可以同步、分析和生成记录，但不会向真实客户自动发信。</span>';
+      } else if (runtime.safe_mode) {
+        notice.className = "notice warn";
+        notice.innerHTML = '<span class="notice-dot"></span><span><strong>自动发送已开启，安全名单仍生效。</strong> 请持续观察发件队列和失败记录。</span>';
+      } else {
+        notice.className = "notice danger";
+        notice.innerHTML = '<span class="notice-dot"></span><span><strong>自动发送已开启且安全模式关闭。</strong> 当前属于正式发件状态。</span>';
+      }
+    }
+
+    function renderConfig(data) {
+      const r = data.runtime;
+      const yesNo = (label, value) => `<span class="chip">${esc(label)} ${pill(value ? "ACTIVE" : "OFF")}</span>`;
+      $("#config-row").innerHTML = [
+        `<span class="chip">AI <strong>${esc(r.ai_provider)}</strong></span>`,
+        `<span class="chip">发件方式 <strong>${esc(r.mail_transport)}</strong></span>`,
+        `<span class="chip">钉钉 <strong>${esc(r.dingtalk_transport)}</strong></span>`,
+        yesNo("Gmail 凭据", r.credentials.gmail),
+        yesNo("Gmail 同步", r.imap_sync_enabled),
+        yesNo("安全模式", r.safe_mode),
+        yesNo("自动发送", r.auto_send_enabled),
+        `<span class="chip">案件 ${Object.entries(data.cases_by_status).map(([key, value]) => `${esc(key)} ${value}`).join(" · ") || "0"}</span>`
+      ].join("");
+
+      const boxes = data.mailboxes || [];
+      $("#sync-grid").innerHTML = boxes.length ? boxes.map((box) => `
+        <article class="sync-item">
+          <div class="sync-title"><span>${esc(box.folder)}</span>${pill(box.history_complete ? "DONE" : "RUNNING")}</div>
+          <div class="sync-meta">UID ${esc(box.last_uid)} / ${esc(box.history_cutoff_uid ?? "实时")} · 更新 ${fmt(box.updated_at)}</div>
+        </article>
+      `).join("") : '<div class="empty">Gmail 尚未开始同步，因此还没有文件夹进度。</div>';
+    }
+
+    function renderEmails(rows) {
+      $("#emails-body").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${pill(row.direction)}${row.is_history ? '<span class="cell-sub">历史</span>' : ""}</td>
+          <td>${fmt(row.received_at)}</td>
+          <td><button class="link-btn" data-detail="emails" data-id="${row.id}" data-title="邮件 #${row.id}">${esc(short(row.subject || "（无主题）", 72))}</button><span class="cell-sub">${row.attachments ? `${row.attachments} 个附件` : "无附件"}</span></td>
+          <td><span class="cell-main">${esc(row.direction === "INBOUND" ? row.from : (row.to || []).join(", "))}</span></td>
+          <td><span class="mono">Case ${esc(row.case_id ?? "未匹配")}</span><span class="cell-sub">${esc(row.folder || "—")}</span></td>
+        </tr>
+      `).join("") : empty(5);
+    }
+
+    function renderHandoffs(rows) {
+      $("#handoffs-body").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${fmt(row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td>${pill(row.reason)}</td>
+          <td><button class="link-btn" data-detail="handoffs" data-id="${row.id}" data-title="人工接管 #${row.id}">${esc(short(row.summary, 72))}</button><span class="cell-sub">${pill(row.status)}</span></td>
+          <td>${pill(row.dingtalk_status)}</td>
+        </tr>
+      `).join("") : empty(4);
+    }
+
+    function renderOutbox(rows) {
+      $("#outbox-body").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${fmt(row.sent_at || row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td><button class="link-btn" data-detail="outbox" data-id="${row.id}" data-title="发件记录 #${row.id}">${esc(short(row.recipient, 48))}</button>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 62))}</span>` : ""}</td>
+          <td>${pill(row.status)}</td>
+          <td>${esc(row.attempts)}</td>
+        </tr>
+      `).join("") : empty(4);
+    }
+
+    function renderQuotes(rows) {
+      $("#quotes-body").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${fmt(row.created_at)}<span class="cell-sub">第 ${esc(row.round)} 轮</span></td>
+          <td><button class="link-btn" data-detail="cases" data-id="${row.case_id}" data-title="案件 #${row.case_id}">${esc(short(row.company, 38))}</button><span class="cell-sub mono">${esc(row.product)}</span></td>
+          <td>${esc(row.quantity)}</td>
+          <td><strong>${esc(row.currency)} ${esc(row.unit_price)}</strong><span class="cell-sub">${esc(row.incoterm)}</span></td>
+          <td>${esc(row.valid_until)}</td>
+        </tr>
+      `).join("") : empty(5);
+    }
+
+    function renderJobs(rows) {
+      $("#jobs-body").innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${fmt(row.updated_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td><span class="cell-main mono">${esc(row.kind)}</span>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 70))}</span>` : ""}</td>
+          <td>${pill(row.status)}</td>
+          <td>${esc(row.attempts)} / ${esc(row.max_attempts)}</td>
+        </tr>
+      `).join("") : empty(4);
+    }
+
+    function renderAudit(rows) {
+      $("#audit-list").innerHTML = rows.length ? rows.map((row) => `
+        <article class="audit-item">
+          <div class="audit-time">${fmt(row.created_at)}<br>Case ${esc(row.case_id ?? "—")}</div>
+          <div><div class="audit-title">${esc(row.event_type)} <span class="pill neutral">${esc(row.actor)}</span></div><div class="audit-data">${esc(short(JSON.stringify(row.data || {}), 220))}</div></div>
+        </article>
+      `).join("") : '<div class="empty">暂无审计记录</div>';
+    }
+
+    function render(data) {
+      const m = data.metrics;
+      $("#m-inbound").textContent = m.inbound_24h;
+      $("#m-sent").textContent = m.sent_24h;
+      $("#m-outbox").textContent = m.pending_outbox;
+      $("#m-handoffs").textContent = m.open_handoffs;
+      $("#m-jobs").textContent = m.failed_jobs;
+      $("#m-history").textContent = m.unmatched_history;
+      renderSafety(data.runtime);
+      renderConfig(data);
+      renderEmails(data.emails || []);
+      renderHandoffs(data.handoffs || []);
+      renderOutbox(data.outbox || []);
+      renderQuotes(data.quotes || []);
+      renderJobs(data.jobs || []);
+      renderAudit(data.audit || []);
+      $("#updated-at").textContent = `最后更新 ${fmt(data.generated_at)}`;
+    }
+
+    async function load() {
+      const button = $("#refresh");
+      button.disabled = true;
+      try {
+        const response = await fetch("/admin/dashboard/data", { cache: "no-store", headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error(`读取失败（HTTP ${response.status}）`);
+        render(await response.json());
+      } catch (error) {
+        const notice = $("#safety-notice");
+        notice.className = "notice error";
+        notice.innerHTML = `<span class="notice-dot"></span><span>${esc(error.message)}。请确认服务和数据库正在运行。</span>`;
+        $("#updated-at").textContent = "状态读取失败";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function showDetail(kind, id, title) {
+      const dialog = $("#detail-dialog");
+      $("#dialog-title").textContent = title;
+      $("#dialog-meta").textContent = `正在读取 ${kind} #${id}`;
+      $("#dialog-body").textContent = "正在加载…";
+      dialog.showModal();
+      try {
+        const response = await fetch(`/admin/${kind}/${id}`, { cache: "no-store", headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error(`读取详情失败（HTTP ${response.status}）`);
+        const data = await response.json();
+        if (kind === "emails") {
+          $("#dialog-meta").textContent = `${data.direction} · ${data.from} → ${(data.to || []).join(", ")}\n${data.subject || "（无主题）"}`;
+          $("#dialog-body").textContent = `${data.body_text || "（无纯文本正文）"}${data.body_truncated ? "\n\n[正文过长，页面仅显示前 30000 字符]" : ""}`;
+        } else if (kind === "outbox") {
+          $("#dialog-meta").textContent = `${data.status} · ${data.recipient} · 尝试 ${data.attempts} 次${data.last_error ? `\n错误：${data.last_error}` : ""}`;
+          $("#dialog-body").textContent = `${data.raw_message || "（无邮件内容）"}${data.message_truncated ? "\n\n[内容过长，页面仅显示前 30000 字符]" : ""}`;
+        } else {
+          $("#dialog-meta").textContent = `${kind} #${id}`;
+          $("#dialog-body").textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (error) {
+        $("#dialog-meta").textContent = "详情读取失败";
+        $("#dialog-body").textContent = error.message;
+      }
+    }
+
+    document.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-detail]");
+      if (target) showDetail(target.dataset.detail, target.dataset.id, target.dataset.title || "详情");
+    });
+    $("#dialog-close").addEventListener("click", () => $("#detail-dialog").close());
+    $("#detail-dialog").addEventListener("click", (event) => {
+      if (event.target === $("#detail-dialog")) $("#detail-dialog").close();
+    });
+    $("#refresh").addEventListener("click", load);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+    load();
+    setInterval(() => { if (!document.hidden) load(); }, 20000);
+  </script>
+</body>
+</html>
