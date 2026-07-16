@@ -939,6 +939,74 @@ async def test_historical_sent_mail_pauses_case_and_blocks_new_initial_outreach(
     ) == 1
 
 
+async def test_old_history_does_not_take_over_case_with_newer_live_activity(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    live_received_at = case.last_activity_at + timedelta(minutes=1)
+    linked_history = EmailMessage(
+        case_id=case.id,
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="OUTBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="[Gmail]/Sent Mail",
+        message_id="<linked-old-history@example.com>",
+        from_address="sales-agent@example.com",
+        to_addresses=["internal@example.com"],
+        subject="Industrial Widget 100 quotation",
+        body_text="Older linked quotation",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"linked-old-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 6, 1, 8, 0, tzinfo=UTC),
+    )
+    unlinked_history = EmailMessage(
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="OUTBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="[Gmail]/Sent Mail",
+        message_id="<unlinked-old-history@example.com>",
+        from_address="sales-agent@example.com",
+        to_addresses=["internal@example.com"],
+        subject="Industrial Widget 100 quotation",
+        body_text="Older unlinked quotation",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"unlinked-old-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 5, 1, 8, 0, tzinfo=UTC),
+    )
+    live_email = EmailMessage(
+        case_id=case.id,
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="OUTBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="[Gmail]/Sent Mail",
+        message_id="<new-live-email@example.com>",
+        from_address="sales-agent@example.com",
+        to_addresses=["internal@example.com"],
+        subject="Industrial Widget 100 quotation",
+        body_text="Current live quotation",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"new-live-email").hexdigest(),
+        is_history=False,
+        received_at=live_received_at,
+    )
+    db_session.add_all([linked_history, unlinked_history, live_email])
+    await db_session.commit()
+
+    result = await reconcile_email_history(db_session)
+    await db_session.refresh(case)
+    await db_session.refresh(unlinked_history)
+
+    assert unlinked_history.case_id is None
+    assert case.status == CaseStatus.ACTIVE
+    assert case.last_activity_at == live_email.received_at
+    assert result.no_reply_cases_paused == 0
+
+
 async def test_imap_cursor_marks_initial_batch_as_history_and_later_mail_as_live(db_session: AsyncSession) -> None:
     settings = get_settings()
     original_address = settings.gmail_address

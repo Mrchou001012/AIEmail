@@ -148,6 +148,22 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
         .scalars()
         .all()
     )
+    latest_live_activity_by_case = {
+        case_id: received_at
+        for case_id, received_at in (
+            await session.execute(
+                select(
+                    EmailMessage.case_id,
+                    func.max(EmailMessage.received_at),
+                )
+                .where(
+                    EmailMessage.case_id.is_not(None),
+                    EmailMessage.is_history.is_(False),
+                )
+                .group_by(EmailMessage.case_id)
+            )
+        ).all()
+    }
     contacts = ((await session.execute(select(Contact))).scalars().all())
     contacts_by_id = {contact.id: contact for contact in contacts}
     contacts_by_email: dict[str, list[Contact]] = defaultdict(list)
@@ -226,9 +242,19 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
                     ):
                         case = candidate
                 if case is None and row.contact_id is not None:
+                    # Older imported mail must not heuristically claim a case
+                    # that has already moved forward through live traffic.
+                    candidates = [
+                        candidate
+                        for candidate in cases_by_contact.get(row.contact_id, [])
+                        if (
+                            latest_live_activity_by_case.get(candidate.id) is None
+                            or latest_live_activity_by_case[candidate.id] < row.received_at
+                        )
+                    ]
                     case = _contact_case(
                         row,
-                        cases_by_contact.get(row.contact_id, []),
+                        candidates,
                         product_codes,
                     )
                 if case is not None:
@@ -285,7 +311,15 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
         case = cases_by_id.get(case_id)
         if case is None:
             continue
-        case.last_activity_at = max(case.last_activity_at, latest.received_at)
+        latest_live_activity = latest_live_activity_by_case.get(case_id)
+        activity_dates = [case.last_activity_at, latest.received_at]
+        if latest_live_activity is not None:
+            activity_dates.append(latest_live_activity)
+        case.last_activity_at = max(activity_dates)
+        # Live workflow state is authoritative once it is at least as recent
+        # as the imported history row being reconciled.
+        if latest_live_activity is not None and latest_live_activity >= latest.received_at:
+            continue
         if latest.direction == "INBOUND":
             if case.status not in {
                 CaseStatus.HUMAN_TAKEOVER,
