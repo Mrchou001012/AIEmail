@@ -16,6 +16,7 @@ from app.db import (
     CaseStage,
     CaseStatus,
     Contact,
+    Customer,
     DeliveryStatus,
     EmailAddressStatus,
     EmailDomainStatus,
@@ -26,6 +27,7 @@ from app.db import (
     MailboxDailyUsage,
     MailboxThrottle,
     Outbox,
+    Product,
     Quote,
     SalesCase,
 )
@@ -62,6 +64,8 @@ async def test_dashboard_data_supports_an_empty_database(db_session: AsyncSessio
         "open_handoffs": 0,
         "failed_jobs": 0,
         "unmatched_history": 0,
+        "unmatched_history_cases": 0,
+        "customer_matched_case_unmatched": 0,
         "ai_failures": 0,
         "bounced_24h": 0,
         "suppressed_addresses": 0,
@@ -424,6 +428,8 @@ async def test_new_subject_with_recent_same_product_case_requires_manual_linking
     email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
 
     assert email_row is not None and email_row.case_id is None
+    assert email_row.customer_id == existing_case.customer_id
+    assert email_row.contact_id == existing_case.contact_id
     handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
@@ -509,7 +515,7 @@ async def test_new_subject_referring_to_previous_quote_requires_manual_linking(
 async def test_new_subject_with_multiple_products_requires_human_selection(
     db_session: AsyncSession,
 ) -> None:
-    await _seed_case(db_session, with_quote=False)
+    existing_case = await _seed_case(db_session, with_quote=False)
     message = MIMEMessage()
     message["From"] = "internal@example.com"
     message["To"] = "sales-agent@example.com"
@@ -520,6 +526,8 @@ async def test_new_subject_with_multiple_products_requires_human_selection(
     email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
 
     assert email_row is not None and email_row.case_id is None
+    assert email_row.customer_id == existing_case.customer_id
+    assert email_row.contact_id == existing_case.contact_id
     handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.NEW_INQUIRY_REVIEW.value
@@ -709,7 +717,11 @@ async def test_gmail_history_links_sent_and_inbox_without_processing_old_reply(d
     await db_session.refresh(case)
 
     assert sent_row.case_id == case.id
+    assert sent_row.customer_id == case.customer_id
+    assert sent_row.contact_id == case.contact_id
     assert reply_row.case_id == case.id
+    assert reply_row.customer_id == case.customer_id
+    assert reply_row.contact_id == case.contact_id
     assert case.status == CaseStatus.WAITING_HUMAN
     assert result.replies_waiting_review == 1
     assert await db_session.scalar(
@@ -719,6 +731,160 @@ async def test_gmail_history_links_sent_and_inbox_without_processing_old_reply(d
         select(Handoff).where(Handoff.case_id == case.id, Handoff.summary == HISTORY_REVIEW_SUMMARY)
     )
     assert review is not None
+
+
+async def test_history_links_unique_contact_without_guessing_case(
+    db_session: AsyncSession,
+) -> None:
+    ids = await seed_demo_data(db_session)
+    row = EmailMessage(
+        direction="INBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="INBOX",
+        message_id="<contact-only-history@example.com>",
+        from_address="internal@example.com",
+        to_addresses=["sales-agent@example.com"],
+        subject="General introduction",
+        body_text="Hello",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"contact-only-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 4, 1, 8, 0, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    result = await reconcile_email_history(db_session)
+    await db_session.refresh(row)
+
+    assert row.customer_id == ids["customer_id"]
+    assert row.contact_id == ids["contact_id"]
+    assert row.case_id is None
+    assert result.customer_matched_messages == 1
+    assert result.customer_unmatched_messages == 0
+    assert result.customer_matched_case_unmatched_messages == 1
+
+
+async def test_history_uses_explicit_product_to_choose_one_of_multiple_cases(
+    db_session: AsyncSession,
+) -> None:
+    first_case = await _seed_case(db_session, with_quote=False)
+    product = Product(
+        code="YAC-TES",
+        name="YAC-TES",
+        unit="kg",
+        approved_text_key="yac_tes",
+    )
+    db_session.add(product)
+    await db_session.flush()
+    second_case = SalesCase(
+        customer_id=first_case.customer_id,
+        contact_id=first_case.contact_id,
+        product_id=product.id,
+        currency="USD",
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.ACTIVE,
+        subject_key="yac-tes quotation",
+    )
+    db_session.add(second_case)
+    await db_session.flush()
+    row = EmailMessage(
+        direction="INBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="INBOX",
+        message_id="<explicit-product-history@example.com>",
+        from_address="internal@example.com",
+        to_addresses=["sales-agent@example.com"],
+        subject="Please quote YAC-TES",
+        body_text="We need YAC-TES pricing.",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"explicit-product-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 4, 2, 8, 0, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    await reconcile_email_history(db_session)
+    await db_session.refresh(row)
+
+    assert row.case_id == second_case.id
+    assert row.customer_id == second_case.customer_id
+    assert row.contact_id == second_case.contact_id
+
+
+async def test_history_does_not_link_email_shared_by_multiple_customers(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    second_customer = Customer(company_name="Second Company")
+    db_session.add(second_customer)
+    await db_session.flush()
+    db_session.add(
+        Contact(
+            customer_id=second_customer.id,
+            name="Second Buyer",
+            email="internal@example.com",
+        )
+    )
+    row = EmailMessage(
+        direction="INBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="INBOX",
+        message_id="<ambiguous-contact-history@example.com>",
+        from_address="internal@example.com",
+        to_addresses=["sales-agent@example.com"],
+        subject="Hello",
+        body_text="Hello",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"ambiguous-contact-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 4, 3, 8, 0, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    result = await reconcile_email_history(db_session)
+    await db_session.refresh(row)
+
+    assert row.customer_id is None
+    assert row.contact_id is None
+    assert row.case_id is None
+    assert result.customer_unmatched_messages == 1
+
+
+async def test_contact_linked_history_blocks_initial_outreach_without_case_guess(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    row = EmailMessage(
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="OUTBOUND",
+        mailbox="sales-agent@example.com",
+        mailbox_folder="[Gmail]/Sent Mail",
+        message_id="<contact-outreach-history@example.com>",
+        from_address="sales-agent@example.com",
+        to_addresses=["internal@example.com"],
+        subject="Unrelated historical note",
+        body_text="Earlier contact",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(b"contact-outreach-history").hexdigest(),
+        is_history=True,
+        received_at=datetime(2025, 3, 1, 8, 0, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    await create_case_outreach(db_session, {"case_id": case.id, "quantity": 100})
+
+    assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Handoff)
+        .where(Handoff.case_id == case.id, Handoff.summary.like("Historical Gmail outreach exists%"))
+    ) == 1
 
 
 async def test_historical_sent_mail_pauses_case_and_blocks_new_initial_outreach(db_session: AsyncSession) -> None:

@@ -174,14 +174,14 @@ The mailbox guards are deliberately below Gmail's published hard limits. IMAP is
 
 Gmail synchronization is explicitly disabled until `IMAP_SYNC_ENABLED=true`. On the first enabled run, the poller snapshots the current highest UID independently for Sent and Inbox, imports at most `IMAP_BATCH_SIZE` messages per folder per cycle, and marks everything up to that snapshot as history. Historical Inbox messages are never queued for autonomous reply.
 
-Sent is synchronized before Inbox. Threads are matched by Message-ID/In-Reply-To/References, then conservatively by contact and subject. A historical thread whose latest message is inbound becomes `WAITING_HUMAN`; one whose latest message is outbound becomes `PAUSED`. Any matched historical outbound message blocks the initial-outreach workflow, preventing the application from treating an OpenClaw contact as new.
+Sent is synchronized before Inbox. Every message is first linked to a customer/contact only when its participant address identifies exactly one contact globally. A case is then selected by Message-ID/In-Reply-To/References, an explicit unique product, an exact case subject, or a single open case for that contact. Ambiguous messages remain customer-linked without guessing a case. A historical thread whose latest message is inbound becomes `WAITING_HUMAN`; one whose latest message is outbound becomes `PAUSED`. Historical outbound mail linked either to the case or its contact blocks the initial-outreach workflow, preventing the application from treating an OpenClaw contact as new.
 
 Monitor and rerun reconciliation through:
 
 - `GET /admin/history/status`
 - `POST /admin/history/reconcile`
 
-Messages that cannot be matched remain unassigned and are reported by the status endpoint. Importing customer data automatically retries reconciliation. Keep file mail, safe mode, and disabled auto-send throughout history migration.
+The history status endpoint reports customer-unmatched messages separately from case-unmatched messages. Importing customer data automatically retries reconciliation; rows whose products are not in the active catalog still create customers and contacts but do not create a case. Keep file mail, safe mode, and disabled auto-send throughout history migration.
 
 ### Live new-thread safety
 

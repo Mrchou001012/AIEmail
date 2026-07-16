@@ -133,9 +133,12 @@ async def poll_once() -> int:
     async with SessionLocal() as session:
         result = await reconcile_email_history(session)
         logger.info(
-            "Gmail history reconciliation matched=%s unmatched=%s replies_waiting=%s no_reply_paused=%s",
+            "Gmail history reconciliation case_matched=%s case_unmatched=%s "
+            "customer_matched=%s customer_unmatched=%s replies_waiting=%s no_reply_paused=%s",
             result.matched_messages,
             result.unmatched_messages,
+            result.customer_matched_messages,
+            result.customer_unmatched_messages,
             result.replies_waiting_review,
             result.no_reply_cases_paused,
         )

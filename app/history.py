@@ -1,166 +1,281 @@
+from collections import defaultdict
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import AuditEvent, CaseStatus, Contact, EmailMessage, Handoff, Outbox, SalesCase
+from app.db import (
+    AuditEvent,
+    CaseStatus,
+    Contact,
+    EmailMessage,
+    Handoff,
+    Outbox,
+    Product,
+    SalesCase,
+)
 from app.domain import HandoffReason
 from app.mail import normalized_subject
+from app.products import find_product_codes
 
 HISTORY_REVIEW_SUMMARY = "Historical Gmail reply requires review"
+CLOSED_CASE_STATUSES = {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
 
 
 @dataclass(frozen=True)
 class HistoryReconciliation:
+    # The original two fields remain as case-level compatibility fields for
+    # callers that consumed the earlier endpoint response.
     matched_messages: int
     unmatched_messages: int
+    customer_matched_messages: int
+    customer_unmatched_messages: int
+    customer_matched_case_unmatched_messages: int
     replies_waiting_review: int
     no_reply_cases_paused: int
 
 
 def _participants(row: EmailMessage) -> list[str]:
-    if row.direction == "INBOUND":
-        return [row.from_address.lower()]
-    return [address.lower() for address in row.to_addresses]
-
-
-async def _thread_case_ids(session: AsyncSession, row: EmailMessage) -> set[int]:
-    message_ids = [item for item in [row.in_reply_to, *row.references_json] if item]
-    case_ids: set[int] = set()
-    if message_ids:
-        email_cases = (
-            (
-                await session.execute(
-                    select(EmailMessage.case_id).where(
-                        EmailMessage.message_id.in_(message_ids),
-                        EmailMessage.case_id.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
+    values = [row.from_address] if row.direction == "INBOUND" else row.to_addresses
+    return list(
+        dict.fromkeys(
+            address.strip().casefold()
+            for address in values
+            if address and address.strip()
         )
-        case_ids.update(case_id for case_id in email_cases if case_id is not None)
-    outbox_ids = [*message_ids]
-    if row.direction == "OUTBOUND" and row.message_id:
-        outbox_ids.append(row.message_id)
-    if outbox_ids:
-        outbox_cases = (
-            (
-                await session.execute(
-                    select(Outbox.case_id).where(
-                        Outbox.message_id.in_(outbox_ids),
-                        Outbox.case_id.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
+    )
+
+
+async def resolve_unique_contact(
+    session: AsyncSession,
+    addresses: list[str],
+) -> Contact | None:
+    """Resolve addresses only when they identify one Contact globally."""
+    normalized = list(
+        dict.fromkeys(
+            address.strip().casefold()
+            for address in addresses
+            if address and address.strip()
         )
-        case_ids.update(case_id for case_id in outbox_cases if case_id is not None)
-    return case_ids
-
-
-async def _contact_case(session: AsyncSession, row: EmailMessage) -> SalesCase | None:
-    participants = _participants(row)
-    if not participants:
+    )
+    if not normalized:
         return None
-    candidates = (
+    contacts = (
         (
             await session.execute(
-                select(SalesCase)
-                .join(Contact, SalesCase.contact_id == Contact.id)
-                .where(
-                    Contact.email.in_(participants),
-                    SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
-                )
+                select(Contact).where(func.lower(Contact.email).in_(normalized))
             )
         )
         .scalars()
         .all()
     )
-    if len(candidates) == 1:
-        return candidates[0]
+    unique = {contact.id: contact for contact in contacts}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def apply_case_identity(row: EmailMessage, case: SalesCase) -> None:
+    row.case_id = case.id
+    row.customer_id = case.customer_id
+    row.contact_id = case.contact_id
+
+
+def _contact_from_participants(
+    participants: list[str],
+    contacts_by_email: dict[str, list[Contact]],
+) -> Contact | None:
+    candidates = {
+        contact.id: contact
+        for address in participants
+        for contact in contacts_by_email.get(address, [])
+    }
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
+def _contact_case(
+    row: EmailMessage,
+    candidates: list[SalesCase],
+    product_codes: dict[int, str],
+) -> SalesCase | None:
+    if not candidates:
+        return None
+
+    explicit_codes = find_product_codes(f"{row.subject}\n{row.body_text}")
+    if explicit_codes:
+        product_matches = [
+            case for case in candidates if product_codes.get(case.product_id) in explicit_codes
+        ]
+        return product_matches[0] if len(product_matches) == 1 else None
+
     subject = normalized_subject(row.subject)
-    subject_matches = [case for case in candidates if normalized_subject(case.subject_key or "") == subject]
-    return subject_matches[0] if len(subject_matches) == 1 else None
+    subject_matches = [
+        case
+        for case in candidates
+        if case.subject_key and normalized_subject(case.subject_key) == subject
+    ]
+    if len(subject_matches) == 1:
+        return subject_matches[0]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _thread_case_ids(
+    row: EmailMessage,
+    email_message_cases: dict[str, set[int]],
+    outbox_message_cases: dict[str, set[int]],
+) -> set[int]:
+    message_ids = [item for item in [row.in_reply_to, *row.references_json] if item]
+    if row.direction == "OUTBOUND" and row.message_id:
+        message_ids.append(row.message_id)
+    return {
+        case_id
+        for message_id in message_ids
+        for case_id in (
+            email_message_cases.get(message_id, set())
+            | outbox_message_cases.get(message_id, set())
+        )
+    }
 
 
 async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliation:
-    unmatched = (
+    history_rows = (
         (
             await session.execute(
                 select(EmailMessage)
-                .where(EmailMessage.is_history.is_(True), EmailMessage.case_id.is_(None))
+                .where(EmailMessage.is_history.is_(True))
                 .order_by(EmailMessage.received_at, EmailMessage.id)
             )
         )
         .scalars()
         .all()
     )
-    matched = 0
-    for _ in range(20):
-        changed = 0
-        for row in unmatched:
-            if row.case_id is not None:
-                continue
-            participants = _participants(row)
-            thread_case_ids = await _thread_case_ids(session, row)
-            if len(thread_case_ids) == 1:
-                case = await session.get(SalesCase, next(iter(thread_case_ids)))
-                if case is not None:
-                    contact_email = await session.scalar(select(Contact.email).where(Contact.id == case.contact_id))
-                    if contact_email and contact_email.lower() in participants:
-                        row.case_id = case.id
-            if row.case_id is None:
-                case = await _contact_case(session, row)
-                if case is not None:
-                    row.case_id = case.id
-            if row.case_id is not None:
-                changed += 1
-                matched += 1
-        await session.flush()
-        if changed == 0:
-            break
+    contacts = ((await session.execute(select(Contact))).scalars().all())
+    contacts_by_id = {contact.id: contact for contact in contacts}
+    contacts_by_email: dict[str, list[Contact]] = defaultdict(list)
+    for contact in contacts:
+        contacts_by_email[contact.email.strip().casefold()].append(contact)
 
-    history_case_ids = (
+    case_rows = (
         (
             await session.execute(
-                select(EmailMessage.case_id)
-                .where(EmailMessage.is_history.is_(True), EmailMessage.case_id.is_not(None))
-                .distinct()
+                select(SalesCase, Product.code).join(Product, SalesCase.product_id == Product.id)
             )
         )
-        .scalars()
         .all()
     )
+    cases_by_id = {case.id: case for case, _ in case_rows}
+    cases_by_contact: dict[int, list[SalesCase]] = defaultdict(list)
+    product_codes: dict[int, str] = {}
+    for case, product_code in case_rows:
+        product_codes[case.product_id] = product_code
+        if case.status not in CLOSED_CASE_STATUSES:
+            cases_by_contact[case.contact_id].append(case)
+
+    email_message_cases: dict[str, set[int]] = defaultdict(set)
+    existing_email_links = await session.execute(
+        select(EmailMessage.message_id, EmailMessage.case_id).where(
+            EmailMessage.message_id.is_not(None),
+            EmailMessage.case_id.is_not(None),
+        )
+    )
+    for message_id, case_id in existing_email_links.all():
+        email_message_cases[message_id].add(case_id)
+    outbox_message_cases: dict[str, set[int]] = defaultdict(set)
+    existing_outbox_links = await session.execute(
+        select(Outbox.message_id, Outbox.case_id).where(
+            Outbox.message_id.is_not(None),
+            Outbox.case_id.is_not(None),
+        )
+    )
+    for message_id, case_id in existing_outbox_links.all():
+        outbox_message_cases[message_id].add(case_id)
+
+    customer_matched = 0
+    case_matched = 0
+    for _ in range(20):
+        changed_cases = 0
+        for row in history_rows:
+            participants = _participants(row)
+            case = cases_by_id.get(row.case_id) if row.case_id is not None else None
+            if case is not None:
+                apply_case_identity(row, case)
+            else:
+                contact = contacts_by_id.get(row.contact_id) if row.contact_id is not None else None
+                if contact is None:
+                    contact = _contact_from_participants(participants, contacts_by_email)
+                if contact is not None:
+                    was_unmatched = row.contact_id is None
+                    row.contact_id = contact.id
+                    row.customer_id = contact.customer_id
+                    if was_unmatched:
+                        customer_matched += 1
+
+                thread_case_ids = _thread_case_ids(
+                    row,
+                    email_message_cases,
+                    outbox_message_cases,
+                )
+                if len(thread_case_ids) == 1:
+                    candidate = cases_by_id.get(next(iter(thread_case_ids)))
+                    candidate_contact = (
+                        contacts_by_id.get(candidate.contact_id) if candidate is not None else None
+                    )
+                    if (
+                        candidate is not None
+                        and candidate_contact is not None
+                        and candidate_contact.email.strip().casefold() in participants
+                    ):
+                        case = candidate
+                if case is None and row.contact_id is not None:
+                    case = _contact_case(
+                        row,
+                        cases_by_contact.get(row.contact_id, []),
+                        product_codes,
+                    )
+                if case is not None:
+                    apply_case_identity(row, case)
+                    case_matched += 1
+                    changed_cases += 1
+
+            if row.case_id is not None and row.message_id:
+                email_message_cases[row.message_id].add(row.case_id)
+        if changed_cases == 0:
+            break
+
+    await session.flush()
+
+    latest_by_case: dict[int, EmailMessage] = {}
+    for row in history_rows:
+        if row.case_id is not None:
+            latest_by_case[row.case_id] = row
+    latest_email_ids = [row.id for row in latest_by_case.values()]
+    existing_review_sources: set[int] = set()
+    if latest_email_ids:
+        existing_review_sources = set(
+            (
+                await session.execute(
+                    select(Handoff.source_email_id).where(
+                        Handoff.source_email_id.in_(latest_email_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
     replies_waiting = 0
     no_reply_paused = 0
-    for case_id in history_case_ids:
-        case = await session.get(SalesCase, case_id)
+    for case_id, latest in latest_by_case.items():
+        case = cases_by_id.get(case_id)
         if case is None:
-            continue
-        latest = await session.scalar(
-            select(EmailMessage)
-            .where(EmailMessage.case_id == case.id, EmailMessage.is_history.is_(True))
-            .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
-            .limit(1)
-        )
-        if latest is None:
             continue
         case.last_activity_at = max(case.last_activity_at, latest.received_at)
         if latest.direction == "INBOUND":
-            if case.status not in {CaseStatus.HUMAN_TAKEOVER, CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+            if case.status not in {
+                CaseStatus.HUMAN_TAKEOVER,
+                CaseStatus.CLOSED_WON,
+                CaseStatus.CLOSED_LOST,
+            }:
                 case.status = CaseStatus.WAITING_HUMAN
-            existing_review = await session.scalar(
-                select(Handoff.id).where(
-                    Handoff.case_id == case.id,
-                    Handoff.reason_code == HandoffReason.HUMAN_CONTROL.value,
-                    Handoff.summary == HISTORY_REVIEW_SUMMARY,
-                    Handoff.status == "OPEN",
-                )
-            )
-            if existing_review is None:
+            if latest.id not in existing_review_sources:
                 session.add(
                     Handoff(
                         case_id=case.id,
@@ -196,14 +311,31 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
             no_reply_paused += 1
 
     await session.commit()
-    remaining = await session.scalar(
+    customer_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(EmailMessage.is_history.is_(True), EmailMessage.contact_id.is_(None))
+    )
+    case_unmatched = await session.scalar(
         select(func.count())
         .select_from(EmailMessage)
         .where(EmailMessage.is_history.is_(True), EmailMessage.case_id.is_(None))
     )
+    customer_matched_case_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_not(None),
+            EmailMessage.case_id.is_(None),
+        )
+    )
     return HistoryReconciliation(
-        matched_messages=matched,
-        unmatched_messages=remaining or 0,
+        matched_messages=case_matched,
+        unmatched_messages=case_unmatched or 0,
+        customer_matched_messages=customer_matched,
+        customer_unmatched_messages=customer_unmatched or 0,
+        customer_matched_case_unmatched_messages=customer_matched_case_unmatched or 0,
         replies_waiting_review=replies_waiting,
         no_reply_cases_paused=no_reply_paused,
     )

@@ -67,6 +67,12 @@ class ImportResult:
     total_rows: int = 0
     valid_rows: int = 0
     applied_rows: int = 0
+    case_ready_rows: int = 0
+    contact_only_rows: int = 0
+    created_customers: int = 0
+    created_contacts: int = 0
+    created_cases: int = 0
+    missing_product_codes: list[str] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -217,6 +223,8 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
     rows = _rows(path)
     result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
     parsed: list[dict[str, Any]] = []
+    product_cache: dict[str, Product | None] = {}
+    missing_product_codes: set[str] = set()
     for number, row in enumerate(rows, start=2):
         errors: list[str] = []
         company = str(row.get("company_name") or "").strip()
@@ -230,21 +238,48 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
         except EmailNotValidError as exc:
             errors.append(f"invalid email: {exc}")
             address = ""
-        product = await session.scalar(select(Product).where(Product.code == product_code, Product.active.is_(True)))
+        product = None
+        if product_code:
+            if product_code not in product_cache:
+                product_cache[product_code] = await session.scalar(
+                    select(Product).where(Product.code == product_code, Product.active.is_(True))
+                )
+            product = product_cache[product_code]
+            if product is None:
+                missing_product_codes.add(product_code)
         if not company:
             errors.append("company_name is required")
         if not name:
             errors.append("contact_name is required")
-        if product is None:
-            errors.append(f"missing or inactive product: {product_code}")
         if errors:
             result.errors.append({"row": number, "errors": errors})
             continue
-        parsed.append({**row, "email": address, "product": product, "company": company, "name": name})
+        parsed.append(
+            {
+                **row,
+                "email": address,
+                "product": product,
+                "product_code": product_code,
+                "company": company,
+                "name": name,
+            }
+        )
+        if product is None:
+            result.contact_only_rows += 1
+        else:
+            result.case_ready_rows += 1
     result.valid_rows = len(parsed)
+    result.missing_product_codes = sorted(missing_product_codes)
     if apply and result.ok:
+        customer_cache: dict[str, Customer] = {}
+        contact_cache: dict[tuple[int, str], Contact] = {}
+        case_cache: dict[tuple[int, int, str], SalesCase | None] = {}
         for row in parsed:
-            customer = await session.scalar(select(Customer).where(Customer.company_name == row["company"]))
+            customer = customer_cache.get(row["company"])
+            if customer is None:
+                customer = await session.scalar(
+                    select(Customer).where(Customer.company_name == row["company"])
+                )
             row_auto_send = _bool(row.get("auto_send_allowed"))
             row_do_not_contact = _bool(row.get("do_not_contact"))
             row_consent = str(row.get("consent_basis") or "") or None
@@ -257,14 +292,24 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
                 )
                 session.add(customer)
                 await session.flush()
+                result.created_customers += 1
             else:
                 # Merge repeated company rows conservatively: any suppression wins,
                 # and every row must explicitly allow automation.
                 customer.auto_send_allowed = customer.auto_send_allowed and row_auto_send
                 customer.do_not_contact = customer.do_not_contact or row_do_not_contact
                 customer.consent_basis = customer.consent_basis or row_consent
+            customer_cache[row["company"]] = customer
             customer.language = str(row.get("language") or "en")
-            contact = await session.scalar(select(Contact).where(Contact.customer_id == customer.id, Contact.email == row["email"]))
+            contact_key = (customer.id, row["email"])
+            contact = contact_cache.get(contact_key)
+            if contact is None:
+                contact = await session.scalar(
+                    select(Contact).where(
+                        Contact.customer_id == customer.id,
+                        Contact.email == row["email"],
+                    )
+                )
             if contact is None:
                 contact = Contact(
                     customer_id=customer.id,
@@ -274,36 +319,45 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
                 )
                 session.add(contact)
                 await session.flush()
+                result.created_contacts += 1
             else:
                 contact.name = row["name"]
                 contact.language = str(row.get("language") or "en")
+            contact_cache[contact_key] = contact
+            if row["product"] is None:
+                result.applied_rows += 1
+                continue
             currency = str(row.get("currency") or "USD").strip().upper()
-            sales_case = await session.scalar(
-                select(SalesCase).where(
-                    SalesCase.customer_id == customer.id,
-                    SalesCase.contact_id == contact.id,
-                    SalesCase.product_id == row["product"].id,
-                    SalesCase.currency == currency,
-                    SalesCase.status.in_(
-                        [
-                            CaseStatus.ACTIVE,
-                            CaseStatus.WAITING_HUMAN,
-                            CaseStatus.PAUSED,
-                            CaseStatus.HUMAN_TAKEOVER,
-                        ]
-                    ),
-                )
-            )
-            if sales_case is None:
-                session.add(
-                    SalesCase(
-                        customer_id=customer.id,
-                        contact_id=contact.id,
-                        product_id=row["product"].id,
-                        currency=currency,
-                        subject_key=f"{row['product'].name} quotation".lower(),
+            case_key = (contact.id, row["product"].id, currency)
+            if case_key not in case_cache:
+                case_cache[case_key] = await session.scalar(
+                    select(SalesCase).where(
+                        SalesCase.customer_id == customer.id,
+                        SalesCase.contact_id == contact.id,
+                        SalesCase.product_id == row["product"].id,
+                        SalesCase.currency == currency,
+                        SalesCase.status.in_(
+                            [
+                                CaseStatus.ACTIVE,
+                                CaseStatus.WAITING_HUMAN,
+                                CaseStatus.PAUSED,
+                                CaseStatus.HUMAN_TAKEOVER,
+                            ]
+                        ),
                     )
                 )
+            sales_case = case_cache[case_key]
+            if sales_case is None:
+                sales_case = SalesCase(
+                    customer_id=customer.id,
+                    contact_id=contact.id,
+                    product_id=row["product"].id,
+                    currency=currency,
+                    subject_key=f"{row['product'].name} quotation".lower(),
+                )
+                session.add(sales_case)
+                case_cache[case_key] = sales_case
+                result.created_cases += 1
             result.applied_rows += 1
         await session.commit()
         await reconcile_email_history(session)

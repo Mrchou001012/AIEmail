@@ -171,6 +171,19 @@ async def dashboard_data(
     unmatched_history = await session.scalar(
         select(func.count()).select_from(EmailMessage).where(
             EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_(None),
+        )
+    )
+    unmatched_history_cases = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.case_id.is_(None),
+        )
+    )
+    customer_matched_case_unmatched = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_not(None),
             EmailMessage.case_id.is_(None),
         )
     )
@@ -306,6 +319,8 @@ async def dashboard_data(
             "open_handoffs": int(open_handoffs or 0),
             "failed_jobs": int(failed_jobs or 0),
             "unmatched_history": int(unmatched_history or 0),
+            "unmatched_history_cases": int(unmatched_history_cases or 0),
+            "customer_matched_case_unmatched": int(customer_matched_case_unmatched or 0),
             "ai_failures": int(ai_failure_count or 0),
             "bounced_24h": int(bounced_24h or 0),
             "suppressed_addresses": int(suppressed_addresses or 0),
@@ -326,6 +341,8 @@ async def dashboard_data(
             {
                 "id": row.id,
                 "case_id": row.case_id,
+                "customer_id": row.customer_id,
+                "contact_id": row.contact_id,
                 "direction": row.direction,
                 "from": row.from_address,
                 "to": row.to_addresses,
@@ -425,6 +442,8 @@ async def email_detail(email_id: int, _: Admin, session: Session) -> dict[str, A
     return {
         "id": row.id,
         "case_id": row.case_id,
+        "customer_id": row.customer_id,
+        "contact_id": row.contact_id,
         "direction": row.direction,
         "folder": row.mailbox_folder,
         "from": row.from_address,
@@ -530,10 +549,24 @@ async def history_status(_: Admin, session: Session) -> dict[str, Any]:
         .where(EmailMessage.is_history.is_(True))
         .group_by(EmailMessage.direction)
     )
-    unmatched = await session.scalar(
+    case_unmatched = await session.scalar(
         select(func.count())
         .select_from(EmailMessage)
         .where(EmailMessage.is_history.is_(True), EmailMessage.case_id.is_(None))
+    )
+    customer_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(EmailMessage.is_history.is_(True), EmailMessage.contact_id.is_(None))
+    )
+    customer_matched_case_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_not(None),
+            EmailMessage.case_id.is_(None),
+        )
     )
     cursors = (
         (
@@ -546,7 +579,11 @@ async def history_status(_: Admin, session: Session) -> dict[str, Any]:
     )
     return {
         "history_messages": {direction: count for direction, count in direction_counts.all()},
-        "unmatched_history_messages": unmatched or 0,
+        # Compatibility field: this was historically the case-level count.
+        "unmatched_history_messages": case_unmatched or 0,
+        "customer_unmatched_history_messages": customer_unmatched or 0,
+        "case_unmatched_history_messages": case_unmatched or 0,
+        "customer_matched_case_unmatched_messages": customer_matched_case_unmatched or 0,
         "folders": [
             {
                 "mailbox": cursor.mailbox,

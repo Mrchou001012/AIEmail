@@ -338,7 +338,8 @@
       <article class="metric"><div class="metric-label">等待发件</div><div class="metric-value" id="m-outbox">—</div><div class="metric-note">含待处理和重试</div></article>
       <article class="metric"><div class="metric-label">待人工</div><div class="metric-value" id="m-handoffs">—</div><div class="metric-note">开放接管记录</div></article>
       <article class="metric"><div class="metric-label">失败任务</div><div class="metric-value" id="m-jobs">—</div><div class="metric-note">已停止自动重试</div></article>
-      <article class="metric"><div class="metric-label">未匹配历史</div><div class="metric-value" id="m-history">—</div><div class="metric-note">尚未关联客户</div></article>
+      <article class="metric"><div class="metric-label">未匹配客户</div><div class="metric-value" id="m-history">—</div><div class="metric-note">历史邮件尚未关联客户</div></article>
+      <article class="metric"><div class="metric-label">未匹配业务</div><div class="metric-value" id="m-history-cases">—</div><div class="metric-note">已识别客户但未必能确定 Case</div></article>
     </section>
 
     <section class="panel">
@@ -492,7 +493,7 @@
           <td>${fmt(row.received_at)}</td>
           <td><button class="link-btn" data-detail="emails" data-id="${row.id}" data-title="邮件 #${row.id}">${esc(short(row.subject || "（无主题）", 72))}</button><span class="cell-sub">${row.bounce_type ? `退信 · ${esc(row.bounce_type)}` : (row.automated_reply_type ? `自动回复 · ${esc(row.automated_reply_type)}` : (row.attachments ? `${row.attachments} 个附件` : "无附件"))}</span></td>
           <td><span class="cell-main">${esc(row.direction === "INBOUND" ? row.from : (row.to || []).join(", "))}</span></td>
-          <td><span class="mono">Case ${esc(row.case_id ?? "未匹配")}</span><span class="cell-sub">${esc(row.folder || "—")}</span></td>
+          <td><span class="mono">Case ${esc(row.case_id ?? "未匹配")}</span><span class="cell-sub">${row.customer_id ? `客户 #${esc(row.customer_id)} · 联系人 #${esc(row.contact_id)}` : "客户未匹配"} · ${esc(row.folder || "—")}</span></td>
         </tr>
       `).join("") : empty(5);
     }
@@ -559,6 +560,7 @@
       $("#m-handoffs").textContent = m.open_handoffs;
       $("#m-jobs").textContent = m.failed_jobs;
       $("#m-history").textContent = m.unmatched_history;
+      $("#m-history-cases").textContent = m.unmatched_history_cases;
       renderSafety(data.runtime);
       renderConfig(data);
       renderEmails(data.emails || []);

@@ -3,7 +3,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from openpyxl import load_workbook
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import Contact, Customer, SalesCase
 from app.imports import (
     CUSTOMER_HEADERS,
     PRICE_HEADERS,
@@ -46,6 +49,51 @@ async def test_invalid_customer_csv_email_is_row_error(tmp_path: Path) -> None:
     result = await import_customers(path, session, apply=False)
     assert not result.ok
     assert "invalid email" in result.errors[0]["errors"][0]
+
+
+@pytest.mark.asyncio
+async def test_missing_product_is_valid_contact_only_row(tmp_path: Path) -> None:
+    generate_templates(tmp_path)
+    path = tmp_path / "customer_list_template.xlsx"
+    workbook = load_workbook(path)
+    workbook.active["E2"] = "UNKNOWN-PRODUCT"
+    workbook.save(path)
+    session = AsyncMock()
+    session.scalar.return_value = None
+
+    result = await import_customers(path, session, apply=False)
+
+    assert result.ok
+    assert result.valid_rows == 1
+    assert result.contact_only_rows == 1
+    assert result.case_ready_rows == 0
+    assert result.missing_product_codes == ["UNKNOWN-PRODUCT"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_contact_only_customer_import_is_applied_idempotently(
+    tmp_path: Path,
+    db_session: AsyncSession,
+) -> None:
+    generate_templates(tmp_path)
+    path = tmp_path / "customer_list_template.xlsx"
+    workbook = load_workbook(path)
+    workbook.active["E2"] = "UNKNOWN-PRODUCT"
+    workbook.save(path)
+
+    first = await import_customers(path, db_session, apply=True)
+    second = await import_customers(path, db_session, apply=True)
+
+    assert first.ok and second.ok
+    assert first.created_customers == 1
+    assert first.created_contacts == 1
+    assert first.created_cases == 0
+    assert second.created_customers == 0
+    assert second.created_contacts == 0
+    assert await db_session.scalar(select(func.count()).select_from(Customer)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(Contact)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 0
 
 
 @pytest.mark.asyncio

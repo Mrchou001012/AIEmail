@@ -171,6 +171,14 @@ class EmailMessage(Base):
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
+    customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL", name="fk_emails_customer_id_customers"),
+        index=True,
+    )
+    contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="SET NULL", name="fk_emails_contact_id_contacts"),
+        index=True,
+    )
     direction: Mapped[str] = mapped_column(String(16))
     mailbox: Mapped[str | None] = mapped_column(String(320))
     mailbox_folder: Mapped[str | None] = mapped_column(String(255))

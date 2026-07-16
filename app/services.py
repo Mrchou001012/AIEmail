@@ -51,6 +51,7 @@ from app.domain import (
     quote_valid_until,
     transition,
 )
+from app.history import resolve_unique_contact
 from app.imports import ContentBundle, load_content
 from app.integrations import DingTalkNotifier
 from app.mail import (
@@ -376,6 +377,8 @@ async def assign_handoff_case(
 
     previous_case_id = handoff.case_id
     email_row.case_id = case.id
+    email_row.customer_id = case.customer_id
+    email_row.contact_id = case.contact_id
     handoff.case_id = case.id
     case.status = CaseStatus.WAITING_HUMAN
     await audit(
@@ -436,6 +439,8 @@ async def create_case_for_handoff(
     session.add(sales_case)
     await session.flush()
     email_row.case_id = sales_case.id
+    email_row.customer_id = sales_case.customer_id
+    email_row.contact_id = sales_case.contact_id
     handoff.case_id = sales_case.id
     await audit(
         session,
@@ -548,6 +553,8 @@ async def queue_human_reply(
     session.add(
         EmailMessage(
             case_id=case.id,
+            customer_id=case.customer_id,
+            contact_id=case.contact_id,
             direction="OUTBOUND",
             message_id=message_id,
             in_reply_to=source_email.message_id,
@@ -749,6 +756,8 @@ async def freeze_outbox(
             session.add(
                 EmailMessage(
                     case_id=case.id,
+                    customer_id=case.customer_id,
+                    contact_id=case.contact_id,
                     direction="OUTBOUND",
                     message_id=message_id,
                     in_reply_to=in_reply_to,
@@ -890,7 +899,10 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
     historical_outbound = await session.scalar(
         select(EmailMessage)
         .where(
-            EmailMessage.case_id == case.id,
+            or_(
+                EmailMessage.case_id == case.id,
+                EmailMessage.contact_id == case.contact_id,
+            ),
             EmailMessage.direction == "OUTBOUND",
             EmailMessage.is_history.is_(True),
         )
@@ -1398,10 +1410,28 @@ async def ingest_raw_email(
     bounce_metadata = bounce.metadata() if bounce and bounce.is_bounce else {}
     if matched_outbox is not None:
         bounce_metadata["matched_outbox_id"] = matched_outbox.id
+    identity_contact = None
+    if case is None:
+        identity_addresses = (
+            [parsed.from_address] if direction == "INBOUND" else parsed.to_addresses
+        )
+        identity_contact = await resolve_unique_contact(session, identity_addresses)
+    identity_customer_id = (
+        case.customer_id
+        if case is not None
+        else identity_contact.customer_id if identity_contact is not None else None
+    )
+    identity_contact_id = (
+        case.contact_id
+        if case is not None
+        else identity_contact.id if identity_contact is not None else None
+    )
     try:
         async with session.begin_nested():
             row = EmailMessage(
                 case_id=case.id if case else None,
+                customer_id=identity_customer_id,
+                contact_id=identity_contact_id,
                 direction=direction,
                 mailbox=mailbox,
                 mailbox_folder=mailbox_folder,
@@ -1532,6 +1562,9 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
         case = await session.get(SalesCase, email_row.case_id)
     if case and email_row.case_id is None:
         email_row.case_id = case.id
+    if case:
+        email_row.customer_id = case.customer_id
+        email_row.contact_id = case.contact_id
 
     metadata = dict(email_row.bounce_metadata or {})
     if outbox is not None:
