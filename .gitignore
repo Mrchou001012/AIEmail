@@ -27,6 +27,7 @@ htmlcov/
 # Runtime mail, logs, generated messages, and local databases
 runtime/*
 !runtime/.gitkeep
+outputs/
 postgres_data/
 *.log
 *.db
