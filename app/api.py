@@ -16,8 +16,10 @@ from app.db import (
     AIInvocation,
     AuditEvent,
     CaseStatus,
+    Contact,
     Customer,
     DeliveryStatus,
+    EmailAddressStatus,
     EmailMessage,
     Handoff,
     Job,
@@ -25,6 +27,7 @@ from app.db import (
     MailboxDailyUsage,
     MailboxThrottle,
     Outbox,
+    PricePolicy,
     Product,
     Quote,
     SalesCase,
@@ -33,12 +36,21 @@ from app.db import (
 )
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
-from app.services import active_policy, enqueue_job, ingest_raw_email, seed_demo_data
+from app.services import (
+    active_policy,
+    assign_handoff_case,
+    create_case_for_handoff,
+    enqueue_job,
+    ingest_raw_email,
+    queue_human_reply,
+    seed_demo_data,
+)
 from app.settings import Settings, get_settings
 
 router = APIRouter()
 security = HTTPBasic()
 DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
+HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 
 
 def require_admin(
@@ -80,6 +92,23 @@ class CaseOutreachRequest(BaseModel):
 class HandoffUpdate(BaseModel):
     action: str
     note: str = ""
+
+
+class HandoffAssignmentRequest(BaseModel):
+    case_id: int = Field(gt=0)
+
+
+class HandoffCaseRequest(BaseModel):
+    contact_id: int = Field(gt=0)
+    product_id: int = Field(gt=0)
+    currency: str = Field(min_length=3, max_length=3)
+
+
+class HandoffReplyRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=998)
+    body_text: str = Field(min_length=1, max_length=50_000)
+    note: str = Field(default="", max_length=2_000)
+    resume_automation: bool = False
 
 
 def _dashboard_headers() -> dict[str, str]:
@@ -143,6 +172,17 @@ async def dashboard_data(
         select(func.count()).select_from(EmailMessage).where(
             EmailMessage.is_history.is_(True),
             EmailMessage.case_id.is_(None),
+        )
+    )
+    bounced_24h = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_bounce.is_(True),
+            EmailMessage.received_at >= since_day,
+        )
+    )
+    suppressed_addresses = await session.scalar(
+        select(func.count()).select_from(EmailAddressStatus).where(
+            EmailAddressStatus.suppressed.is_(True)
         )
     )
 
@@ -267,6 +307,8 @@ async def dashboard_data(
             "failed_jobs": int(failed_jobs or 0),
             "unmatched_history": int(unmatched_history or 0),
             "ai_failures": int(ai_failure_count or 0),
+            "bounced_24h": int(bounced_24h or 0),
+            "suppressed_addresses": int(suppressed_addresses or 0),
         },
         "cases_by_status": {status_key.value: count for status_key, count in case_status_counts.all()},
         "mailboxes": [
@@ -290,6 +332,16 @@ async def dashboard_data(
                 "subject": row.subject,
                 "received_at": row.received_at.isoformat(),
                 "is_history": row.is_history,
+                "is_automated_reply": row.is_automated_reply,
+                "automated_reply_type": row.automated_reply_type,
+                "automated_reply_handled_at": (
+                    row.automated_reply_handled_at.isoformat()
+                    if row.automated_reply_handled_at
+                    else None
+                ),
+                "is_bounce": row.is_bounce,
+                "bounce_type": row.bounce_type,
+                "bounce_handled_at": row.bounce_handled_at.isoformat() if row.bounce_handled_at else None,
                 "folder": row.mailbox_folder,
                 "attachments": len(row.attachment_metadata),
             }
@@ -384,6 +436,18 @@ async def email_detail(email_id: int, _: Admin, session: Session) -> dict[str, A
         "attachments": row.attachment_metadata,
         "received_at": row.received_at.isoformat(),
         "is_history": row.is_history,
+        "is_automated_reply": row.is_automated_reply,
+        "automated_reply_type": row.automated_reply_type,
+        "automated_reply_metadata": row.automated_reply_metadata,
+        "automated_reply_handled_at": (
+            row.automated_reply_handled_at.isoformat()
+            if row.automated_reply_handled_at
+            else None
+        ),
+        "is_bounce": row.is_bounce,
+        "bounce_type": row.bounce_type,
+        "bounce_metadata": row.bounce_metadata,
+        "bounce_handled_at": row.bounce_handled_at.isoformat() if row.bounce_handled_at else None,
         "body_text": row.body_text[:body_limit],
         "body_truncated": len(row.body_text) > body_limit,
     }
@@ -395,6 +459,7 @@ async def outbox_detail(outbox_id: int, _: Admin, session: Session) -> dict[str,
     if row is None:
         raise HTTPException(404, "Outbox record not found")
     message_limit = 30_000
+    recipient_status = await session.get(EmailAddressStatus, row.recipient.strip().casefold())
     return {
         "id": row.id,
         "case_id": row.case_id,
@@ -405,6 +470,30 @@ async def outbox_detail(outbox_id: int, _: Admin, session: Session) -> dict[str,
         "last_error": row.last_error,
         "created_at": row.created_at.isoformat(),
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        "approval_handoff_id": row.approval_handoff_id,
+        "human_approved_by": row.human_approved_by,
+        "human_approved_at": row.human_approved_at.isoformat() if row.human_approved_at else None,
+        "recipient_deliverability": (
+            {
+                "format_valid": recipient_status.format_valid,
+                "preflight_status": recipient_status.preflight_status,
+                "last_preflight_at": (
+                    recipient_status.last_preflight_at.isoformat()
+                    if recipient_status.last_preflight_at
+                    else None
+                ),
+                "suppressed": recipient_status.suppressed,
+                "suppression_reason": recipient_status.suppression_reason,
+                "last_bounce_type": recipient_status.last_bounce_type,
+                "last_bounce_at": (
+                    recipient_status.last_bounce_at.isoformat()
+                    if recipient_status.last_bounce_at
+                    else None
+                ),
+            }
+            if recipient_status
+            else None
+        ),
         "raw_message": row.raw_message[:message_limit],
         "message_truncated": len(row.raw_message) > message_limit,
     }
@@ -636,6 +725,93 @@ async def case_detail(case_id: int, _: Admin, session: Session) -> dict[str, Any
     }
 
 
+def _suggested_handoff_reply(
+    handoff: Handoff,
+    source_email: EmailMessage | None,
+    case: SalesCase | None,
+) -> dict[str, str]:
+    subject = (source_email.subject if source_email else "Your inquiry").strip()
+    if not subject.casefold().startswith("re:"):
+        subject = f"Re: {subject}"
+    contact_name = case.contact.name.strip() if case and case.contact.name.strip() else "Customer"
+    opening_by_reason = {
+        "PRICE_NEGOTIATION": (
+            "Thank you for your feedback on our quotation. We are reviewing your pricing request "
+            "and will confirm the best available terms with you."
+        ),
+        "PACKAGING_REVIEW": (
+            "Thank you for your inquiry. We are confirming the applicable packaging details and "
+            "will update you shortly."
+        ),
+        "SHIPPING_REQUEST": (
+            "Thank you for your inquiry. We are checking the requested delivery and shipping "
+            "details before confirming them."
+        ),
+        "THREAD_AMBIGUOUS": (
+            "Thank you for your email. We are reviewing the related quotation history to make "
+            "sure we respond with the correct information."
+        ),
+        "NEW_INQUIRY_REVIEW": (
+            "Thank you for your inquiry. We are reviewing the requested product details and will "
+            "reply with the appropriate information."
+        ),
+        "PERSONNEL_CHANGE": (
+            "Thank you for the update. We are reviewing the contact information before making any "
+            "changes to our records."
+        ),
+    }
+    opening = opening_by_reason.get(
+        handoff.reason_code,
+        "Thank you for your email. We are reviewing your request and will respond with the correct information.",
+    )
+    return {
+        "subject": subject[:998],
+        "body_text": f"Dear {contact_name},\n\n{opening}\n\nBest regards,",
+    }
+
+
+async def _handoff_case_payload(session: AsyncSession, case_id: int | None) -> dict[str, Any] | None:
+    if case_id is None:
+        return None
+    case = await session.scalar(
+        select(SalesCase)
+        .options(
+            selectinload(SalesCase.customer),
+            selectinload(SalesCase.contact),
+            selectinload(SalesCase.product),
+        )
+        .where(SalesCase.id == case_id)
+    )
+    if case is None:
+        return None
+    latest_quote = await session.scalar(
+        select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc())
+    )
+    return {
+        "id": case.id,
+        "company": case.customer.company_name,
+        "contact_name": case.contact.name,
+        "contact_email": case.contact.email,
+        "product": case.product.code,
+        "product_name": case.product.name,
+        "currency": case.currency,
+        "stage": case.stage.value,
+        "status": case.status.value,
+        "latest_quote": (
+            {
+                "id": latest_quote.id,
+                "round": latest_quote.round_number,
+                "unit_price": str(latest_quote.unit_price),
+                "currency": latest_quote.currency,
+                "quantity": latest_quote.quantity,
+                "valid_until": latest_quote.valid_until.isoformat(),
+            }
+            if latest_quote
+            else None
+        ),
+    }
+
+
 @router.get("/admin/handoffs")
 async def list_handoffs(_: Admin, session: Session) -> list[dict[str, Any]]:
     rows = (await session.execute(select(Handoff).order_by(Handoff.id.desc()))).scalars().all()
@@ -652,25 +828,230 @@ async def list_handoffs(_: Admin, session: Session) -> list[dict[str, Any]]:
     ]
 
 
+@router.get("/admin/handoffs/{handoff_id}/review", response_class=HTMLResponse, include_in_schema=False)
+async def handoff_review(handoff_id: int, _: Admin, session: Session) -> HTMLResponse:
+    if await session.get(Handoff, handoff_id) is None:
+        raise HTTPException(404, "Handoff not found")
+    return HTMLResponse(
+        HANDOFF_REVIEW_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
 @router.get("/admin/handoffs/{handoff_id}")
 async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[str, Any]:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
         raise HTTPException(404, "Handoff not found")
+    source_email = (
+        await session.get(EmailMessage, handoff.source_email_id)
+        if handoff.source_email_id is not None
+        else None
+    )
+    case_payload = await _handoff_case_payload(session, handoff.case_id)
+    case = None
+    if handoff.case_id is not None:
+        case = await session.scalar(
+            select(SalesCase)
+            .options(selectinload(SalesCase.contact))
+            .where(SalesCase.id == handoff.case_id)
+        )
+
+    candidate_ids = {
+        int(value)
+        for key in ("possible_related_case_ids", "recent_related_case_ids")
+        for value in handoff.extracted_facts.get(key, [])
+        if str(value).isdigit()
+    }
+    if source_email is not None:
+        sender_case_ids = (
+            (
+                await session.execute(
+                    select(SalesCase.id)
+                    .join(Contact, SalesCase.contact_id == Contact.id)
+                    .where(
+                        func.lower(Contact.email) == source_email.from_address.casefold(),
+                        SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
+                    )
+                    .limit(50)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidate_ids.update(sender_case_ids)
+    if handoff.case_id is not None:
+        candidate_ids.add(handoff.case_id)
+    candidate_cases = [
+        payload
+        for case_id in sorted(candidate_ids)
+        if (payload := await _handoff_case_payload(session, case_id)) is not None
+    ]
+
+    matching_contacts: list[Contact] = []
+    if source_email is not None:
+        matching_contacts = (
+            (
+                await session.execute(
+                    select(Contact)
+                    .where(func.lower(Contact.email) == source_email.from_address.casefold())
+                    .order_by(Contact.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    products = (
+        (
+            await session.execute(select(Product).where(Product.active.is_(True)).order_by(Product.code))
+        )
+        .scalars()
+        .all()
+    )
+    product_currency_rows = await session.execute(
+        select(PricePolicy.product_id, PricePolicy.currency).where(PricePolicy.active.is_(True))
+    )
+    currencies_by_product: dict[int, set[str]] = {}
+    for product_id, currency in product_currency_rows:
+        currencies_by_product.setdefault(product_id, set()).add(currency)
+    approved_outbox = await session.scalar(
+        select(Outbox).where(Outbox.approval_handoff_id == handoff.id)
+    )
     return {
         "id": handoff.id,
         "case_id": handoff.case_id,
+        "source_email_id": handoff.source_email_id,
         "reason": handoff.reason_code,
         "summary": handoff.summary,
         "facts": handoff.extracted_facts,
         "status": handoff.status,
         "dingtalk_status": handoff.dingtalk_status,
         "resolution_note": handoff.resolution_note,
+        "case": case_payload,
+        "source_email": (
+            {
+                "id": source_email.id,
+                "from": source_email.from_address,
+                "to": source_email.to_addresses,
+                "subject": source_email.subject,
+                "received_at": source_email.received_at.isoformat(),
+                "body_text": source_email.body_text[:50_000],
+                "body_truncated": len(source_email.body_text) > 50_000,
+                "attachments": source_email.attachment_metadata,
+            }
+            if source_email
+            else None
+        ),
+        "candidate_cases": candidate_cases,
+        "matching_contacts": [
+            {
+                "id": contact.id,
+                "customer_id": contact.customer_id,
+                "name": contact.name,
+                "email": contact.email,
+            }
+            for contact in matching_contacts
+        ],
+        "products": [
+            {
+                "id": product.id,
+                "code": product.code,
+                "name": product.name,
+                "currencies": sorted(currencies_by_product.get(product.id, set())),
+            }
+            for product in products
+        ],
+        "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
+        "approved_outbox": (
+            {
+                "id": approved_outbox.id,
+                "status": approved_outbox.status.value,
+                "human_approved_by": approved_outbox.human_approved_by,
+                "human_approved_at": (
+                    approved_outbox.human_approved_at.isoformat()
+                    if approved_outbox.human_approved_at
+                    else None
+                ),
+            }
+            if approved_outbox
+            else None
+        ),
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/assign")
+async def assign_handoff(
+    handoff_id: int,
+    request: HandoffAssignmentRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        handoff = await assign_handoff_case(
+            session,
+            handoff_id=handoff_id,
+            case_id=request.case_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"id": handoff.id, "case_id": handoff.case_id, "status": handoff.status}
+
+
+@router.post("/admin/handoffs/{handoff_id}/cases", status_code=201)
+async def create_handoff_case(
+    handoff_id: int,
+    request: HandoffCaseRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        case = await create_case_for_handoff(
+            session,
+            handoff_id=handoff_id,
+            contact_id=request.contact_id,
+            product_id=request.product_id,
+            currency=request.currency,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"case_id": case.id, "status": case.status.value}
+
+
+@router.post("/admin/handoffs/{handoff_id}/send", status_code=202)
+async def send_handoff_reply(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_human_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
     }
 
 
 @router.post("/admin/handoffs/{handoff_id}")
-async def update_handoff(handoff_id: int, update: HandoffUpdate, _: Admin, session: Session) -> dict[str, Any]:
+async def update_handoff(
+    handoff_id: int,
+    update: HandoffUpdate,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
         raise HTTPException(404, "Handoff not found")
@@ -713,6 +1094,18 @@ async def update_handoff(handoff_id: int, update: HandoffUpdate, _: Admin, sessi
                 for row in pending:
                     row.status = DeliveryStatus.CANCELLED
                     row.last_error = f"cancelled by handoff action: {update.action}"
+    session.add(
+        AuditEvent(
+            case_id=handoff.case_id,
+            actor=admin,
+            event_type="handoff.action",
+            data={
+                "handoff_id": handoff.id,
+                "action": update.action,
+                "note": update.note,
+            },
+        )
+    )
     await session.commit()
     return {"id": handoff.id, "status": handoff.status, "action": update.action}
 

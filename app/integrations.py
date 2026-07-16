@@ -12,7 +12,7 @@ class DingTalkNotifier:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
 
-    async def notify(self, handoff: Handoff, case: SalesCase | None) -> None:
+    async def notify(self, handoff: Handoff, case: SalesCase | None) -> str:
         case_id = case.id if case else "unmatched"
         title = f"Sales handoff #{handoff.id}: {handoff.reason_code}"
         text = (
@@ -20,11 +20,11 @@ class DingTalkNotifier:
             f"- Case: {case_id}\n"
             f"- Reason: {handoff.reason_code}\n"
             f"- Summary: {handoff.summary}\n"
-            f"- Review: {self.settings.public_base_url}/admin/handoffs/{handoff.id}\n"
+            f"- Review: {self.settings.public_base_url}/admin/handoffs/{handoff.id}/review\n"
         )
         if self.settings.dingtalk_transport != "webhook":
             logger.warning("DingTalk(log): %s", text.replace("\n", " | "))
-            return
+            return "LOGGED"
         if not self.settings.dingtalk_webhook_url:
             raise RuntimeError("DingTalk webhook is not configured")
         async with httpx.AsyncClient(timeout=15) as client:
@@ -36,3 +36,4 @@ class DingTalkNotifier:
             payload = response.json()
             if payload.get("errcode") not in {0, None}:
                 raise RuntimeError(f"DingTalk rejected notification: {payload.get('errmsg')}")
+        return "SENT"

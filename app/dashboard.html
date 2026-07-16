@@ -471,6 +471,8 @@
         yesNo("Gmail 同步", r.imap_sync_enabled),
         yesNo("安全模式", r.safe_mode),
         yesNo("自动发送", r.auto_send_enabled),
+        `<span class="chip">退信（24h）<strong>${esc(data.metrics?.bounced_24h ?? 0)}</strong></span>`,
+        `<span class="chip">永久抑制 <strong>${esc(data.metrics?.suppressed_addresses ?? 0)}</strong></span>`,
         `<span class="chip">案件 ${Object.entries(data.cases_by_status).map(([key, value]) => `${esc(key)} ${value}`).join(" · ") || "0"}</span>`
       ].join("");
 
@@ -488,7 +490,7 @@
         <tr>
           <td>${pill(row.direction)}${row.is_history ? '<span class="cell-sub">历史</span>' : ""}</td>
           <td>${fmt(row.received_at)}</td>
-          <td><button class="link-btn" data-detail="emails" data-id="${row.id}" data-title="邮件 #${row.id}">${esc(short(row.subject || "（无主题）", 72))}</button><span class="cell-sub">${row.attachments ? `${row.attachments} 个附件` : "无附件"}</span></td>
+          <td><button class="link-btn" data-detail="emails" data-id="${row.id}" data-title="邮件 #${row.id}">${esc(short(row.subject || "（无主题）", 72))}</button><span class="cell-sub">${row.bounce_type ? `退信 · ${esc(row.bounce_type)}` : (row.automated_reply_type ? `自动回复 · ${esc(row.automated_reply_type)}` : (row.attachments ? `${row.attachments} 个附件` : "无附件"))}</span></td>
           <td><span class="cell-main">${esc(row.direction === "INBOUND" ? row.from : (row.to || []).join(", "))}</span></td>
           <td><span class="mono">Case ${esc(row.case_id ?? "未匹配")}</span><span class="cell-sub">${esc(row.folder || "—")}</span></td>
         </tr>
@@ -500,7 +502,7 @@
         <tr>
           <td>${fmt(row.created_at)}<span class="cell-sub">#${row.id}</span></td>
           <td>${pill(row.reason)}</td>
-          <td><button class="link-btn" data-detail="handoffs" data-id="${row.id}" data-title="人工接管 #${row.id}">${esc(short(row.summary, 72))}</button><span class="cell-sub">${pill(row.status)}</span></td>
+          <td><a class="link-btn" href="/admin/handoffs/${row.id}/review">${esc(short(row.summary, 72))}</a><span class="cell-sub">${pill(row.status)}</span></td>
           <td>${pill(row.dingtalk_status)}</td>
         </tr>
       `).join("") : empty(4);
@@ -596,10 +598,16 @@
         if (!response.ok) throw new Error(`读取详情失败（HTTP ${response.status}）`);
         const data = await response.json();
         if (kind === "emails") {
-          $("#dialog-meta").textContent = `${data.direction} · ${data.from} → ${(data.to || []).join(", ")}\n${data.subject || "（无主题）"}`;
+          const autoReply = data.automated_reply_type
+            ? `\n自动回复：${data.automated_reply_type} · ${data.automated_reply_handled_at ? "已处理" : "待处理"}\n${JSON.stringify(data.automated_reply_metadata || {})}`
+            : "";
+          const bounce = data.bounce_type
+            ? `\n退信：${data.bounce_type} · ${data.bounce_handled_at ? "已处理" : "待处理"}\n${JSON.stringify(data.bounce_metadata || {})}`
+            : "";
+          $("#dialog-meta").textContent = `${data.direction} · ${data.from} → ${(data.to || []).join(", ")}\n${data.subject || "（无主题）"}${autoReply}${bounce}`;
           $("#dialog-body").textContent = `${data.body_text || "（无纯文本正文）"}${data.body_truncated ? "\n\n[正文过长，页面仅显示前 30000 字符]" : ""}`;
         } else if (kind === "outbox") {
-          $("#dialog-meta").textContent = `${data.status} · ${data.recipient} · 尝试 ${data.attempts} 次${data.last_error ? `\n错误：${data.last_error}` : ""}`;
+          $("#dialog-meta").textContent = `${data.status} · ${data.recipient} · 尝试 ${data.attempts} 次${data.last_error ? `\n错误：${data.last_error}` : ""}${data.recipient_deliverability ? `\n可达性：${JSON.stringify(data.recipient_deliverability)}` : ""}`;
           $("#dialog-body").textContent = `${data.raw_message || "（无邮件内容）"}${data.message_truncated ? "\n\n[内容过长，页面仅显示前 30000 字符]" : ""}`;
         } else {
           $("#dialog-meta").textContent = `${kind} #${id}`;

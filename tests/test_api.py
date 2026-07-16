@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.api import dashboard, health
+from app.api import HANDOFF_REVIEW_PATH, dashboard, health
 
 
 @pytest.mark.asyncio
@@ -39,3 +39,14 @@ async def test_dashboard_is_a_protected_no_store_html_surface() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+def test_handoff_review_page_exposes_complete_human_workflow() -> None:
+    html = HANDOFF_REVIEW_PATH.read_text(encoding="utf-8")
+
+    assert "人工处理" in html
+    assert "/assign" in html
+    assert "/cases" in html
+    assert "/send" in html
+    assert "确认并加入发件队列" in html
+    assert "resume_automation" in html

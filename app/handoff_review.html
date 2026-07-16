@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIEmail 人工处理</title>
+  <style>
+    :root { color-scheme: light; --bg:#f5f7fb; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#175cd3; --red:#b42318; --green:#067647; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,input,select,textarea { font:inherit; }
+    .shell { max-width:1180px; margin:0 auto; padding:24px; }
+    .top { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    h1 { margin:0; font-size:24px; }
+    .sub { color:var(--muted); margin-top:4px; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(340px,.75fr); gap:18px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 4px 18px rgba(16,24,40,.04); margin-bottom:18px; }
+    .card h2 { font-size:16px; margin:0 0 14px; }
+    .meta { display:grid; grid-template-columns:120px 1fr; gap:8px 14px; }
+    .label { color:var(--muted); }
+    .pill { display:inline-flex; border-radius:999px; padding:3px 9px; background:#eef4ff; color:#1849a9; font-weight:650; }
+    .danger { color:var(--red); }
+    .success { color:var(--green); }
+    .mail { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:14px; max-height:440px; overflow:auto; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:260px; overflow:auto; }
+    label { display:block; font-weight:650; margin:12px 0 6px; }
+    input,select,textarea { width:100%; border:1px solid #c7d0dd; border-radius:9px; padding:9px 11px; background:#fff; color:var(--ink); }
+    textarea { min-height:250px; resize:vertical; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+    button { border:0; border-radius:9px; padding:9px 13px; cursor:pointer; background:#e9eef6; color:var(--ink); font-weight:650; }
+    button.primary { background:var(--blue); color:#fff; }
+    button.warn { background:#fff1f0; color:var(--red); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .check { display:flex; align-items:center; gap:8px; font-weight:400; }
+    .check input { width:auto; }
+    #notice { display:none; margin-bottom:16px; border-radius:10px; padding:11px 13px; background:#eef4ff; }
+    #notice.error { display:block; background:#fff1f0; color:var(--red); }
+    #notice.ok { display:block; background:#ecfdf3; color:var(--green); }
+    .hidden { display:none !important; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } .shell { padding:14px; } .meta { grid-template-columns:90px 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="top">
+      <div><h1>人工处理 <span id="handoff-id"></span></h1><div class="sub" id="headline">正在读取处理单…</div></div>
+      <a href="/dashboard">← 返回运行看板</a>
+    </div>
+    <div id="notice"></div>
+    <div class="grid">
+      <section>
+        <article class="card">
+          <h2>客户原邮件</h2>
+          <div class="meta" id="email-meta"></div>
+          <div class="mail" id="email-body">暂无原邮件</div>
+        </article>
+        <article class="card">
+          <h2>系统判断</h2>
+          <div class="meta" id="handoff-meta"></div>
+          <pre id="facts">{}</pre>
+        </article>
+        <article class="card">
+          <h2>当前关联案例</h2>
+          <div id="case-detail" class="sub">尚未关联案例</div>
+          <div id="association-tools">
+            <label for="case-select">关联已有案例</label>
+            <select id="case-select"></select>
+            <button id="assign" type="button">确认关联</button>
+            <div id="new-case-tools">
+              <label>或建立新案例</label>
+              <div class="row"><select id="contact-select"></select><select id="product-select"></select></div>
+              <div class="row"><input id="currency" value="INR" maxlength="3" aria-label="币种"><button id="create-case" type="button">建立并关联</button></div>
+            </div>
+          </div>
+        </article>
+      </section>
+      <aside>
+        <article class="card">
+          <h2>人工回复</h2>
+          <div class="sub">以下是保守建议草稿。请人工核对并修改；发送时系统自动追加正式签名。</div>
+          <label for="reply-subject">邮件主题</label>
+          <input id="reply-subject" maxlength="998">
+          <label for="reply-body">邮件正文</label>
+          <textarea id="reply-body" maxlength="50000"></textarea>
+          <label for="reply-note">处理备注</label>
+          <input id="reply-note" maxlength="2000" placeholder="例如：已核对价格并人工回复">
+          <label class="check"><input id="resume" type="checkbox">发送后恢复该案例的 AI 自动处理</label>
+          <div class="actions"><button class="primary" id="send" type="button">确认并加入发件队列</button></div>
+          <div class="sub" id="send-state"></div>
+        </article>
+        <article class="card">
+          <h2>其他处理</h2>
+          <div class="actions">
+            <button id="takeover" type="button">人工接管</button>
+            <button id="pause" type="button">暂停案例</button>
+            <button id="resume-case" type="button">恢复案例</button>
+            <button class="warn" id="resolve" type="button">关闭处理单</button>
+          </div>
+        </article>
+      </aside>
+    </div>
+  </main>
+  <script>
+    const id = Number(location.pathname.match(/handoffs\/(\d+)\/review/)?.[1]);
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    let state = null;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {headers:{"Content-Type":"application/json", ...(options.headers || {})}, ...options});
+      if (!response.ok) {
+        let message = `${response.status} ${response.statusText}`;
+        try { message = (await response.json()).detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+    function notice(message, kind = "ok") { const node = $("#notice"); node.className = kind; node.textContent = message; }
+    function options(select, rows, label) {
+      select.innerHTML = rows.length ? rows.map((row) => `<option value="${esc(row.id)}">${esc(label(row))}</option>`).join("") : '<option value="">暂无可选项</option>';
+    }
+    function renderCase(data) {
+      const node = $("#case-detail");
+      if (!data) { node.textContent = "尚未关联案例；发送前必须关联或建立案例。"; return; }
+      node.innerHTML = `<div class="meta"><span class="label">案例</span><strong>#${esc(data.id)} · ${esc(data.company)}</strong><span class="label">联系人</span><span>${esc(data.contact_name)} · ${esc(data.contact_email)}</span><span class="label">产品</span><span>${esc(data.product)} · ${esc(data.currency)}</span><span class="label">状态</span><span>${esc(data.stage)} / ${esc(data.status)}</span><span class="label">最新报价</span><span>${data.latest_quote ? esc(`${data.latest_quote.currency} ${data.latest_quote.unit_price} · ${data.latest_quote.quantity} · 有效至 ${data.latest_quote.valid_until}`) : "无"}</span></div>`;
+    }
+    function render(data) {
+      state = data;
+      $("#handoff-id").textContent = `#${data.id}`;
+      $("#headline").textContent = `${data.reason} · ${data.status} · ${data.summary}`;
+      const mail = data.source_email;
+      $("#email-meta").innerHTML = mail ? `<span class="label">发件人</span><span>${esc(mail.from)}</span><span class="label">主题</span><strong>${esc(mail.subject)}</strong><span class="label">时间</span><span>${esc(new Date(mail.received_at).toLocaleString())}</span><span class="label">附件</span><span>${esc((mail.attachments || []).map((item) => item.filename).join(", ") || "无")}</span>` : '<span class="danger">该处理单没有原始收件</span>';
+      $("#email-body").textContent = mail?.body_text || "暂无原邮件";
+      $("#handoff-meta").innerHTML = `<span class="label">原因</span><span class="pill">${esc(data.reason)}</span><span class="label">摘要</span><span>${esc(data.summary)}</span><span class="label">通知</span><span>${esc(data.dingtalk_status)}</span><span class="label">处理备注</span><span>${esc(data.resolution_note || "无")}</span>`;
+      $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
+      renderCase(data.case);
+      options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product} · ${row.status}`);
+      options($("#contact-select"), data.matching_contacts || [], (row) => `${row.name} · ${row.email}`);
+      options($("#product-select"), data.products || [], (row) => `${row.code} · ${row.name}`);
+      if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
+      if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
+      $("#association-tools").classList.toggle("hidden", Boolean(data.case));
+      const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
+      $("#send").disabled = blocked;
+      $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
+    }
+    async function load() { try { render(await api(`/admin/handoffs/${id}`)); } catch (error) { notice(error.message, "error"); } }
+    async function post(path, payload, success) { try { await api(path, {method:"POST", body:JSON.stringify(payload)}); notice(success); await load(); } catch (error) { notice(error.message, "error"); } }
+
+    $("#assign").addEventListener("click", () => post(`/admin/handoffs/${id}/assign`, {case_id:Number($("#case-select").value)}, "案例已关联。"));
+    $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
+    $("#create-case").addEventListener("click", () => post(`/admin/handoffs/${id}/cases`, {contact_id:Number($("#contact-select").value), product_id:Number($("#product-select").value), currency:$("#currency").value.trim().toUpperCase()}, "新案例已建立并关联。"));
+    $("#send").addEventListener("click", async () => {
+      if (!confirm("确认以当前内容回复客户？邮件将进入发件队列并记录你的账号。")) return;
+      await post(`/admin/handoffs/${id}/send`, {subject:$("#reply-subject").value, body_text:$("#reply-body").value, note:$("#reply-note").value, resume_automation:$("#resume").checked}, "人工回复已加入发件队列。");
+    });
+    for (const [selector, action, message] of [["#takeover","takeover","案例已设为人工接管。"],["#pause","pause","案例已暂停。"],["#resume-case","resume","案例已恢复。"],["#resolve","resolve","处理单已关闭。"]]) {
+      $(selector).addEventListener("click", () => post(`/admin/handoffs/${id}`, {action, note:$("#reply-note").value}, message));
+    }
+    load();
+  </script>
+</body>
+</html>
