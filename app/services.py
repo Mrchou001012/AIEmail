@@ -2,18 +2,22 @@ import asyncio
 import hashlib
 import html
 import logging
+import re
 import smtplib
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email.utils import parseaddr
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.ai import AIClient, validate_rendered_email
+from app.auto_replies import AutomatedReplyType, classify_automated_reply
+from app.bounces import BounceType, classify_bounce, classify_smtp_failure
 from app.db import (
     AIInvocation,
     AuditEvent,
@@ -22,6 +26,8 @@ from app.db import (
     Contact,
     Customer,
     DeliveryStatus,
+    EmailAddressStatus,
+    EmailDomainStatus,
     EmailMessage,
     Handoff,
     Job,
@@ -33,6 +39,7 @@ from app.db import (
     Quote,
     SalesCase,
 )
+from app.deliverability import MXResult, MXStatus, lookup_mx, validate_address_format
 from app.domain import (
     HandoffReason,
     Intent,
@@ -41,14 +48,51 @@ from app.domain import (
     counteroffer,
     evaluate_send_policy,
     initial_quote,
+    quote_valid_until,
     transition,
 )
 from app.imports import ContentBundle, load_content
 from app.integrations import DingTalkNotifier
-from app.mail import GmailIMAPClient, build_message, match_case, parse_mime, transport_for
+from app.mail import (
+    GmailIMAPClient,
+    ParsedEmail,
+    build_message,
+    has_thread_subject_prefix,
+    match_case,
+    normalized_subject,
+    parse_mime,
+    transport_for,
+)
+from app.products import canonical_product_code, find_product_codes, product_codes_match
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+PRIOR_THREAD_MARKERS = (
+    "previous quote",
+    "previous quotation",
+    "earlier quote",
+    "earlier quotation",
+    "last quote",
+    "last price",
+    "as discussed",
+    "as agreed",
+    "same as before",
+    "revised quote",
+    "revised quotation",
+    "revise your quote",
+    "follow up on",
+    "our previous conversation",
+    "your previous offer",
+)
+
+
+@dataclass(frozen=True)
+class NewInquiryResolution:
+    case: SalesCase | None
+    reason: HandoffReason | None = None
+    summary: str | None = None
+    facts: dict[str, Any] | None = None
 
 
 def _pricing_policy(row: PricePolicy) -> PricingPolicy:
@@ -65,6 +109,10 @@ def _pricing_policy(row: PricePolicy) -> PricingPolicy:
         allowed_incoterms=tuple(row.allowed_incoterms),
         standard_payment_term=row.standard_payment_term,
         allowed_payment_terms=tuple(row.allowed_payment_terms),
+        tier_1_max_multiple=Decimal(row.tier_1_max_multiple) if row.tier_1_max_multiple is not None else None,
+        tier_1_markup_pct=Decimal(row.tier_1_markup_pct),
+        tier_2_max_multiple=Decimal(row.tier_2_max_multiple) if row.tier_2_max_multiple is not None else None,
+        tier_2_markup_pct=Decimal(row.tier_2_markup_pct),
     )
 
 
@@ -77,6 +125,145 @@ async def audit(
     data: dict[str, Any] | None = None,
 ) -> None:
     session.add(AuditEvent(case_id=case_id, actor=actor, event_type=event_type, data=data or {}))
+
+
+async def _email_address_status(session: AsyncSession, email_address: str) -> EmailAddressStatus:
+    normalized = email_address.strip().casefold()[:320]
+    row = await session.get(EmailAddressStatus, normalized)
+    if row is None:
+        row = EmailAddressStatus(email=normalized, suppressed=False)
+        session.add(row)
+        await session.flush()
+    return row
+
+
+async def _suppress_email_address(
+    session: AsyncSession,
+    email_address: str,
+    *,
+    reason: str,
+    source_email_id: int | None = None,
+    bounce_type: str | None = None,
+    diagnostic: str | None = None,
+) -> EmailAddressStatus:
+    now = datetime.now(UTC)
+    status = await _email_address_status(session, email_address)
+    status.suppressed = True
+    status.suppression_reason = reason
+    status.suppression_source_email_id = source_email_id
+    status.suppressed_at = status.suppressed_at or now
+    if bounce_type:
+        status.last_bounce_at = now
+        status.last_bounce_type = bounce_type
+        status.last_bounce_diagnostic = diagnostic[:2000] if diagnostic else None
+    contacts = (
+        (
+            await session.execute(
+                select(Contact).where(func.lower(Contact.email) == status.email)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for contact in contacts:
+        contact.suppressed = True
+    return status
+
+
+async def _recipient_preflight(
+    session: AsyncSession,
+    recipient: str,
+    settings: Settings,
+) -> tuple[str, str, dict[str, Any]]:
+    """Return ALLOW, BLOCK, or DEFER plus a stable detail and audit facts."""
+    if not settings.email_preflight_enabled:
+        return "ALLOW", "recipient preflight disabled", {"preflight_status": "DISABLED"}
+
+    now = datetime.now(UTC)
+    format_result = validate_address_format(recipient)
+    status = await _email_address_status(session, format_result.normalized)
+    status.format_valid = format_result.valid
+    status.domain = format_result.domain
+    status.last_preflight_at = now
+    if status.suppressed:
+        status.preflight_status = "SUPPRESSED"
+        detail = f"recipient permanently suppressed: {status.suppression_reason or 'unspecified'}"
+        status.last_preflight_detail = detail
+        return "BLOCK", detail, {
+            "recipient": status.email,
+            "preflight_status": "SUPPRESSED",
+            "suppression_reason": status.suppression_reason,
+        }
+    if not format_result.valid:
+        detail = f"invalid recipient format: {format_result.error or 'invalid address'}"
+        status.preflight_status = "INVALID_FORMAT"
+        status.last_preflight_detail = detail
+        await _suppress_email_address(session, status.email, reason="INVALID_FORMAT")
+        return "BLOCK", detail, {
+            "recipient": status.email,
+            "preflight_status": "INVALID_FORMAT",
+            "format_error": format_result.error,
+        }
+    if not settings.mx_check_enabled:
+        status.preflight_status = MXStatus.UNCHECKED.value
+        status.last_preflight_detail = "MX checking disabled"
+        return "ALLOW", "MX checking disabled", {
+            "recipient": status.email,
+            "domain": status.domain,
+            "preflight_status": MXStatus.UNCHECKED.value,
+        }
+
+    assert format_result.domain is not None
+    domain_status = await session.get(EmailDomainStatus, format_result.domain)
+    cache_ttl = (
+        timedelta(minutes=settings.mx_temporary_retry_minutes)
+        if domain_status and domain_status.mx_status == MXStatus.TEMPORARY_ERROR.value
+        else timedelta(hours=settings.mx_cache_ttl_hours)
+    )
+    cache_fresh = bool(domain_status and domain_status.checked_at >= now - cache_ttl)
+    if cache_fresh and domain_status is not None:
+        mx_result = MXResult(
+            MXStatus(domain_status.mx_status),
+            domain_status.domain,
+            tuple(domain_status.mx_records),
+            domain_status.last_error,
+        )
+    else:
+        mx_result = await asyncio.to_thread(
+            lookup_mx,
+            format_result.domain,
+            timeout_seconds=settings.mx_lookup_timeout_seconds,
+        )
+        if domain_status is None:
+            domain_status = EmailDomainStatus(
+                domain=format_result.domain,
+                mx_status=mx_result.status.value,
+                mx_records=list(mx_result.records),
+                checked_at=now,
+                last_error=mx_result.error,
+            )
+            session.add(domain_status)
+        else:
+            domain_status.mx_status = mx_result.status.value
+            domain_status.mx_records = list(mx_result.records)
+            domain_status.checked_at = now
+            domain_status.last_error = mx_result.error
+
+    status.preflight_status = mx_result.status.value
+    status.last_preflight_detail = mx_result.error
+    facts = {
+        "recipient": status.email,
+        "domain": mx_result.domain,
+        "preflight_status": mx_result.status.value,
+        "mx_records": list(mx_result.records),
+        "cache_hit": cache_fresh,
+        "detail": mx_result.error,
+    }
+    if mx_result.deliverable:
+        return "ALLOW", "recipient format and MX checks passed", facts
+    if mx_result.temporary:
+        return "DEFER", mx_result.error or "temporary DNS lookup failure", facts
+    return "BLOCK", mx_result.error or "recipient domain cannot receive email", facts
 
 
 async def enqueue_job(
@@ -156,6 +343,241 @@ async def create_handoff(
         f"handoff-notify:{handoff.id}",
     )
     return handoff
+
+
+async def assign_handoff_case(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    case_id: int,
+    actor: str,
+) -> Handoff:
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.source_email_id is None:
+        raise ValueError("handoff has no source email to associate")
+    email_row = await session.get(EmailMessage, handoff.source_email_id)
+    case = await session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.contact))
+        .where(SalesCase.id == case_id)
+    )
+    if email_row is None or case is None:
+        raise ValueError("source email or case not found")
+    if email_row.direction != "INBOUND":
+        raise ValueError("only inbound email can be associated with a handoff case")
+    if case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        raise ValueError("closed case cannot accept a new inbound email")
+    if email_row.from_address.casefold() != case.contact.email.casefold():
+        raise ValueError("source sender does not match the selected case contact")
+    if email_row.case_id not in {None, case.id}:
+        raise ValueError("source email is already associated with a different case")
+
+    previous_case_id = handoff.case_id
+    email_row.case_id = case.id
+    handoff.case_id = case.id
+    case.status = CaseStatus.WAITING_HUMAN
+    await audit(
+        session,
+        "handoff.case_assigned",
+        case_id=case.id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "email_id": email_row.id,
+            "previous_case_id": previous_case_id,
+        },
+    )
+    await session.commit()
+    return handoff
+
+
+async def create_case_for_handoff(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    contact_id: int,
+    product_id: int,
+    currency: str,
+    actor: str,
+) -> SalesCase:
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.source_email_id is None:
+        raise ValueError("handoff has no source email")
+    email_row = await session.get(EmailMessage, handoff.source_email_id)
+    contact = await session.get(Contact, contact_id)
+    product = await session.get(Product, product_id)
+    normalized_currency = currency.strip().upper()
+    if email_row is None or contact is None or product is None:
+        raise ValueError("source email, contact, or product not found")
+    if email_row.direction != "INBOUND":
+        raise ValueError("only inbound email can create a reviewed case")
+    if email_row.from_address.casefold() != contact.email.casefold():
+        raise ValueError("source sender does not match the selected contact")
+    if not product.active:
+        raise ValueError("inactive product cannot be selected")
+    if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+        raise ValueError("currency must be a three-letter code")
+    if email_row.case_id is not None or handoff.case_id is not None:
+        raise ValueError("handoff is already associated with a case")
+
+    sales_case = SalesCase(
+        customer_id=contact.customer_id,
+        contact_id=contact.id,
+        product_id=product.id,
+        currency=normalized_currency,
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.WAITING_HUMAN,
+        subject_key=normalized_subject(email_row.subject)[:255],
+    )
+    session.add(sales_case)
+    await session.flush()
+    email_row.case_id = sales_case.id
+    handoff.case_id = sales_case.id
+    await audit(
+        session,
+        "handoff.case_created",
+        case_id=sales_case.id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "email_id": email_row.id,
+            "contact_id": contact.id,
+            "product_id": product.id,
+            "currency": normalized_currency,
+        },
+    )
+    await session.commit()
+    return sales_case
+
+
+async def queue_human_reply(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    subject: str,
+    body_text: str,
+    actor: str,
+    note: str = "",
+    resume_automation: bool = False,
+) -> Outbox:
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    existing = await session.scalar(
+        select(Outbox).where(
+            or_(
+                Outbox.approval_handoff_id == handoff.id,
+                Outbox.business_key == f"handoff-reply:{handoff.id}",
+            )
+        )
+    )
+    if existing is not None:
+        return existing
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.case_id is None or handoff.source_email_id is None:
+        raise ValueError("associate the handoff with a case before replying")
+    source_email = await session.get(EmailMessage, handoff.source_email_id)
+    case = await session.scalar(
+        select(SalesCase)
+        .options(
+            selectinload(SalesCase.customer),
+            selectinload(SalesCase.contact),
+            selectinload(SalesCase.product),
+        )
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if source_email is None or case is None:
+        raise ValueError("source email or associated case not found")
+    if source_email.direction != "INBOUND":
+        raise ValueError("human reply requires an inbound source email")
+    if source_email.from_address.casefold() != case.contact.email.casefold():
+        raise ValueError("source sender does not match the associated case contact")
+    if case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        raise ValueError("closed case cannot send a reviewed reply")
+    if case.customer.do_not_contact or case.contact.suppressed:
+        raise ValueError("recipient is suppressed or marked do-not-contact")
+    address_status = await session.get(EmailAddressStatus, case.contact.email.casefold())
+    if address_status is not None and address_status.suppressed:
+        raise ValueError("recipient address is permanently suppressed")
+
+    clean_subject = subject.strip()
+    clean_body = body_text.strip()
+    if not clean_subject or "\r" in clean_subject or "\n" in clean_subject:
+        raise ValueError("subject must be a single non-empty line")
+    if not clean_body:
+        raise ValueError("reply body cannot be empty")
+    bundle = load_content(get_settings().content_dir)
+    signed_text = "\n".join([clean_body, "", bundle.signature_text.strip()])
+    html_lines = [
+        f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
+        for line in clean_body.splitlines()
+    ]
+    signed_html = "".join(html_lines) + bundle.signature_html
+    references = list(dict.fromkeys([*source_email.references_json, source_email.message_id]))
+    references = [item for item in references if item]
+    business_key = f"handoff-reply:{handoff.id}"
+    message_id, raw = build_message(
+        from_address=get_settings().mail_from,
+        recipient=case.contact.email,
+        subject=clean_subject,
+        text_body=signed_text,
+        html_body=signed_html,
+        stable_key=business_key,
+        in_reply_to=source_email.message_id,
+        references=references,
+    )
+    parsed_outbound = parse_mime(raw.encode("utf-8"))
+    now = datetime.now(UTC)
+    outbox = Outbox(
+        case_id=case.id,
+        business_key=business_key,
+        message_id=message_id,
+        recipient=case.contact.email,
+        raw_message=raw,
+        approval_handoff_id=handoff.id,
+        human_approved_by=actor[:128],
+        human_approved_at=now,
+    )
+    session.add(outbox)
+    await session.flush()
+    session.add(
+        EmailMessage(
+            case_id=case.id,
+            direction="OUTBOUND",
+            message_id=message_id,
+            in_reply_to=source_email.message_id,
+            references_json=references,
+            from_address=parseaddr(get_settings().mail_from)[1],
+            to_addresses=[case.contact.email],
+            subject=clean_subject,
+            body_text=signed_text,
+            body_html=signed_html,
+            attachment_metadata=[],
+            raw_sha256=parsed_outbound.raw_sha256,
+        )
+    )
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = note.strip() or f"Reply approved by {actor}"
+    case.status = CaseStatus.ACTIVE if resume_automation else CaseStatus.HUMAN_TAKEOVER
+    await audit(
+        session,
+        "handoff.reply_approved",
+        case_id=case.id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "outbox_id": outbox.id,
+            "message_id": message_id,
+            "resume_automation": resume_automation,
+        },
+    )
+    await session.commit()
+    return outbox
 
 
 async def active_policy(session: AsyncSession, product_id: int, currency: str) -> PricePolicy | None:
@@ -247,6 +669,9 @@ def render_quote(
     incoterm: str,
     payment_term: str,
     valid_until: date,
+    taxes_included: bool = False,
+    freight_included: bool = False,
+    availability: str = "Ready stock",
 ) -> tuple[str, str]:
     snippet = bundle.product_snippets[product_key]
     # Free-form model prose is deliberately not inserted into a commercial email.
@@ -256,7 +681,7 @@ def render_quote(
     opening = "Thank you for your inquiry."
     price_lead_in = "Please find our standard quotation details below."
     closing = "Please let us know if you have questions about this non-binding standard quotation."
-    lines = [
+    body_lines = [
         greeting,
         "",
         opening,
@@ -265,18 +690,25 @@ def render_quote(
         price_lead_in,
         f"Product: {product_name}",
         f"Quantity: {quantity} {unit}",
-        f"Unit price: {currency} {price:.4f}",
-        f"Incoterm: {incoterm}",
+        f"Unit price: {currency} {price:.4f} per {unit}",
+        f"Availability: {availability}",
+        f"Price basis: {incoterm} (ex-warehouse)",
+        f"Taxes: {'included' if taxes_included else 'excluded'}",
+        f"Freight: {'included' if freight_included else 'excluded'}",
         f"Payment term: {payment_term}",
-        f"Quote valid until: {valid_until.isoformat()}",
+        f"Quote valid until: {valid_until.isoformat()} ({valid_until.strftime('%A')})",
         "",
         closing,
-        "",
-        bundle.signature_text.strip(),
     ]
-    text = "\n".join(lines)
-    html_body = "<p>" + "</p><p>".join(html.escape(line) if line else "&nbsp;" for line in lines[:-1]) + "</p>" + bundle.signature_html
-    validate_rendered_email(text, exact_price=price, currency=currency, approved_fragments=[snippet])
+    business_text = "\n".join(body_lines)
+    validate_rendered_email(business_text, exact_price=price, currency=currency, approved_fragments=[snippet])
+    text = "\n".join([business_text, "", bundle.signature_text.strip()])
+    html_body = (
+        "<p>"
+        + "</p><p>".join(html.escape(line) if line else "&nbsp;" for line in body_lines)
+        + "</p>"
+        + bundle.signature_html
+    )
     return text, html_body
 
 
@@ -381,7 +813,10 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
     )
     session.add(case)
     await session.flush()
-    valid_until = date.today() + timedelta(days=policy_row.quote_valid_days)
+    valid_until = quote_valid_until(
+        quote_valid_days=policy_row.quote_valid_days,
+        quote_valid_weekday=policy_row.quote_valid_weekday,
+    )
     quote = Quote(
         case_id=case.id,
         price_policy_id=policy_row.id,
@@ -397,6 +832,8 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
             "absolute_floor": str(policy_row.absolute_floor),
             "hard_minimum": str(decision.hard_minimum),
             "max_discount_pct": str(policy_row.max_discount_pct),
+            "applied_markup_pct": str(decision.applied_markup_pct),
+            "pricing_tier": decision.reason,
         },
     )
     session.add(quote)
@@ -422,6 +859,8 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
         incoterm=policy_row.standard_incoterm,
         payment_term=policy_row.standard_payment_term,
         valid_until=valid_until,
+        taxes_included=policy_row.taxes_included,
+        freight_included=policy_row.freight_included,
     )
     await freeze_outbox(
         session,
@@ -522,7 +961,10 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             facts={"quantity": quantity, "hard_minimum": str(decision.hard_minimum)},
         )
         return
-    valid_until = date.today() + timedelta(days=policy_row.quote_valid_days)
+    valid_until = quote_valid_until(
+        quote_valid_days=policy_row.quote_valid_days,
+        quote_valid_weekday=policy_row.quote_valid_weekday,
+    )
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
@@ -552,6 +994,8 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             incoterm=policy_row.standard_incoterm,
             payment_term=policy_row.standard_payment_term,
             valid_until=valid_until,
+            taxes_included=policy_row.taxes_included,
+            freight_included=policy_row.freight_included,
         )
     except Exception as exc:
         await create_handoff(
@@ -576,6 +1020,8 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             "absolute_floor": str(policy_row.absolute_floor),
             "hard_minimum": str(decision.hard_minimum),
             "max_discount_pct": str(policy_row.max_discount_pct),
+            "applied_markup_pct": str(decision.applied_markup_pct),
+            "pricing_tier": decision.reason,
         },
     )
     session.add(quote)
@@ -598,7 +1044,18 @@ async def _ensure_inbound_follow_up(
     row: EmailMessage,
     *,
     ambiguous: bool = False,
+    review_reason: HandoffReason | None = None,
+    review_summary: str | None = None,
+    review_facts: dict[str, Any] | None = None,
 ) -> None:
+    if row.is_bounce:
+        await enqueue_job(
+            session,
+            "process_inbound",
+            {"email_id": row.id},
+            f"process-inbound:{row.id}",
+        )
+        return
     if row.case_id is not None:
         await enqueue_job(
             session,
@@ -611,9 +1068,245 @@ async def _ensure_inbound_follow_up(
     await create_handoff(
         session,
         case=None,
-        reason=HandoffReason.THREAD_AMBIGUOUS,
-        summary=f"{summary_prefix} from {row.from_address}: {row.subject}",
+        reason=review_reason or HandoffReason.THREAD_AMBIGUOUS,
+        summary=review_summary or f"{summary_prefix} from {row.from_address}: {row.subject}",
+        facts=review_facts,
         source_email_id=row.id,
+    )
+
+
+def _explicit_product_codes(text: str) -> list[str]:
+    codes = find_product_codes(text)
+    explicit = re.findall(
+        r"\b(?:SKU|PRODUCT)\s*[:#-]?\s*([A-Z0-9][A-Z0-9_()%.\-]{1,63})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return list(dict.fromkeys([*codes, *(canonical_product_code(value) for value in explicit)]))
+
+
+def _prior_thread_marker(text: str) -> str | None:
+    lowered = text.casefold()
+    return next((marker for marker in PRIOR_THREAD_MARKERS if marker in lowered), None)
+
+
+async def _resolve_new_inquiry_case(
+    session: AsyncSession,
+    parsed: ParsedEmail,
+) -> NewInquiryResolution:
+    sender = parsed.from_address.strip().lower()
+    facts: dict[str, Any] = {
+        "new_thread": True,
+        "sender": sender,
+        "subject": parsed.subject,
+    }
+    if not sender:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.NEW_INQUIRY_REVIEW,
+            "New inbound thread has no reliable sender address",
+            facts,
+        )
+
+    combined_text = f"{parsed.subject}\n{parsed.body_text}"
+    marker = _prior_thread_marker(combined_text)
+    if marker:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.THREAD_AMBIGUOUS,
+            "New email thread refers to prior commercial history and requires manual linking",
+            {**facts, "prior_context_marker": marker},
+        )
+
+    contacts = (
+        (
+            await session.execute(
+                select(Contact)
+                .options(selectinload(Contact.customer))
+                .where(func.lower(Contact.email) == sender)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(contacts) != 1:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.NEW_INQUIRY_REVIEW,
+            (
+                "New inbound thread sender is not a known contact"
+                if not contacts
+                else "New inbound thread sender matches multiple customer records"
+            ),
+            {**facts, "matching_contact_count": len(contacts)},
+        )
+    contact = contacts[0]
+
+    product_codes = _explicit_product_codes(combined_text)
+    facts.update(
+        {
+            "contact_id": contact.id,
+            "customer_id": contact.customer_id,
+            "product_codes": product_codes,
+        }
+    )
+    if len(product_codes) != 1:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.NEW_INQUIRY_REVIEW,
+            (
+                "New inbound thread does not identify a supported product"
+                if not product_codes
+                else "New inbound thread mentions multiple products"
+            ),
+            facts,
+        )
+
+    product = await session.scalar(
+        select(Product).where(Product.code == product_codes[0], Product.active.is_(True))
+    )
+    if product is None:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.NEW_INQUIRY_REVIEW,
+            "New inbound thread names a product that is not active in the catalog",
+            facts,
+        )
+
+    today = date.today()
+    policy_rows = await session.execute(
+        select(PricePolicy.currency).where(
+            PricePolicy.product_id == product.id,
+            PricePolicy.active.is_(True),
+            PricePolicy.valid_from <= today,
+            (PricePolicy.valid_to.is_(None) | (PricePolicy.valid_to >= today)),
+        )
+    )
+    policy_currencies = set(policy_rows.scalars().all())
+    customer_currency_rows = await session.execute(
+        select(SalesCase.currency).where(
+            SalesCase.customer_id == contact.customer_id,
+            SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
+        )
+    )
+    customer_currencies = set(customer_currency_rows.scalars().all())
+    if len(policy_currencies) == 1:
+        currency = next(iter(policy_currencies))
+    elif len(policy_currencies & customer_currencies) == 1:
+        currency = next(iter(policy_currencies & customer_currencies))
+    elif not policy_currencies and len(customer_currencies) == 1:
+        # Manual-only products can still be represented as a case and routed to
+        # a human using the customer's established market currency.
+        currency = next(iter(customer_currencies))
+    else:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.NEW_INQUIRY_REVIEW,
+            "New inbound thread currency cannot be selected unambiguously",
+            {
+                **facts,
+                "policy_currencies": sorted(policy_currencies),
+                "customer_currencies": sorted(customer_currencies),
+            },
+        )
+
+    related_case_ids = (
+        (
+            await session.execute(
+                select(SalesCase.id).where(
+                    SalesCase.contact_id == contact.id,
+                    SalesCase.product_id == product.id,
+                    SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recent_cutoff = datetime.now(UTC) - timedelta(days=7)
+    recent_related_case_ids = (
+        (
+            await session.execute(
+                select(SalesCase.id).where(
+                    SalesCase.id.in_(related_case_ids),
+                    or_(
+                        SalesCase.id.in_(
+                            select(EmailMessage.case_id).where(
+                                EmailMessage.case_id.is_not(None),
+                                EmailMessage.received_at >= recent_cutoff,
+                            )
+                        ),
+                        SalesCase.id.in_(
+                            select(Quote.case_id).where(Quote.valid_until >= today)
+                        ),
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    incoming_subject_key = normalized_subject(parsed.subject)[:255]
+    if recent_related_case_ids and has_thread_subject_prefix(parsed.subject):
+        strong_matches = (
+            (
+                await session.execute(
+                    select(SalesCase).where(
+                        SalesCase.id.in_(recent_related_case_ids),
+                        SalesCase.currency == currency,
+                        SalesCase.subject_key == incoming_subject_key,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(strong_matches) == 1:
+            return NewInquiryResolution(
+                strong_matches[0],
+                facts={
+                    **facts,
+                    "product_id": product.id,
+                    "currency": currency,
+                    "possible_related_case_ids": related_case_ids,
+                    "recent_related_case_ids": recent_related_case_ids,
+                    "recovered_thread": True,
+                    "match_basis": "unique_recent_contact_product_currency_subject",
+                },
+            )
+    if recent_related_case_ids:
+        return NewInquiryResolution(
+            None,
+            HandoffReason.THREAD_AMBIGUOUS,
+            "New email thread may belong to a recent active case and requires manual linking",
+            {
+                **facts,
+                "product_id": product.id,
+                "currency": currency,
+                "possible_related_case_ids": related_case_ids,
+                "recent_related_case_ids": recent_related_case_ids,
+                "recent_activity_cutoff": recent_cutoff.isoformat(),
+            },
+        )
+    sales_case = SalesCase(
+        customer_id=contact.customer_id,
+        contact_id=contact.id,
+        product_id=product.id,
+        currency=currency,
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.ACTIVE,
+        subject_key=incoming_subject_key,
+    )
+    session.add(sales_case)
+    await session.flush()
+    return NewInquiryResolution(
+        sales_case,
+        facts={
+            **facts,
+            "product_id": product.id,
+            "currency": currency,
+            "possible_related_case_ids": related_case_ids,
+        },
     )
 
 
@@ -632,6 +1325,22 @@ async def ingest_raw_email(
     if direction not in {"INBOUND", "OUTBOUND"}:
         raise ValueError(f"unsupported email direction: {direction}")
     parsed = parse_mime(raw)
+    bounce = classify_bounce(
+        raw,
+        subject=parsed.subject,
+        body=parsed.body_text,
+        sender=parsed.from_address,
+    ) if direction == "INBOUND" else None
+    automated_reply = (
+        classify_automated_reply(
+            subject=parsed.subject,
+            body=parsed.body_text,
+            headers=parsed.header_metadata,
+            sender=parsed.from_address,
+        )
+        if direction == "INBOUND" and not (bounce and bounce.is_bounce)
+        else None
+    )
     duplicate_query = select(EmailMessage).where(
         (EmailMessage.raw_sha256 == parsed.raw_sha256)
         | ((EmailMessage.message_id == parsed.message_id) & EmailMessage.message_id.is_not(None))
@@ -641,7 +1350,54 @@ async def ingest_raw_email(
         if direction == "INBOUND" and duplicate.direction == "INBOUND" and not is_history:
             await _ensure_inbound_follow_up(session, duplicate)
         return duplicate
-    case, ambiguous = await match_case(session, parsed, direction=direction)
+    live_human_inbound = bool(
+        direction == "INBOUND"
+        and not is_history
+        and not (bounce and bounce.is_bounce)
+        and not (automated_reply and automated_reply.is_automated)
+    )
+    case, ambiguous = await match_case(
+        session,
+        parsed,
+        direction=direction,
+        # A live human-authored message may inherit commercial history only
+        # through Message-ID/References. Subject-only matching is retained for
+        # history reconciliation, outbound mail, and non-sending auto replies.
+        allow_subject_fallback=not live_human_inbound,
+    )
+    new_inquiry = NewInquiryResolution(case)
+    if live_human_inbound and case is None and not ambiguous:
+        has_thread_headers = bool(parsed.in_reply_to or parsed.references)
+        if has_thread_headers:
+            new_inquiry = NewInquiryResolution(
+                None,
+                HandoffReason.THREAD_AMBIGUOUS,
+                "Inbound reply contains thread references that do not match a known case",
+                {
+                    "new_thread": False,
+                    "sender": parsed.from_address,
+                    "subject": parsed.subject,
+                    "in_reply_to": parsed.in_reply_to,
+                    "references": parsed.references,
+                },
+            )
+        else:
+            new_inquiry = await _resolve_new_inquiry_case(session, parsed)
+            case = new_inquiry.case
+    matched_outbox = None
+    if bounce and bounce.is_bounce and bounce.original_message_id:
+        matched_outbox = await session.scalar(
+            select(Outbox).where(
+                Outbox.message_id == bounce.original_message_id,
+                Outbox.status == DeliveryStatus.SENT,
+            )
+        )
+        if case is None and matched_outbox and matched_outbox.case_id:
+            case = await session.get(SalesCase, matched_outbox.case_id)
+            ambiguous = False
+    bounce_metadata = bounce.metadata() if bounce and bounce.is_bounce else {}
+    if matched_outbox is not None:
+        bounce_metadata["matched_outbox_id"] = matched_outbox.id
     try:
         async with session.begin_nested():
             row = EmailMessage(
@@ -662,6 +1418,24 @@ async def ingest_raw_email(
                 attachment_metadata=parsed.attachments,
                 raw_sha256=parsed.raw_sha256,
                 is_history=is_history,
+                is_automated_reply=bool(automated_reply and automated_reply.is_automated),
+                automated_reply_type=(
+                    automated_reply.reply_type.value
+                    if automated_reply and automated_reply.reply_type is not None
+                    else None
+                ),
+                automated_reply_metadata=(
+                    {**automated_reply.metadata(), "headers": parsed.header_metadata}
+                    if automated_reply and automated_reply.is_automated
+                    else {}
+                ),
+                is_bounce=bool(bounce and bounce.is_bounce),
+                bounce_type=(
+                    bounce.bounce_type.value
+                    if bounce and bounce.bounce_type is not None
+                    else None
+                ),
+                bounce_metadata=bounce_metadata,
                 received_at=parsed.occurred_at or datetime.now(UTC),
             )
             session.add(row)
@@ -688,17 +1462,198 @@ async def ingest_raw_email(
             "direction": direction,
             "mailbox": mailbox,
             "mailbox_folder": mailbox_folder,
+            "automated_reply_type": row.automated_reply_type,
+            "bounce_type": row.bounce_type,
         },
     )
+    if new_inquiry.case is not None and new_inquiry.facts is not None and live_human_inbound:
+        await audit(
+            session,
+            (
+                "email.thread_recovered"
+                if new_inquiry.facts.get("recovered_thread")
+                else "case.created_from_new_inquiry"
+            ),
+            case_id=new_inquiry.case.id,
+            actor="thread_resolver",
+            data=new_inquiry.facts,
+        )
     await session.commit()
     if direction == "INBOUND" and not is_history:
-        await _ensure_inbound_follow_up(session, row, ambiguous=ambiguous)
+        await _ensure_inbound_follow_up(
+            session,
+            row,
+            ambiguous=ambiguous,
+            review_reason=new_inquiry.reason,
+            review_summary=new_inquiry.summary,
+            review_facts=new_inquiry.facts,
+        )
     return row
+
+
+async def _match_bounce_outbox(
+    session: AsyncSession,
+    email_row: EmailMessage,
+) -> tuple[Outbox | None, str | None]:
+    metadata = email_row.bounce_metadata or {}
+    recipient = str(metadata.get("recipient") or "").strip().casefold() or None
+    outbox = None
+    if metadata.get("matched_outbox_id"):
+        outbox = await session.get(Outbox, int(metadata["matched_outbox_id"]))
+    if outbox is None and metadata.get("original_message_id"):
+        outbox = await session.scalar(
+            select(Outbox).where(
+                Outbox.message_id == str(metadata["original_message_id"]),
+                Outbox.status == DeliveryStatus.SENT,
+            )
+        )
+    if outbox is None and recipient:
+        outbox = await session.scalar(
+            select(Outbox)
+            .where(
+                func.lower(Outbox.recipient) == recipient,
+                Outbox.status == DeliveryStatus.SENT,
+            )
+            .order_by(Outbox.sent_at.desc(), Outbox.id.desc())
+        )
+    if outbox is not None:
+        recipient = recipient or outbox.recipient.casefold()
+        if recipient != outbox.recipient.casefold():
+            return None, recipient
+    return outbox, recipient
+
+
+async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None:
+    if email_row.bounce_handled_at is not None:
+        return
+    outbox, recipient = await _match_bounce_outbox(session, email_row)
+    case = await session.get(SalesCase, outbox.case_id) if outbox and outbox.case_id else None
+    if case is None and email_row.case_id:
+        case = await session.get(SalesCase, email_row.case_id)
+    if case and email_row.case_id is None:
+        email_row.case_id = case.id
+
+    metadata = dict(email_row.bounce_metadata or {})
+    if outbox is not None:
+        metadata["matched_outbox_id"] = outbox.id
+    metadata["recipient"] = recipient
+    email_row.bounce_metadata = metadata
+    email_row.bounce_handled_at = datetime.now(UTC)
+    diagnostic = str(metadata.get("diagnostic") or "")[:2000] or None
+
+    if email_row.bounce_type == BounceType.HARD.value and outbox is not None and recipient:
+        await _suppress_email_address(
+            session,
+            recipient,
+            reason="HARD_BOUNCE",
+            source_email_id=email_row.id,
+            bounce_type=email_row.bounce_type,
+            diagnostic=diagnostic,
+        )
+        if case and case.status == CaseStatus.ACTIVE:
+            case.status = CaseStatus.PAUSED
+        await audit(
+            session,
+            "inbound.hard_bounce_suppressed",
+            case_id=case.id if case else None,
+            actor="system",
+            data={"email_id": email_row.id, "outbox_id": outbox.id, **metadata},
+        )
+        await session.commit()
+        return
+
+    if recipient:
+        status = await _email_address_status(session, recipient)
+        status.last_bounce_at = datetime.now(UTC)
+        status.last_bounce_type = email_row.bounce_type
+        status.last_bounce_diagnostic = diagnostic
+    await audit(
+        session,
+        "inbound.bounce_review_required",
+        case_id=case.id if case else None,
+        actor="system",
+        data={"email_id": email_row.id, "outbox_id": outbox.id if outbox else None, **metadata},
+    )
+    await create_handoff(
+        session,
+        case=case,
+        reason=HandoffReason.BOUNCE_REVIEW,
+        summary=(
+            f"Review {email_row.bounce_type or 'unknown'} delivery failure for "
+            f"{recipient or 'an unidentified recipient'}"
+        ),
+        facts={"email_id": email_row.id, "outbox_id": outbox.id if outbox else None, **metadata},
+        source_email_id=email_row.id,
+    )
+
+
+async def _handle_automated_reply(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+) -> bool:
+    if not email_row.is_automated_reply:
+        return False
+    if email_row.automated_reply_handled_at is not None:
+        return True
+
+    reply_type = email_row.automated_reply_type
+    facts = {
+        "automated_reply_type": reply_type,
+        **(email_row.automated_reply_metadata or {}),
+    }
+    email_row.automated_reply_handled_at = datetime.now(UTC)
+    if reply_type in {
+        AutomatedReplyType.OUT_OF_OFFICE.value,
+        AutomatedReplyType.GENERIC_AUTOREPLY.value,
+    }:
+        await audit(
+            session,
+            "inbound.automated_reply_handled",
+            case_id=case.id,
+            actor="system",
+            data={"email_id": email_row.id, **facts},
+        )
+        await session.commit()
+        return True
+
+    if reply_type == AutomatedReplyType.DEPARTED.value:
+        case.contact.suppressed = True
+        summary = "Contact appears to have left the company; verify any replacement contact"
+        reason = HandoffReason.PERSONNEL_CHANGE
+    elif reply_type == AutomatedReplyType.CONTACT_CHANGE.value:
+        summary = "Inbound message reports a personnel or contact change"
+        reason = HandoffReason.PERSONNEL_CHANGE
+    else:
+        summary = "Automated reply could not be handled safely"
+        reason = HandoffReason.AUTOMATED_REPLY_REVIEW
+    await audit(
+        session,
+        "inbound.automated_reply_escalated",
+        case_id=case.id,
+        actor="system",
+        data={"email_id": email_row.id, **facts},
+    )
+    await create_handoff(
+        session,
+        case=case,
+        reason=reason,
+        summary=summary,
+        facts=facts,
+        source_email_id=email_row.id,
+    )
+    return True
 
 
 async def process_inbound(session: AsyncSession, email_id: int) -> None:
     email_row = await session.get(EmailMessage, email_id)
-    if email_row is None or email_row.case_id is None:
+    if email_row is None:
+        return
+    if email_row.is_bounce:
+        await _handle_bounce(session, email_row)
+        return
+    if email_row.case_id is None:
         return
     case = await session.get(SalesCase, email_row.case_id)
     if case is None:
@@ -724,6 +1679,8 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         )
         return
     await session.refresh(case, ["customer", "contact", "product"])
+    if await _handle_automated_reply(session, case=case, email_row=email_row):
+        return
     ai = AIClient()
     try:
         analysis, metadata = await ai.analyze(email_row.subject, email_row.body_text, email_row.attachment_metadata)
@@ -770,7 +1727,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
                 contact_suppressed=case.contact.suppressed,
                 do_not_contact=case.customer.do_not_contact,
                 has_risky_attachment=analysis.risky_attachment,
-                product_known=analysis.product_code in {case.product.code, None},
+                product_known=analysis.product_code is None or product_codes_match(analysis.product_code, case.product.code),
+                prebook_requested=analysis.prebook_requested,
+                packaging_requested=analysis.packaging_requested,
+                delivery_requested=analysis.shipping_requested,
             ),
             intent_threshold=get_settings().intent_confidence_threshold,
             product_threshold=get_settings().product_confidence_threshold,
@@ -785,19 +1745,41 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    latest_quote = await session.scalar(select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc()))
     policy_row = await active_policy(session, case.product_id, case.currency)
-    if policy_row is None or latest_quote is None or latest_quote.currency != case.currency:
+    latest_quote = await session.scalar(
+        select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc())
+    )
+    if policy_row is None or (latest_quote is not None and latest_quote.currency != case.currency):
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.NONSTANDARD,
-            summary="No standard policy or same-currency prior quote matched the inbound request",
+            summary="No standard policy or compatible case currency matched the inbound request",
             facts=analysis_facts,
             source_email_id=email_row.id,
         )
         return
-    quantity = analysis.quantity or latest_quote.quantity
+    if latest_quote is None and analysis.intent == Intent.COUNTEROFFER:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.PRICE_NEGOTIATION,
+            summary="A new email thread contains a counteroffer without reliable quotation history",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return
+    quantity = analysis.quantity or (latest_quote.quantity if latest_quote is not None else None)
+    if quantity is None:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.LOW_CONFIDENCE,
+            summary="Initial inquiry does not contain a reliable quotation quantity",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return
     currency_standard = analysis.currency is None or analysis.currency.upper() == case.currency
     incoterm_standard = analysis.incoterm is None or analysis.incoterm.upper() == policy_row.standard_incoterm.upper()
     payment_standard = analysis.payment_term is None or analysis.payment_term.casefold() == policy_row.standard_payment_term.casefold()
@@ -820,7 +1802,11 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             quantity_standard=quantity_standard,
             incoterm_standard=incoterm_standard,
             payment_standard=payment_standard,
-            product_known=analysis.product_code in {case.product.code, None},
+            product_known=analysis.product_code is None or product_codes_match(analysis.product_code, case.product.code),
+            prebook_requested=analysis.prebook_requested,
+            packaging_requested=analysis.packaging_requested,
+            delivery_requested=analysis.shipping_requested,
+            ready_stock_available=True,
         ),
         intent_threshold=get_settings().intent_confidence_threshold,
         product_threshold=get_settings().product_confidence_threshold,
@@ -871,7 +1857,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    valid_until = date.today() + timedelta(days=policy_row.quote_valid_days)
+    valid_until = quote_valid_until(
+        quote_valid_days=policy_row.quote_valid_days,
+        quote_valid_weekday=policy_row.quote_valid_weekday,
+    )
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
@@ -903,6 +1892,8 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             incoterm=policy_row.standard_incoterm,
             payment_term=policy_row.standard_payment_term,
             valid_until=valid_until,
+            taxes_included=policy_row.taxes_included,
+            freight_included=policy_row.freight_included,
         )
     except Exception as exc:
         await create_handoff(
@@ -914,10 +1905,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    round_number = latest_quote.round_number + 1
-    next_stage = transition(case.stage, CaseStage.NEGOTIATING)
+    round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
     case.negotiation_round = round_number
-    case.stage = next_stage
+    if latest_quote is not None:
+        case.stage = transition(case.stage, CaseStage.NEGOTIATING)
     quote = Quote(
         case_id=case.id,
         price_policy_id=policy_row.id,
@@ -931,6 +1922,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         pricing_snapshot={
             "hard_minimum": str(price_decision.hard_minimum),
             "pricing_reason": price_decision.reason,
+            "applied_markup_pct": str(price_decision.applied_markup_pct),
             "requested_price": str(analysis.requested_unit_price),
         },
     )
@@ -955,8 +1947,7 @@ async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
         return
     case = await session.get(SalesCase, handoff.case_id) if handoff.case_id else None
     try:
-        await DingTalkNotifier().notify(handoff, case)
-        handoff.dingtalk_status = "SENT"
+        handoff.dingtalk_status = await DingTalkNotifier().notify(handoff, case)
     except Exception as exc:
         handoff.dingtalk_status = "FAILED"
         raise RuntimeError(str(exc)) from exc
@@ -1093,6 +2084,12 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
             row.last_error = f"mailbox cooldown active: {throttle.reason or 'Gmail rate limit'}"[:2000]
             await session.commit()
             return True
+    case: SalesCase | None = None
+    human_approved = bool(
+        row.approval_handoff_id is not None
+        and row.human_approved_by
+        and row.human_approved_at is not None
+    )
     if row.case_id:
         case = await session.scalar(
             select(SalesCase)
@@ -1104,11 +2101,20 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
         )
         if (
             case is None
-            or case.status != CaseStatus.ACTIVE
             or case.contact.suppressed
             or case.customer.do_not_contact
-            or not case.customer.auto_send_allowed
             or case.contact.email.lower() != row.recipient.lower()
+            or (
+                human_approved
+                and case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
+            )
+            or (
+                not human_approved
+                and (
+                    case.status != CaseStatus.ACTIVE
+                    or not case.customer.auto_send_allowed
+                )
+            )
         ):
             row.status = DeliveryStatus.CANCELLED
             row.last_error = "case/contact eligibility changed after message was queued"
@@ -1128,11 +2134,56 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
             )
             await session.commit()
             return True
-        if not settings.auto_send_enabled:
+        if not settings.auto_send_enabled and not human_approved:
             row.status = DeliveryStatus.CANCELLED
             row.last_error = "AUTO_SEND_ENABLED is false"
             await session.commit()
             return True
+        preflight_outcome, preflight_detail, preflight_facts = await _recipient_preflight(
+            session,
+            recipient,
+            settings,
+        )
+        if preflight_outcome == "DEFER":
+            row.status = DeliveryStatus.PENDING
+            row.available_at = now + timedelta(minutes=settings.mx_temporary_retry_minutes)
+            row.last_error = f"recipient preflight deferred: {preflight_detail}"[:2000]
+            await audit(
+                session,
+                "outbox.preflight_deferred",
+                case_id=row.case_id,
+                actor="dns",
+                data={"outbox_id": row.id, **preflight_facts},
+            )
+            await session.commit()
+            return True
+        if preflight_outcome == "BLOCK":
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
+            await audit(
+                session,
+                "outbox.preflight_blocked",
+                case_id=row.case_id,
+                actor="policy",
+                data={"outbox_id": row.id, **preflight_facts},
+            )
+            await session.commit()
+            if case is not None:
+                await create_handoff(
+                    session,
+                    case=case,
+                    reason=HandoffReason.EMAIL_DELIVERABILITY,
+                    summary=f"Recipient preflight blocked {recipient}: {preflight_detail}",
+                    facts={"outbox_id": row.id, **preflight_facts},
+                )
+            return True
+        await audit(
+            session,
+            "outbox.preflight_passed",
+            case_id=row.case_id,
+            actor="dns",
+            data={"outbox_id": row.id, **preflight_facts},
+        )
         since_hour = now - timedelta(hours=1)
         since_day = now - timedelta(days=1)
         sent_events = await _mailbox_sent_events_since(session, mailbox, since_day, now)
@@ -1173,7 +2224,12 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
             "outbox.sent",
             case_id=row.case_id,
             actor=settings.mail_transport,
-            data={"outbox_id": row.id, "message_id": row.message_id},
+            data={
+                "outbox_id": row.id,
+                "message_id": row.message_id,
+                "approval_handoff_id": row.approval_handoff_id,
+                "human_approved_by": row.human_approved_by,
+            },
         )
     except (smtplib.SMTPServerDisconnected, ConnectionResetError, TimeoutError) as exc:
         row.status = DeliveryStatus.UNKNOWN
@@ -1182,9 +2238,30 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
         cooldown_seconds = _smtp_rate_limit_cooldown_seconds(exc, settings)
         detail = exc.smtp_error.decode(errors="replace") if isinstance(exc.smtp_error, bytes) else str(exc.smtp_error)
         if cooldown_seconds is None:
-            row.status = DeliveryStatus.FAILED
-            row.last_error = f"SMTP {exc.smtp_code}: {detail}"[:2000]
-            row.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**row.attempts))
+            failure_type = classify_smtp_failure(exc.smtp_code, detail)
+            if failure_type == BounceType.HARD:
+                row.status = DeliveryStatus.CANCELLED
+                row.last_error = f"permanent SMTP recipient failure {exc.smtp_code}: {detail}"[:2000]
+                await _suppress_email_address(
+                    session,
+                    row.recipient,
+                    reason="SMTP_HARD_BOUNCE",
+                    bounce_type=failure_type.value,
+                    diagnostic=detail,
+                )
+                if case and case.status == CaseStatus.ACTIVE:
+                    case.status = CaseStatus.PAUSED
+                await audit(
+                    session,
+                    "outbox.smtp_hard_bounce_suppressed",
+                    case_id=row.case_id,
+                    actor="smtp",
+                    data={"outbox_id": row.id, "smtp_code": exc.smtp_code, "diagnostic": detail[:2000]},
+                )
+            else:
+                row.status = DeliveryStatus.FAILED
+                row.last_error = f"SMTP {exc.smtp_code}: {detail}"[:2000]
+                row.available_at = datetime.now(UTC) + timedelta(minutes=min(60, 2**row.attempts))
         else:
             cooldown_until = datetime.now(UTC) + timedelta(seconds=cooldown_seconds)
             reason = f"Gmail SMTP {exc.smtp_code}: {detail}"[:2000]

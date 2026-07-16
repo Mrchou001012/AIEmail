@@ -10,11 +10,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import dashboard_data
+from app.auto_replies import AutomatedReplyType
 from app.db import (
     AuditEvent,
     CaseStage,
     CaseStatus,
+    Contact,
     DeliveryStatus,
+    EmailAddressStatus,
+    EmailDomainStatus,
     EmailMessage,
     Handoff,
     Job,
@@ -25,17 +29,21 @@ from app.db import (
     Quote,
     SalesCase,
 )
+from app.deliverability import MXResult, MXStatus
 from app.domain import HandoffReason
-from app.domain import transition as domain_transition
 from app.history import HISTORY_REVIEW_SUMMARY, reconcile_email_history
 from app.imap_poller import poll_folder_once
 from app.mail import parse_mime
 from app.services import (
     active_policy,
+    assign_handoff_case,
+    create_case_for_handoff,
     create_case_outreach,
     create_handoff,
     ingest_raw_email,
+    notify_handoff,
     process_inbound,
+    queue_human_reply,
     seed_demo_data,
     send_one_outbox,
 )
@@ -55,6 +63,8 @@ async def test_dashboard_data_supports_an_empty_database(db_session: AsyncSessio
         "failed_jobs": 0,
         "unmatched_history": 0,
         "ai_failures": 0,
+        "bounced_24h": 0,
+        "suppressed_addresses": 0,
     }
     assert payload["emails"] == []
     assert payload["outbox"] == []
@@ -180,6 +190,142 @@ async def test_recovered_processing_does_not_duplicate_handoff(db_session: Async
     ) == 1
 
 
+async def _unassigned_handoff(db_session: AsyncSession, *, suffix: str) -> Handoff:
+    email_row = EmailMessage(
+        case_id=None,
+        direction="INBOUND",
+        mailbox="integration-test",
+        message_id=f"<{suffix}@example.com>",
+        from_address="internal@example.com",
+        to_addresses=["sales-agent@example.com"],
+        subject="New customer inquiry",
+        body_text="Please review this inquiry.",
+        attachment_metadata=[],
+        raw_sha256=hashlib.sha256(suffix.encode()).hexdigest(),
+    )
+    db_session.add(email_row)
+    await db_session.commit()
+    return await create_handoff(
+        db_session,
+        case=None,
+        reason=HandoffReason.THREAD_AMBIGUOUS,
+        summary="Manual association required",
+        source_email_id=email_row.id,
+    )
+
+
+async def test_human_can_assign_unmatched_email_to_existing_case(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    handoff = await _unassigned_handoff(db_session, suffix="human-assign")
+
+    assigned = await assign_handoff_case(
+        db_session,
+        handoff_id=handoff.id,
+        case_id=case.id,
+        actor="reviewer",
+    )
+
+    email_row = await db_session.get(EmailMessage, handoff.source_email_id)
+    await db_session.refresh(case)
+    assert assigned.case_id == case.id
+    assert email_row is not None and email_row.case_id == case.id
+    assert case.status == CaseStatus.WAITING_HUMAN
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "handoff.case_assigned")
+    )
+    assert audit_event is not None and audit_event.actor == "reviewer"
+
+
+async def test_human_can_create_case_for_unmatched_email(db_session: AsyncSession) -> None:
+    ids = await seed_demo_data(db_session)
+    handoff = await _unassigned_handoff(db_session, suffix="human-create-case")
+
+    case = await create_case_for_handoff(
+        db_session,
+        handoff_id=handoff.id,
+        contact_id=ids["contact_id"],
+        product_id=ids["product_id"],
+        currency="usd",
+        actor="reviewer",
+    )
+
+    email_row = await db_session.get(EmailMessage, handoff.source_email_id)
+    await db_session.refresh(handoff)
+    assert case.currency == "USD"
+    assert case.status == CaseStatus.WAITING_HUMAN
+    assert email_row is not None and email_row.case_id == case.id
+    assert handoff.case_id == case.id
+
+
+async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    sent: list[str] = []
+
+    class RecordingTransport:
+        def send(self, raw_message, message_id, recipient):
+            sent.append(recipient)
+
+    case = await _seed_case(db_session, with_quote=True)
+    await db_session.refresh(case, ["customer"])
+    case.customer.auto_send_allowed = False
+    await db_session.commit()
+    handoff = await _unassigned_handoff(db_session, suffix="human-approved-send")
+    await assign_handoff_case(
+        db_session,
+        handoff_id=handoff.id,
+        case_id=case.id,
+        actor="reviewer",
+    )
+
+    outbox = await queue_human_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject="Re: New customer inquiry",
+        body_text="Dear Customer,\n\nWe have reviewed your request.",
+        actor="reviewer",
+        note="Reviewed and approved",
+        resume_automation=False,
+    )
+
+    await db_session.refresh(case)
+    await db_session.refresh(handoff)
+    assert outbox.approval_handoff_id == handoff.id
+    assert outbox.human_approved_by == "reviewer"
+    assert outbox.human_approved_at is not None
+    assert "Shreya Saxena" in outbox.raw_message
+    assert case.status == CaseStatus.HUMAN_TAKEOVER
+    assert handoff.status == "RESOLVED"
+    approval = await db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "handoff.reply_approved")
+    )
+    assert approval is not None and approval.actor == "reviewer"
+
+    monkeypatch.setattr("app.services.transport_for", lambda settings: RecordingTransport())
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=False,
+        safe_mode=True,
+        recipient_allowlist=["internal@example.com"],
+        gmail_address="sales-agent@example.com",
+        gmail_app_password="test-only",
+        email_preflight_enabled=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+        max_sends_per_hour=10,
+        max_sends_per_day=20,
+    )
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(outbox)
+    assert sent == ["internal@example.com"]
+    assert outbox.status == DeliveryStatus.SENT
+
+
 async def test_duplicate_raw_ingestion_repairs_missing_job(db_session: AsyncSession) -> None:
     case = await _seed_case(db_session, with_quote=False)
     message = MIMEMessage()
@@ -221,9 +367,187 @@ async def test_duplicate_raw_ingestion_repairs_missing_job(db_session: AsyncSess
     ) == 1
 
 
-async def test_counteroffer_uses_transition_and_freezes_reply(
+async def test_new_subject_creates_independent_case_without_inheriting_quote_history(
+    db_session: AsyncSession,
+) -> None:
+    existing_case = await _seed_case(db_session, with_quote=True)
+    expired_quote = await db_session.scalar(select(Quote).where(Quote.case_id == existing_case.id))
+    assert expired_quote is not None
+    expired_quote.valid_until = date.today() - timedelta(days=1)
+    await db_session.commit()
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Fresh WIDGET-100 inquiry"
+    message["Message-ID"] = "<fresh-widget-inquiry@example.com>"
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None
+    assert email_row.case_id is not None
+    assert email_row.case_id != existing_case.id
+    new_case = await db_session.get(SalesCase, email_row.case_id)
+    assert new_case is not None
+    assert new_case.stage == CaseStage.QUOTING
+    assert new_case.negotiation_round == 0
+    await process_inbound(db_session, email_row.id)
+
+    quote = await db_session.scalar(select(Quote).where(Quote.case_id == new_case.id))
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
+    )
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.case_id == new_case.id,
+            AuditEvent.event_type == "case.created_from_new_inquiry",
+        )
+    )
+    assert quote is not None and quote.round_number == 0
+    assert quote.unit_price == Decimal("100.0000")
+    assert outbox is not None
+    assert audit_event is not None
+    assert audit_event.data["possible_related_case_ids"] == [existing_case.id]
+
+
+async def test_new_subject_with_recent_same_product_case_requires_manual_linking(
+    db_session: AsyncSession,
+) -> None:
+    existing_case = await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Fresh WIDGET-100 inquiry"
+    message["Message-ID"] = "<fresh-but-possibly-related@example.com>"
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert handoff.extracted_facts["recent_related_case_ids"] == [existing_case.id]
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+
+
+async def test_localized_reply_subject_recovers_unique_recent_case_without_thread_headers(
+    db_session: AsyncSession,
+) -> None:
+    existing_case = await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "回复：Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = "<localized-reply-without-thread-headers@example.com>"
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id == existing_case.id
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.case_id == existing_case.id,
+            AuditEvent.event_type == "email.thread_recovered",
+        )
+    )
+    assert audit_event is not None
+    assert audit_event.data["recovered_thread"] is True
+    assert audit_event.data["match_basis"] == "unique_recent_contact_product_currency_subject"
+
+
+async def test_log_only_dingtalk_notification_is_not_marked_sent(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff = await create_handoff(
+        db_session,
+        case=None,
+        reason=HandoffReason.THREAD_AMBIGUOUS,
+        summary="Integration test",
+        facts={},
+    )
+
+    class LogNotifier:
+        async def notify(self, handoff: Handoff, case: SalesCase | None) -> str:
+            return "LOGGED"
+
+    monkeypatch.setattr("app.services.DingTalkNotifier", LogNotifier)
+    await notify_handoff(db_session, handoff.id)
+
+    await db_session.refresh(handoff)
+    assert handoff.dingtalk_status == "LOGGED"
+
+
+async def test_new_subject_referring_to_previous_quote_requires_manual_linking(
+    db_session: AsyncSession,
+) -> None:
+    existing_case = await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Price discussion"
+    message["Message-ID"] = "<lost-thread-context@example.com>"
+    message.set_content(
+        "Regarding your previous quote for PRODUCT WIDGET-100 quantity 100 kg, please review it."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert handoff.extracted_facts["prior_context_marker"] == "previous quote"
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 1
+    assert existing_case.id == 1
+
+
+async def test_new_subject_with_multiple_products_requires_human_selection(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_case(db_session, with_quote=False)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "New quotation request"
+    message["Message-ID"] = "<multi-product-new-thread@example.com>"
+    message.set_content("Please quote YAC-TES and YAC-TMCS, quantity 100 kg each.")
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.NEW_INQUIRY_REVIEW.value
+    assert handoff.extracted_facts["product_codes"] == ["YAC-TES", "YAC-TMCS"]
+
+
+async def test_unmatched_reply_headers_do_not_fall_back_to_subject(db_session: AsyncSession) -> None:
+    await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = "<orphan-reply@example.com>"
+    message["In-Reply-To"] = "<unknown-message@example.com>"
+    message["References"] = "<unknown-message@example.com>"
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert handoff.extracted_facts["in_reply_to"] == "<unknown-message@example.com>"
+
+
+async def test_counteroffer_hands_off_without_changing_quote(
+    db_session: AsyncSession,
 ) -> None:
     case = await _seed_case(db_session, with_quote=True)
     email_row = await _add_inbound(
@@ -232,27 +556,110 @@ async def test_counteroffer_uses_transition_and_freezes_reply(
         "PRODUCT WIDGET-100 quantity 100. Your price is too high; can you do USD 92?",
         suffix="counteroffer",
     )
-    transitions: list[tuple[CaseStage, CaseStage]] = []
-
-    def record_transition(current: CaseStage, target: CaseStage) -> CaseStage:
-        transitions.append((current, target))
-        return domain_transition(current, target)
-
-    monkeypatch.setattr("app.services.transition", record_transition)
-
     await process_inbound(db_session, email_row.id)
 
     latest_quote = await db_session.scalar(select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc()))
     outbox = await db_session.scalar(select(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}"))
     await db_session.refresh(case)
-    assert transitions == [(CaseStage.QUOTING, CaseStage.NEGOTIATING)]
-    assert case.stage == CaseStage.NEGOTIATING
+    assert case.stage == CaseStage.QUOTING
     assert latest_quote is not None
-    assert latest_quote.round_number == 1
-    assert latest_quote.unit_price == Decimal("97.0000")
+    assert latest_quote.round_number == 0
+    assert latest_quote.unit_price == Decimal("100.0000")
+    assert outbox is None
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.PRICE_NEGOTIATION.value
+
+
+async def test_ready_stock_lead_time_gets_bounded_reply(db_session: AsyncSession) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 quantity 100. Please quote and confirm the lead time.",
+        suffix="ready-stock-lead-time",
+    )
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
+    )
     assert outbox is not None
+    parsed = parse_mime(outbox.raw_message.encode())
+    assert "Availability: Ready stock" in parsed.body_text
     assert await db_session.scalar(
         select(func.count()).select_from(Handoff).where(Handoff.source_email_id == email_row.id)
+    ) == 0
+
+
+async def test_out_of_office_reply_is_recorded_and_silently_handled(db_session: AsyncSession) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = "<out-of-office@example.com>"
+    message["Auto-Submitted"] = "auto-replied"
+    message.set_content(
+        "I am currently out of the office and will return on 22 July 2026. "
+        "For urgent matters please contact backup@example.com."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+    assert email_row is not None
+    assert email_row.case_id == case.id
+    assert email_row.automated_reply_type == AutomatedReplyType.OUT_OF_OFFICE.value
+
+    await process_inbound(db_session, email_row.id)
+
+    await db_session.refresh(email_row)
+    await db_session.refresh(case)
+    assert email_row.automated_reply_handled_at is not None
+    assert email_row.automated_reply_metadata["return_hint"] == "22 July 2026"
+    assert email_row.automated_reply_metadata["replacement_emails"] == ["backup@example.com"]
+    assert case.status == CaseStatus.ACTIVE
+    assert await db_session.scalar(
+        select(func.count()).select_from(Handoff).where(Handoff.source_email_id == email_row.id)
+    ) == 0
+    assert await db_session.scalar(
+        select(func.count()).select_from(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
+    ) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(AuditEvent.event_type == "inbound.automated_reply_handled")
+    ) == 1
+
+
+async def test_departed_contact_is_suppressed_and_handed_off(db_session: AsyncSession) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = "<departed-contact@example.com>"
+    message["Auto-Submitted"] = "auto-replied"
+    message.set_content(
+        "I no longer work with Example Ltd. Going forward, please contact newbuyer@example.com."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    contact = await db_session.get(Contact, case.contact_id)
+    await db_session.refresh(case)
+    await db_session.refresh(email_row)
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.PERSONNEL_CHANGE.value
+    assert handoff.extracted_facts["replacement_emails"] == ["newbuyer@example.com"]
+    assert contact is not None and contact.suppressed
+    assert case.status == CaseStatus.WAITING_HUMAN
+    assert email_row.automated_reply_handled_at is not None
+    assert await db_session.scalar(
+        select(func.count()).select_from(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
     ) == 0
 
 
@@ -449,6 +856,7 @@ async def test_mailbox_sent_history_enforces_spacing_without_calling_smtp(
         safe_mode=False,
         gmail_address="sales-agent@example.com",
         gmail_app_password="test-only",
+        email_preflight_enabled=False,
         min_send_interval_seconds=120,
         send_interval_jitter_seconds=0,
         max_sends_per_hour=5,
@@ -484,6 +892,7 @@ async def test_gmail_rate_error_sets_durable_mailbox_cooldown(
         safe_mode=False,
         gmail_address="sales-agent@example.com",
         gmail_app_password="test-only",
+        email_preflight_enabled=False,
         min_send_interval_seconds=0,
         send_interval_jitter_seconds=0,
         max_sends_per_hour=5,
@@ -527,3 +936,248 @@ async def test_gmail_rate_error_sets_durable_mailbox_cooldown(
     assert calls == 1
     assert second.status == DeliveryStatus.PENDING
     assert second.available_at == throttle.cooldown_until
+
+
+async def test_smtp_preflight_uses_cached_mx_and_sends_valid_recipient(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    lookups = 0
+    sent: list[str] = []
+
+    def valid_mx(domain: str, *, timeout_seconds: int) -> MXResult:
+        nonlocal lookups
+        lookups += 1
+        return MXResult(MXStatus.VALID, domain, ("10 mx.example.net",))
+
+    class RecordingTransport:
+        def send(self, raw_message, message_id, recipient):
+            sent.append(recipient)
+
+    monkeypatch.setattr("app.services.lookup_mx", valid_mx)
+    monkeypatch.setattr("app.services.transport_for", lambda settings: RecordingTransport())
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+        max_sends_per_hour=10,
+        max_sends_per_day=20,
+    )
+    first = Outbox(
+        business_key="preflight-valid-1",
+        message_id="<preflight-valid-1@example.com>",
+        recipient="buyer@example.com",
+        raw_message="Subject: valid\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    second = Outbox(
+        business_key="preflight-valid-2",
+        message_id="<preflight-valid-2@example.com>",
+        recipient="other@example.com",
+        raw_message="Subject: valid\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add_all([first, second])
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(first)
+    await db_session.refresh(second)
+
+    assert first.status == DeliveryStatus.SENT
+    assert second.status == DeliveryStatus.SENT
+    assert sent == ["buyer@example.com", "other@example.com"]
+    assert lookups == 1
+    domain = await db_session.get(EmailDomainStatus, "example.com")
+    assert domain is not None and domain.mx_status == MXStatus.VALID.value
+
+
+async def test_smtp_preflight_blocks_missing_mx_without_permanent_suppression(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_email = case.contact.email
+    monkeypatch.setattr(
+        "app.services.lookup_mx",
+        lambda domain, *, timeout_seconds: MXResult(MXStatus.NO_MX, domain, error="domain has no MX record"),
+    )
+    monkeypatch.setattr("app.services.transport_for", lambda settings: pytest.fail("SMTP must not be called"))
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+    )
+    pending = Outbox(
+        case_id=case.id,
+        business_key="preflight-no-mx",
+        message_id="<preflight-no-mx@example.com>",
+        recipient=contact_email,
+        raw_message="Subject: no mx\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(pending)
+    await db_session.refresh(case)
+    address = await db_session.get(EmailAddressStatus, contact_email)
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.case_id == case.id))
+
+    assert pending.status == DeliveryStatus.CANCELLED
+    assert "no MX" in (pending.last_error or "")
+    assert address is not None and address.preflight_status == MXStatus.NO_MX.value
+    assert address.suppressed is False
+    assert case.status == CaseStatus.WAITING_HUMAN
+    assert handoff is not None and handoff.reason_code == HandoffReason.EMAIL_DELIVERABILITY.value
+
+
+async def test_smtp_preflight_defers_temporary_dns_failure_without_attempt(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.lookup_mx",
+        lambda domain, *, timeout_seconds: MXResult(MXStatus.TEMPORARY_ERROR, domain, error="DNS timeout"),
+    )
+    monkeypatch.setattr("app.services.transport_for", lambda settings: pytest.fail("SMTP must not be called"))
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+        mx_temporary_retry_minutes=30,
+    )
+    pending = Outbox(
+        business_key="preflight-dns-timeout",
+        message_id="<preflight-dns-timeout@example.com>",
+        recipient="buyer@example.com",
+        raw_message="Subject: dns timeout\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(pending)
+    await db_session.commit()
+    before = datetime.now(UTC)
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(pending)
+
+    assert pending.status == DeliveryStatus.PENDING
+    assert pending.attempts == 0
+    assert pending.available_at >= before + timedelta(minutes=29)
+
+
+def _integration_dsn(*, original_message_id: str, recipient: str, status: str, diagnostic: str) -> bytes:
+    return f"""From: Mail Delivery Subsystem <mailer-daemon@googlemail.com>
+To: sales-agent@example.com
+Subject: Delivery Status Notification (Failure)
+Message-ID: <bounce-{original_message_id.strip('<>')}@googlemail.com>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary=dsn
+
+--dsn
+Content-Type: text/plain; charset=utf-8
+
+Your message wasn't delivered to {recipient}. {diagnostic}
+--dsn
+Content-Type: message/delivery-status
+
+Final-Recipient: rfc822; {recipient}
+Action: failed
+Status: {status}
+Diagnostic-Code: smtp; {diagnostic}
+
+--dsn
+Content-Type: message/rfc822
+
+Message-ID: {original_message_id}
+From: sales-agent@example.com
+To: {recipient}
+Subject: Quote
+
+Hello
+--dsn--
+""".replace("\n", "\r\n").encode()
+
+
+async def test_correlated_hard_bounce_permanently_suppresses_recipient(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_id = case.contact.id
+    contact_email = case.contact.email
+    original_message_id = "<hard-bounce-original@example.com>"
+    sent = Outbox(
+        case_id=case.id,
+        business_key="hard-bounce-original",
+        message_id=original_message_id,
+        recipient=contact_email,
+        raw_message="Subject: Quote\n\nHello",
+        status=DeliveryStatus.SENT,
+        sent_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    db_session.add(sent)
+    await db_session.commit()
+    raw = _integration_dsn(
+        original_message_id=original_message_id,
+        recipient=contact_email,
+        status="5.1.1",
+        diagnostic="550 5.1.1 The email account does not exist",
+    )
+
+    email_row = await ingest_raw_email(db_session, raw, mailbox="integration-test")
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+    await db_session.refresh(case)
+    await db_session.refresh(email_row)
+    contact = await db_session.get(Contact, contact_id)
+    address = await db_session.get(EmailAddressStatus, contact_email)
+    handoff_count = await db_session.scalar(select(func.count()).select_from(Handoff))
+
+    assert email_row.is_bounce is True
+    assert email_row.bounce_type == "HARD"
+    assert email_row.bounce_handled_at is not None
+    assert address is not None and address.suppressed is True
+    assert address.suppression_reason == "HARD_BOUNCE"
+    assert address.suppression_source_email_id == email_row.id
+    assert contact is not None and contact.suppressed is True
+    assert case.status == CaseStatus.PAUSED
+    assert handoff_count == 0
+
+
+async def test_uncorrelated_hard_bounce_goes_to_review_without_suppression(
+    db_session: AsyncSession,
+) -> None:
+    recipient = "unknown-buyer@example.com"
+    raw = _integration_dsn(
+        original_message_id="<not-sent-by-us@example.com>",
+        recipient=recipient,
+        status="5.1.1",
+        diagnostic="550 5.1.1 User unknown",
+    )
+
+    email_row = await ingest_raw_email(db_session, raw, mailbox="integration-test")
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+    address = await db_session.get(EmailAddressStatus, recipient)
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+
+    assert address is not None and address.suppressed is False
+    assert address.last_bounce_type == "HARD"
+    assert handoff is not None and handoff.reason_code == HandoffReason.BOUNCE_REVIEW.value
