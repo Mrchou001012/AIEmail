@@ -392,7 +392,16 @@ class GmailIMAPClient:
             status, data = client.uid("search", None, f"UID {search_after + 1}:*")
             if status != "OK":
                 raise RuntimeError(f"IMAP UID search failed for folder: {selected_folder}")
-            available_uids = data[0].split() if data and data[0] else []
+            # IMAP sequence ranges are order-independent. If search_after is
+            # already the highest UID, a server may interpret "N+1:*" as a
+            # reversed range and return UID N again. Enforce the exclusive
+            # lower bound locally so restarting the poller cannot re-ingest
+            # the cursor message.
+            available_uids = [
+                item
+                for item in (data[0].split() if data and data[0] else [])
+                if int(item) > search_after
+            ]
             highest_uid = max((int(item) for item in available_uids), default=search_after)
             result: list[tuple[int, bytes]] = []
             downloaded_bytes = 0

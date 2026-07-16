@@ -149,6 +149,53 @@ def test_imap_fetch_stops_after_download_budget(monkeypatch) -> None:
     assert messages == [(1, b"123451"), (2, b"123452")]
 
 
+def test_imap_fetch_excludes_cursor_uid_from_reversed_star_range(monkeypatch) -> None:
+    fetched_uids = []
+
+    class FakeIMAP:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def login(self, address, password):
+            return "OK", []
+
+        def select(self, folder, readonly):
+            return "OK", [b"1"]
+
+        def response(self, name):
+            return name, [b"77"]
+
+        def uid(self, command, *args):
+            if command == "search":
+                assert args[-1] == "UID 2612:*"
+                # Gmail may return the current maximum UID because IMAP ranges
+                # can run in either direction when "*" is lower than 2612.
+                return "OK", [b"2611"]
+            fetched_uids.append(args[0])
+            return "OK", [(b"RFC822", b"must-not-be-fetched")]
+
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr("app.mail.imaplib.IMAP4_SSL", FakeIMAP)
+    settings = Settings(
+        _env_file=None,
+        gmail_address="sales@example.com",
+        gmail_app_password="app-password",
+    )
+
+    uid_validity, highest_uid, messages = GmailIMAPClient(settings).fetch_after(
+        2611,
+        expected_uid_validity=77,
+        limit=100,
+    )
+
+    assert uid_validity == 77
+    assert highest_uid == 2611
+    assert messages == []
+    assert fetched_uids == []
+
+
 def test_mime_prefers_plain_and_records_attachment() -> None:
     message = EmailMessage()
     message["From"] = "Buyer <buyer@example.com>"
