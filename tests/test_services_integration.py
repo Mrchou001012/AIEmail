@@ -33,7 +33,11 @@ from app.db import (
 )
 from app.deliverability import MXResult, MXStatus
 from app.domain import HandoffReason
-from app.history import HISTORY_REVIEW_SUMMARY, reconcile_email_history
+from app.history import (
+    HISTORY_CASE_ASSIGNMENT_SUMMARY,
+    HISTORY_REVIEW_SUMMARY,
+    reconcile_email_history,
+)
 from app.imap_poller import poll_folder_once
 from app.mail import parse_mime
 from app.services import (
@@ -755,6 +759,7 @@ async def test_history_links_unique_contact_without_guessing_case(
     await db_session.commit()
 
     result = await reconcile_email_history(db_session)
+    second_result = await reconcile_email_history(db_session)
     await db_session.refresh(row)
 
     assert row.customer_id == ids["customer_id"]
@@ -763,6 +768,16 @@ async def test_history_links_unique_contact_without_guessing_case(
     assert result.customer_matched_messages == 1
     assert result.customer_unmatched_messages == 0
     assert result.customer_matched_case_unmatched_messages == 1
+    assert result.replies_waiting_review == 1
+    assert second_result.replies_waiting_review == 0
+    review = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id)
+    )
+    assert review is not None
+    assert review.case_id is None
+    assert review.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert review.summary == HISTORY_CASE_ASSIGNMENT_SUMMARY
+    assert review.extracted_facts["contact_id"] == ids["contact_id"]
 
 
 async def test_history_uses_explicit_product_to_choose_one_of_multiple_cases(

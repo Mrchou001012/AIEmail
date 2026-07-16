@@ -19,6 +19,7 @@ from app.mail import normalized_subject
 from app.products import find_product_codes
 
 HISTORY_REVIEW_SUMMARY = "Historical Gmail reply requires review"
+HISTORY_CASE_ASSIGNMENT_SUMMARY = "Historical Gmail reply requires case assignment"
 CLOSED_CASE_STATUSES = {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
 
 
@@ -243,10 +244,27 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
     await session.flush()
 
     latest_by_case: dict[int, EmailMessage] = {}
+    latest_human_by_contact: dict[int, EmailMessage] = {}
     for row in history_rows:
         if row.case_id is not None:
             latest_by_case[row.case_id] = row
-    latest_email_ids = [row.id for row in latest_by_case.values()]
+        if (
+            row.contact_id is not None
+            and not row.is_bounce
+            and not row.is_automated_reply
+        ):
+            latest_human_by_contact[row.contact_id] = row
+    contact_only_replies = [
+        row
+        for row in latest_human_by_contact.values()
+        if row.direction == "INBOUND" and row.case_id is None
+    ]
+    latest_email_ids = list(
+        {
+            *(row.id for row in latest_by_case.values()),
+            *(row.id for row in contact_only_replies),
+        }
+    )
     existing_review_sources: set[int] = set()
     if latest_email_ids:
         existing_review_sources = set(
@@ -309,6 +327,38 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
                 )
             )
             no_reply_paused += 1
+
+    for latest in contact_only_replies:
+        if latest.id in existing_review_sources:
+            continue
+        session.add(
+            Handoff(
+                case_id=None,
+                source_email_id=latest.id,
+                reason_code=HandoffReason.THREAD_AMBIGUOUS.value,
+                summary=HISTORY_CASE_ASSIGNMENT_SUMMARY,
+                extracted_facts={
+                    "history_import": True,
+                    "customer_id": latest.customer_id,
+                    "contact_id": latest.contact_id,
+                    "latest_email_id": latest.id,
+                    "latest_email_at": latest.received_at.isoformat(),
+                },
+            )
+        )
+        session.add(
+            AuditEvent(
+                case_id=None,
+                actor="gmail_history",
+                event_type="history.reply_needs_case_assignment",
+                data={
+                    "email_id": latest.id,
+                    "customer_id": latest.customer_id,
+                    "contact_id": latest.contact_id,
+                },
+            )
+        )
+        replies_waiting += 1
 
     await session.commit()
     customer_unmatched = await session.scalar(
