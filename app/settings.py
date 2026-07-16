@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     send_interval_jitter_seconds: int = 180
     gmail_transient_cooldown_seconds: int = 600
     gmail_daily_cooldown_seconds: int = 86400
+    email_preflight_enabled: bool = True
+    mx_check_enabled: bool = True
+    mx_cache_ttl_hours: int = 168
+    mx_lookup_timeout_seconds: int = 5
+    mx_temporary_retry_minutes: int = 30
 
     admin_username: str = "admin"
     admin_password: str = "change-me-locally"
@@ -98,6 +103,9 @@ class Settings(BaseSettings):
         "max_sends_per_day",
         "gmail_transient_cooldown_seconds",
         "gmail_daily_cooldown_seconds",
+        "mx_cache_ttl_hours",
+        "mx_lookup_timeout_seconds",
+        "mx_temporary_retry_minutes",
     )
     @classmethod
     def positive_limit(cls, value: int) -> int:
