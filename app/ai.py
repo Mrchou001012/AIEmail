@@ -69,6 +69,28 @@ recipients, delivery dates, legal commitments, claims, certifications, discounts
 Reference only snippet IDs supplied by the application. Deterministic code inserts approved facts,
 pricing, terms, and the signature after your response."""
 
+_ADAPTIVE_THINKING_MODEL_PREFIXES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+)
+
+
+def _anthropic_inference_options(model: str) -> dict[str, Any]:
+    """Return only inference controls known to be supported by the model."""
+    normalized = model.strip().lower()
+    if normalized.startswith(_ADAPTIVE_THINKING_MODEL_PREFIXES):
+        return {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        }
+    return {}
+
 
 def _intent_from_text(text: str) -> Intent:
     lowered = text.lower()
@@ -202,11 +224,10 @@ class AIClient:
         response = await self._client.messages.parse(
             model=self.settings.anthropic_model,
             max_tokens=2048,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": request_text}],
             output_format=InboundAnalysis,
+            **_anthropic_inference_options(self.settings.anthropic_model),
         )
         if response.stop_reason in {"refusal", "max_tokens"} or response.parsed_output is None:
             raise RuntimeError(f"Anthropic analysis did not complete: {response.stop_reason}")
@@ -238,11 +259,10 @@ class AIClient:
         response = await self._client.messages.parse(
             model=self.settings.anthropic_model,
             max_tokens=2048,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
             system=DRAFT_PROMPT,
             messages=[{"role": "user", "content": f"Application-approved facts: {facts!r}"}],
             output_format=EmailDraftPlan,
+            **_anthropic_inference_options(self.settings.anthropic_model),
         )
         if response.stop_reason in {"refusal", "max_tokens"} or response.parsed_output is None:
             raise RuntimeError(f"Anthropic drafting did not complete: {response.stop_reason}")

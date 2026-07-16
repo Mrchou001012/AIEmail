@@ -5,12 +5,32 @@ from pathlib import Path
 
 import pytest
 
-from app.ai import AIClient, stub_analyze, validate_rendered_email
+from app.ai import AIClient, _anthropic_inference_options, stub_analyze, validate_rendered_email
 from app.domain import Intent, PricingPolicy, counteroffer
 from app.imports import load_content
 from app.mail import build_message, parse_mime
 from app.services import render_quote
 from app.settings import Settings
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-4-5-20250929",
+        "unrecognized-compatible-model",
+    ],
+)
+def test_anthropic_inference_options_omit_unsupported_adaptive_thinking(model: str) -> None:
+    assert _anthropic_inference_options(model) == {}
+
+
+def test_anthropic_inference_options_enable_supported_adaptive_thinking() -> None:
+    assert _anthropic_inference_options("claude-opus-4-8") == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+    }
 
 
 def test_stub_detects_prompt_injection_as_customer_data() -> None:

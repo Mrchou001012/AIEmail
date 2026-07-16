@@ -133,6 +133,8 @@ ANTHROPIC_API_KEY=...
 
 The implementation uses the official `anthropic.AsyncAnthropic` SDK and typed Pydantic structured output via `messages.parse`. Inbound message text is wrapped as untrusted email data and cannot authorize prices, recipients, sending, or policy changes. Refusal, truncation, schema failure, or API failure results in human handoff.
 
+Adaptive thinking and effort controls are sent only to model families known to support them. Claude Haiku 4.5, Claude Opus 4.5, Claude Sonnet 4.5, and unknown compatible model identifiers run without optional thinking controls so a supported structured-output request is not rejected by an incompatible inference parameter.
+
 Keep `MAIL_TRANSPORT=file`, `SAFE_MODE=true`, and `AUTO_SEND_ENABLED=false` while testing real Claude.
 
 ## Gmail and DingTalk activation
