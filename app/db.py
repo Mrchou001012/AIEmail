@@ -111,6 +111,7 @@ class Product(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255))
     unit: Mapped[str] = mapped_column(String(32), default="unit")
     approved_text_key: Mapped[str] = mapped_column(String(128))
+    margin_class: Mapped[str | None] = mapped_column(String(1))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -127,11 +128,18 @@ class PricePolicy(Base, TimestampMixin):
     concession_step_pct: Mapped[Decimal] = mapped_column(Numeric(7, 4), default=Decimal("0.02"))
     min_quantity: Mapped[int] = mapped_column(Integer, default=1)
     max_quantity: Mapped[int | None] = mapped_column(Integer)
+    tier_1_max_multiple: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    tier_1_markup_pct: Mapped[Decimal] = mapped_column(Numeric(7, 4), default=Decimal("0"))
+    tier_2_max_multiple: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    tier_2_markup_pct: Mapped[Decimal] = mapped_column(Numeric(7, 4), default=Decimal("0"))
     quote_valid_days: Mapped[int] = mapped_column(Integer, default=30)
+    quote_valid_weekday: Mapped[int | None] = mapped_column(Integer)
     standard_incoterm: Mapped[str] = mapped_column(String(32), default="EXW")
     allowed_incoterms: Mapped[list[str]] = mapped_column(JSON, default=list)
     standard_payment_term: Mapped[str] = mapped_column(String(128), default="100% before shipment")
     allowed_payment_terms: Mapped[list[str]] = mapped_column(JSON, default=list)
+    taxes_included: Mapped[bool] = mapped_column(Boolean, default=False)
+    freight_included: Mapped[bool] = mapped_column(Boolean, default=False)
     valid_from: Mapped[date] = mapped_column(Date, default=date.today)
     valid_to: Mapped[date | None] = mapped_column(Date)
     source_hash: Mapped[str] = mapped_column(String(64), index=True)
@@ -179,7 +187,43 @@ class EmailMessage(Base):
     attachment_metadata: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     raw_sha256: Mapped[str] = mapped_column(String(64), unique=True)
     is_history: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_automated_reply: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    automated_reply_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    automated_reply_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    automated_reply_handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_bounce: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    bounce_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    bounce_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    bounce_handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class EmailDomainStatus(Base, TimestampMixin):
+    __tablename__ = "email_domain_statuses"
+    domain: Mapped[str] = mapped_column(String(255), primary_key=True)
+    mx_status: Mapped[str] = mapped_column(String(32), index=True)
+    mx_records: Mapped[list[str]] = mapped_column(JSON, default=list)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class EmailAddressStatus(Base, TimestampMixin):
+    __tablename__ = "email_address_statuses"
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    domain: Mapped[str | None] = mapped_column(String(255), index=True)
+    format_valid: Mapped[bool | None] = mapped_column(Boolean)
+    preflight_status: Mapped[str | None] = mapped_column(String(32), index=True)
+    last_preflight_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_preflight_detail: Mapped[str | None] = mapped_column(Text)
+    suppressed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    suppression_reason: Mapped[str | None] = mapped_column(String(64), index=True)
+    suppression_source_email_id: Mapped[int | None] = mapped_column(
+        ForeignKey("emails.id", ondelete="SET NULL")
+    )
+    suppressed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_bounce_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_bounce_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    last_bounce_diagnostic: Mapped[str | None] = mapped_column(Text)
 
 
 class MailboxCursor(Base):
@@ -285,6 +329,11 @@ class Outbox(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_via: Mapped[str | None] = mapped_column(String(32))
+    approval_handoff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("handoffs.id", ondelete="SET NULL"), unique=True, index=True
+    )
+    human_approved_by: Mapped[str | None] = mapped_column(String(128))
+    human_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
