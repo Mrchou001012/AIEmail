@@ -1,9 +1,19 @@
 import imaplib
 from datetime import UTC, datetime
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from email.utils import format_datetime
+from pathlib import Path
 
-from app.mail import GmailIMAPClient, _imap_mailbox_arg, build_message, normalized_subject, parse_mime
+from app.mail import (
+    GmailIMAPClient,
+    _imap_mailbox_arg,
+    build_message,
+    has_thread_subject_prefix,
+    normalized_subject,
+    parse_mime,
+)
 from app.settings import Settings
 
 
@@ -183,8 +193,31 @@ def test_stable_message_id_and_thread_headers() -> None:
     assert "In-Reply-To: <incoming@example.com>" in first_raw
 
 
+def test_build_message_embeds_signature_logo() -> None:
+    root = Path(__file__).resolve().parents[1]
+    signature_html = (root / "config" / "content" / "email_signature.html").read_text(encoding="utf-8")
+
+    _, raw = build_message(
+        from_address="sales@example.com",
+        recipient="buyer@example.com",
+        subject="Signature test",
+        text_body="Signature test",
+        html_body=signature_html,
+        stable_key="signature-logo-test",
+    )
+    message = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8"))
+    logo = next(part for part in message.walk() if part.get("Content-ID") == "<lanyachem-logo>")
+
+    assert logo.get_content_type() == "image/png"
+    assert logo.get_content_disposition() == "inline"
+    assert (logo.get_payload(decode=True) or b"").startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_subject_normalization() -> None:
     assert normalized_subject("Re: FWD:  Product Quote ") == "product quote"
+    assert normalized_subject("回复：Re: YAC-TES，600 kg") == "yac-tes，600 kg"
+    assert has_thread_subject_prefix("回复：Re: YAC-TES，600 kg") is True
+    assert has_thread_subject_prefix("YAC-TES，600 kg") is False
 
 
 def test_mime_records_original_message_time_and_all_recipients() -> None:
@@ -199,3 +232,20 @@ def test_mime_records_original_message_time_and_all_recipients() -> None:
 
     assert parsed.to_addresses == ["buyer@example.com", "other@example.com"]
     assert parsed.occurred_at == datetime(2025, 5, 6, 7, 8, tzinfo=UTC)
+
+
+def test_mime_records_automatic_reply_headers() -> None:
+    message = EmailMessage()
+    message["From"] = "buyer@example.com"
+    message["To"] = "sales@example.com"
+    message["Subject"] = "Automatic reply"
+    message["Auto-Submitted"] = "auto-replied"
+    message["X-Auto-Response-Suppress"] = "All"
+    message.set_content("I am currently out of the office.")
+
+    parsed = parse_mime(message.as_bytes())
+
+    assert parsed.header_metadata == {
+        "auto-submitted": "auto-replied",
+        "x-auto-response-suppress": "All",
+    }

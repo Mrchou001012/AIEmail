@@ -1,3 +1,4 @@
+import base64
 import email
 import hashlib
 import imaplib
@@ -26,6 +27,29 @@ from app.db import Contact, EmailMessage, Outbox, SalesCase
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+SIGNATURE_LOGO_CID = "lanyachem-logo"
+
+
+def _attach_signature_logo(message: MIMEEmailMessage, html_body: str, token: str) -> None:
+    if f"cid:{SIGNATURE_LOGO_CID}" not in html_body:
+        return
+    logo_path = get_settings().content_dir / "email_signature_logo.b64"
+    try:
+        logo_bytes = base64.b64decode(logo_path.read_text(encoding="ascii").strip(), validate=True)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"signature logo asset is unavailable or invalid: {logo_path}") from exc
+    if not logo_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError("signature logo asset is not a PNG image")
+    html_part = message.get_payload()[-1]
+    html_part.add_related(
+        logo_bytes,
+        maintype="image",
+        subtype="png",
+        cid=f"<{SIGNATURE_LOGO_CID}>",
+        filename="lanyachem-logo.png",
+        disposition="inline",
+    )
+    html_part.set_boundary(f"=_sales_agent_related_{token}")
 
 
 def _imap_mailbox_arg(folder: str) -> str:
@@ -45,6 +69,7 @@ class ParsedEmail:
     body_text: str
     body_html: str | None
     attachments: list[dict[str, Any]]
+    header_metadata: dict[str, str]
     raw_sha256: str
     occurred_at: datetime | None
 
@@ -122,6 +147,18 @@ def parse_mime(raw: bytes) -> ParsedEmail:
                 occurred_at = occurred_at.astimezone(UTC)
         except (TypeError, ValueError, OverflowError):
             occurred_at = None
+    relevant_headers = (
+        "Auto-Submitted",
+        "Precedence",
+        "X-Autoreply",
+        "X-Autorespond",
+        "X-Auto-Response-Suppress",
+    )
+    header_metadata = {
+        name.casefold(): str(message.get(name))[:1000]
+        for name in relevant_headers
+        if message.get(name) is not None
+    }
     return ParsedEmail(
         message_id=str(message.get("Message-ID")) if message.get("Message-ID") else None,
         in_reply_to=str(message.get("In-Reply-To")) if message.get("In-Reply-To") else None,
@@ -132,13 +169,24 @@ def parse_mime(raw: bytes) -> ParsedEmail:
         body_text=body_text,
         body_html=body_html,
         attachments=attachments,
+        header_metadata=header_metadata,
         raw_sha256=hashlib.sha256(raw).hexdigest(),
         occurred_at=occurred_at,
     )
 
 
+THREAD_SUBJECT_PREFIX = re.compile(
+    r"^(?:(?:re|fw|fwd|aw|sv|回复|答复|回覆|转发|轉寄)\s*[:：]\s*)+",
+    flags=re.I,
+)
+
+
+def has_thread_subject_prefix(subject: str) -> bool:
+    return THREAD_SUBJECT_PREFIX.match(subject.strip()) is not None
+
+
 def normalized_subject(subject: str) -> str:
-    result = re.sub(r"^(?:(?:re|fw|fwd)\s*:\s*)+", "", subject.strip(), flags=re.I)
+    result = THREAD_SUBJECT_PREFIX.sub("", subject.strip())
     return re.sub(r"\s+", " ", result).lower()
 
 
@@ -147,6 +195,7 @@ async def match_case(
     parsed: ParsedEmail,
     *,
     direction: str = "INBOUND",
+    allow_subject_fallback: bool = True,
 ) -> tuple[SalesCase | None, bool]:
     direction = direction.upper()
     if direction not in {"INBOUND", "OUTBOUND"}:
@@ -190,6 +239,9 @@ async def match_case(
         return None, True
     if len(unique) > 1:
         return None, True
+
+    if not allow_subject_fallback:
+        return None, False
 
     subject = normalized_subject(parsed.subject)
     rows = (
@@ -240,6 +292,7 @@ def build_message(
         msg["References"] = " ".join(references[-20:])
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
+    _attach_signature_logo(msg, html_body, token)
     msg.set_boundary(f"=_sales_agent_{token}")
     return message_id, msg.as_string(policy=policy.SMTP)
 

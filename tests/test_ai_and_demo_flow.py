@@ -3,7 +3,9 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from app.ai import AIClient, stub_analyze
+import pytest
+
+from app.ai import AIClient, stub_analyze, validate_rendered_email
 from app.domain import Intent, PricingPolicy, counteroffer
 from app.imports import load_content
 from app.mail import build_message, parse_mime
@@ -19,6 +21,16 @@ def test_stub_detects_prompt_injection_as_customer_data() -> None:
     )
     assert result.intent == Intent.QUOTE_REQUEST
     assert result.product_code == "WIDGET-100"
+
+
+def test_stub_treats_ready_stock_lead_time_as_quote_request() -> None:
+    result = stub_analyze(
+        "Lead time",
+        "PRODUCT WIDGET-100 quantity 100. Is this available as ready stock?",
+        [],
+    )
+    assert result.intent == Intent.QUOTE_REQUEST
+    assert result.shipping_requested
 
 
 def test_demo_end_to_end_flow() -> None:
@@ -80,6 +92,47 @@ def test_demo_end_to_end_flow() -> None:
     parsed = parse_mime(raw.encode())
     assert parsed.message_id == message_id
     assert "USD 97.0000" in parsed.body_text
+    assert "Availability: Ready stock" in parsed.body_text
+    assert "Shreya Saxena / Technical Sales Engineer" in parsed.body_text
+    assert "Our bank details remain unchanged" in parsed.body_text
+
+
+@pytest.mark.parametrize(
+    "price_text",
+    [
+        "INR 1,250.50",
+        "₹1,250.50",
+        "Rs. 1,250.50",
+        "1,250.50 INR",
+        "1,250.50 Rs",
+    ],
+)
+def test_stub_normalizes_indian_rupee_counteroffers(price_text: str) -> None:
+    result = stub_analyze(
+        "Re: quotation",
+        f"PRODUCT WIDGET-100 quantity 100. Our target price is {price_text}.",
+        [],
+    )
+    assert result.intent == Intent.COUNTEROFFER
+    assert result.currency == "INR"
+    assert result.requested_unit_price == Decimal("1250.50")
+    assert result.numeric_confidence == 0.96
+
+
+def test_inr_render_validation_rejects_unexpected_rupee_amount() -> None:
+    validate_rendered_email(
+        "Unit price: INR 1250.0000",
+        exact_price=Decimal("1250"),
+        currency="INR",
+        approved_fragments=[],
+    )
+    with pytest.raises(ValueError, match="unexpected monetary value"):
+        validate_rendered_email(
+            "Unit price: INR 1250.0000\nSpecial amount: ₹1200",
+            exact_price=Decimal("1250"),
+            currency="INR",
+            approved_fragments=[],
+        )
 
 
 def test_below_floor_demo_creates_no_price() -> None:
