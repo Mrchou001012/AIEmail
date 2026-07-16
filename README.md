@@ -53,6 +53,8 @@ Open:
 - Read-only operations dashboard: <http://localhost:8000/dashboard> (uses the admin username/password)
 - Protected status: `GET /admin/status`
 
+OpenAPI and interactive documentation routes are available only in `DEMO_MODE=true`. Production mode keeps `/docs`, `/redoc`, and `/openapi.json` disabled.
+
 Default demo administration credentials are `admin` / `change-me-locally`. Change them in your local `.env` before exposing the service beyond localhost.
 
 Queue an outreach message:
