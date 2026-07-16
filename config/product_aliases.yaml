@@ -1,0 +1,43 @@
+products:
+  - code: YAC-TEOS40
+    aliases:
+      - YAC-TEOS-40
+      - TEOS40
+      - TEOS-40
+  - code: YAC-TES
+    aliases:
+      - TES
+  - code: YAC-TMCS
+    aliases:
+      - TMCS
+  - code: YAC-TBDMSC
+    aliases:
+      - TBDMSC
+  - code: YAC-HMM
+    aliases:
+      - HMM
+  - code: YAC-BSA
+    aliases:
+      - BSA
+  - code: THEIC
+    aliases:
+      - SUN-THEIC
+      - YAC-THEIC
+  - code: OH-Polymer 80K
+    aliases:
+      - OH-POLYMER-80K
+      - OH POLYMER 80K
+  - code: YAC-N823(98%)
+    aliases:
+      - YAC-N823
+      - N823
+      - YAC-N823-98
+      - YAC-N823 98%
+      - N823(98%)
+      - N823-98
+  - code: YAC-N823(99%)
+    aliases:
+      - YAC-N823-99
+      - YAC-N823 99%
+      - N823(99%)
+      - N823-99

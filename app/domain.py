@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 
@@ -34,6 +35,14 @@ class HandoffReason(StrEnum):
     AI_FAILURE = "AI_FAILURE"
     MAIL_FAILURE = "MAIL_FAILURE"
     THREAD_AMBIGUOUS = "THREAD_AMBIGUOUS"
+    PRICE_NEGOTIATION = "PRICE_NEGOTIATION"
+    PREBOOK_REQUEST = "PREBOOK_REQUEST"
+    PACKAGING_REVIEW = "PACKAGING_REVIEW"
+    PERSONNEL_CHANGE = "PERSONNEL_CHANGE"
+    AUTOMATED_REPLY_REVIEW = "AUTOMATED_REPLY_REVIEW"
+    EMAIL_DELIVERABILITY = "EMAIL_DELIVERABILITY"
+    BOUNCE_REVIEW = "BOUNCE_REVIEW"
+    NEW_INQUIRY_REVIEW = "NEW_INQUIRY_REVIEW"
 
 
 @dataclass(frozen=True)
@@ -50,6 +59,10 @@ class PricingPolicy:
     allowed_incoterms: tuple[str, ...]
     standard_payment_term: str
     allowed_payment_terms: tuple[str, ...]
+    tier_1_max_multiple: Decimal | None = None
+    tier_1_markup_pct: Decimal = Decimal("0")
+    tier_2_max_multiple: Decimal | None = None
+    tier_2_markup_pct: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -58,6 +71,7 @@ class PricingDecision:
     unit_price: Decimal | None
     hard_minimum: Decimal
     reason: str | None = None
+    applied_markup_pct: Decimal = Decimal("0")
 
 
 def money(value: Decimal | str | int) -> Decimal:
@@ -73,7 +87,41 @@ def initial_quote(policy: PricingPolicy, quantity: int) -> PricingDecision:
     floor = hard_minimum(policy)
     if quantity < policy.min_quantity or (policy.max_quantity is not None and quantity > policy.max_quantity):
         return PricingDecision(False, None, floor, "quantity_out_of_policy")
-    return PricingDecision(True, money(policy.standard_price), floor)
+    markup = Decimal("0")
+    tier = "standard_price"
+    if (
+        policy.tier_1_max_multiple is not None
+        and Decimal(quantity) < Decimal(policy.min_quantity) * policy.tier_1_max_multiple
+    ):
+        markup = policy.tier_1_markup_pct
+        tier = "tier_1"
+    elif (
+        policy.tier_2_max_multiple is not None
+        and Decimal(quantity) <= Decimal(policy.min_quantity) * policy.tier_2_max_multiple
+    ):
+        markup = policy.tier_2_markup_pct
+        tier = "tier_2"
+    return PricingDecision(
+        True,
+        money(policy.standard_price * (Decimal("1") + markup)),
+        floor,
+        tier,
+        markup,
+    )
+
+
+def quote_valid_until(
+    *,
+    quote_valid_days: int,
+    quote_valid_weekday: int | None,
+    today: date | None = None,
+) -> date:
+    current = today or date.today()
+    if quote_valid_weekday is not None:
+        if not 0 <= quote_valid_weekday <= 6:
+            raise ValueError("quote_valid_weekday must be between Monday=0 and Sunday=6")
+        return current + timedelta(days=(quote_valid_weekday - current.weekday()) % 7)
+    return current + timedelta(days=quote_valid_days)
 
 
 def counteroffer(
@@ -150,6 +198,10 @@ class SendContext:
     incoterm_standard: bool = True
     payment_standard: bool = True
     product_known: bool = True
+    prebook_requested: bool = False
+    packaging_requested: bool = False
+    delivery_requested: bool = False
+    ready_stock_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,6 +218,7 @@ def evaluate_send_policy(
     numeric_threshold: float = 0.90,
 ) -> PolicyDecision:
     risk_map = {
+        Intent.COUNTEROFFER: HandoffReason.PRICE_NEGOTIATION,
         Intent.SAMPLE_REQUEST: HandoffReason.SAMPLE_REQUEST,
         Intent.ORDER: HandoffReason.ORDER_COMMITMENT,
         Intent.SHIPPING: HandoffReason.SHIPPING_REQUEST,
@@ -174,6 +227,12 @@ def evaluate_send_policy(
     }
     if ctx.intent in risk_map:
         return PolicyDecision(False, risk_map[ctx.intent])
+    if ctx.prebook_requested:
+        return PolicyDecision(False, HandoffReason.PREBOOK_REQUEST)
+    if ctx.packaging_requested:
+        return PolicyDecision(False, HandoffReason.PACKAGING_REVIEW)
+    if ctx.delivery_requested and not ctx.ready_stock_available:
+        return PolicyDecision(False, HandoffReason.SHIPPING_REQUEST)
     if ctx.stage in RISKY_STAGES or ctx.status in {
         CaseStatus.WAITING_HUMAN,
         CaseStatus.PAUSED,

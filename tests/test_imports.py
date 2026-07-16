@@ -53,11 +53,37 @@ async def test_floor_above_standard_blocks_price_import(tmp_path: Path) -> None:
     generate_templates(tmp_path)
     path = tmp_path / "price_list_template.xlsx"
     workbook = load_workbook(path)
-    workbook.active["E2"] = "50"
-    workbook.active["F2"] = "60"
+    workbook.active["G2"] = "50"
+    workbook.active["H2"] = "60"
     workbook.save(path)
     session = AsyncMock()
     session.scalar.return_value = None
     result = await import_prices(path, session, apply=False)
     assert not result.ok
     assert any("floor cannot exceed" in error for error in result.errors[0]["errors"])
+
+
+@pytest.mark.asyncio
+async def test_manual_only_product_allows_blank_prices(tmp_path: Path) -> None:
+    generate_templates(tmp_path)
+    path = tmp_path / "price_list_template.xlsx"
+    workbook = load_workbook(path)
+    sheet = workbook.active
+    columns = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, columns["product_code"], "YAC-TBDMSC")
+    sheet.cell(2, columns["product_name"], "YAC-TBDMSC")
+    sheet.cell(2, columns["approved_text_key"], "yac_tbdmsc")
+    sheet.cell(2, columns["margin_class"], "A")
+    sheet.cell(2, columns["currency"], "INR")
+    sheet.cell(2, columns["unit"], "kg")
+    sheet.cell(2, columns["standard_price"], None)
+    sheet.cell(2, columns["absolute_floor"], None)
+    sheet.cell(2, columns["manual_only"], True)
+    workbook.save(path)
+    session = AsyncMock()
+    session.scalar.return_value = None
+
+    result = await import_prices(path, session, apply=False)
+
+    assert result.ok
+    assert result.valid_rows == 1

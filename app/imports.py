@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import CaseStatus, Contact, Customer, PricePolicy, Product, SalesCase
 from app.history import reconcile_email_history
+from app.products import canonical_product_code, product_text_key
 from app.settings import get_settings
 
 CUSTOMER_HEADERS = [
@@ -32,6 +33,7 @@ PRICE_HEADERS = [
     "product_code",
     "product_name",
     "approved_text_key",
+    "margin_class",
     "currency",
     "unit",
     "standard_price",
@@ -41,11 +43,19 @@ PRICE_HEADERS = [
     "concession_step_pct",
     "min_quantity",
     "max_quantity",
+    "tier_1_max_multiple",
+    "tier_1_markup_pct",
+    "tier_2_max_multiple",
+    "tier_2_markup_pct",
     "quote_valid_days",
+    "quote_valid_weekday",
     "standard_incoterm",
     "allowed_incoterms",
     "standard_payment_term",
     "allowed_payment_terms",
+    "taxes_included",
+    "freight_included",
+    "manual_only",
     "valid_from",
     "valid_to",
 ]
@@ -115,6 +125,7 @@ def generate_templates(target_dir: Path) -> None:
             "WIDGET-100",
             "Industrial Widget 100",
             "widget_100",
+            "A",
             "USD",
             "piece",
             "100.00",
@@ -124,17 +135,25 @@ def generate_templates(target_dir: Path) -> None:
             "0.03",
             10,
             10000,
+            4,
+            "0.25",
+            12,
+            "0.20",
             30,
+            "FRIDAY",
             "EXW",
             "EXW,FCA,FOB",
             "100% before shipment",
             "100% before shipment,30% deposit / 70% before shipment",
+            False,
+            False,
+            False,
             date.today(),
             None,
         ]
     )
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:S2"
+    ws.auto_filter.ref = f"A1:{ws.cell(1, len(PRICE_HEADERS)).column_letter}2"
     prices.save(target_dir / "price_list_template.xlsx")
 
 
@@ -171,6 +190,29 @@ def _date(value: Any) -> date | None:
     return date.fromisoformat(str(value))
 
 
+WEEKDAYS = {
+    "MONDAY": 0,
+    "TUESDAY": 1,
+    "WEDNESDAY": 2,
+    "THURSDAY": 3,
+    "FRIDAY": 4,
+    "SATURDAY": 5,
+    "SUNDAY": 6,
+}
+
+
+def _weekday(value: Any) -> int | None:
+    if value in {None, ""}:
+        return None
+    normalized = str(value).strip().upper()
+    if normalized in WEEKDAYS:
+        return WEEKDAYS[normalized]
+    numeric = int(normalized)
+    if not 0 <= numeric <= 6:
+        raise ValueError
+    return numeric
+
+
 async def import_customers(path: Path, session: AsyncSession, apply: bool = False) -> ImportResult:
     rows = _rows(path)
     result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
@@ -179,7 +221,7 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
         errors: list[str] = []
         company = str(row.get("company_name") or "").strip()
         name = str(row.get("contact_name") or "").strip()
-        product_code = str(row.get("product_code") or "").strip().upper()
+        product_code = canonical_product_code(str(row.get("product_code") or ""))
         currency = str(row.get("currency") or "USD").strip().upper()
         if not re.fullmatch(r"[A-Z]{3}", currency):
             errors.append("currency must be a three-letter code")
@@ -195,19 +237,6 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
             errors.append("contact_name is required")
         if product is None:
             errors.append(f"missing or inactive product: {product_code}")
-        else:
-            today = date.today()
-            policy = await session.scalar(
-                select(PricePolicy.id).where(
-                    PricePolicy.product_id == product.id,
-                    PricePolicy.currency == currency,
-                    PricePolicy.active.is_(True),
-                    PricePolicy.valid_from <= today,
-                    or_(PricePolicy.valid_to.is_(None), PricePolicy.valid_to >= today),
-                )
-            )
-            if policy is None:
-                errors.append(f"no active {currency} price policy for product: {product_code}")
         if errors:
             result.errors.append({"row": number, "errors": errors})
             continue
@@ -288,19 +317,39 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
     parsed: list[dict[str, Any]] = []
     for number, row in enumerate(rows, start=2):
         errors: list[str] = []
-        code = str(row.get("product_code") or "").strip().upper()
+        code = canonical_product_code(str(row.get("product_code") or ""))
         currency = str(row.get("currency") or "").strip().upper()
-        approved_text_key = str(row.get("approved_text_key") or code.lower().replace("-", "_")).strip()
+        manual_only = _bool(row.get("manual_only"))
+        margin_class = str(row.get("margin_class") or "").strip().upper() or None
+        approved_text_key = str(row.get("approved_text_key") or product_text_key(code)).strip()
+        if not code:
+            errors.append("product_code is required")
+        if margin_class not in {None, "A", "B"}:
+            errors.append("margin_class must be A, B, or blank")
         if not approved_text_key or not str(content.product_snippets.get(approved_text_key) or "").strip():
             errors.append(f"approved product text is missing for key: {approved_text_key or '<empty>'}")
         try:
-            standard = Decimal(str(row.get("standard_price")))
-            floor = Decimal(str(row.get("absolute_floor")))
+            standard = Decimal(str(row.get("standard_price") or "0"))
+            floor = Decimal(str(row.get("absolute_floor") or "0"))
             max_discount = Decimal(str(row.get("max_discount_pct") or "0"))
             concession = Decimal(str(row.get("concession_step_pct") or "0"))
+            tier_1_max = (
+                Decimal(str(row.get("tier_1_max_multiple")))
+                if row.get("tier_1_max_multiple") not in {None, ""}
+                else None
+            )
+            tier_1_markup = Decimal(str(row.get("tier_1_markup_pct") or "0"))
+            tier_2_max = (
+                Decimal(str(row.get("tier_2_max_multiple")))
+                if row.get("tier_2_max_multiple") not in {None, ""}
+                else None
+            )
+            tier_2_markup = Decimal(str(row.get("tier_2_markup_pct") or "0"))
         except (InvalidOperation, TypeError):
             errors.append("price and percentage fields must be decimals")
             standard = floor = max_discount = concession = Decimal("0")
+            tier_1_max = tier_2_max = None
+            tier_1_markup = tier_2_markup = Decimal("0")
         try:
             valid_from = _date(row.get("valid_from")) or date.today()
             valid_to = _date(row.get("valid_to"))
@@ -309,10 +358,15 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
             valid_from = date.today()
             valid_to = None
         try:
-            max_rounds = int(row.get("max_negotiation_rounds") or 2)
+            max_rounds = int(
+                row.get("max_negotiation_rounds")
+                if row.get("max_negotiation_rounds") not in {None, ""}
+                else 2
+            )
             min_quantity = int(row.get("min_quantity") or 1)
             max_quantity = int(row["max_quantity"]) if row.get("max_quantity") else None
             quote_valid_days = int(row.get("quote_valid_days") or 30)
+            quote_valid_weekday = _weekday(row.get("quote_valid_weekday"))
             if max_rounds < 0 or min_quantity < 1 or quote_valid_days < 1:
                 raise ValueError
             if max_quantity is not None and max_quantity < min_quantity:
@@ -320,14 +374,23 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
         except (TypeError, ValueError):
             errors.append("round, quantity, and validity fields must be valid positive integers")
             max_rounds, min_quantity, max_quantity, quote_valid_days = 2, 1, None, 30
+            quote_valid_weekday = None
         if not re.fullmatch(r"[A-Z]{3}", currency):
             errors.append("currency must be a three-letter code")
-        if standard <= 0 or floor <= 0 or floor > standard:
+        if not manual_only and (standard <= 0 or floor <= 0 or floor > standard):
             errors.append("prices must be positive and floor cannot exceed standard price")
         if not Decimal("0") <= max_discount < Decimal("1"):
             errors.append("max_discount_pct must be between 0 and 1")
         if valid_to and valid_to < valid_from:
             errors.append("valid_to cannot precede valid_from")
+        if tier_1_markup < 0 or tier_2_markup < 0:
+            errors.append("tier markups cannot be negative")
+        if (tier_1_max is None) != (tier_2_max is None):
+            errors.append("tier_1_max_multiple and tier_2_max_multiple must both be set or both be blank")
+        if tier_1_max is not None and tier_2_max is not None and not (
+            tier_1_max > 1 and tier_2_max > tier_1_max
+        ):
+            errors.append("quantity tier multiples must satisfy 1 < tier 1 < tier 2")
         product = await session.scalar(select(Product).where(Product.code == code))
         if product is None and not str(row.get("product_name") or "").strip():
             errors.append("new product requires product_name")
@@ -335,7 +398,7 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
             errors.append(
                 f"approved_text_key must match existing product key: {product.approved_text_key}"
             )
-        if product is not None:
+        if product is not None and not manual_only:
             overlap = await session.scalar(
                 select(PricePolicy.id).where(
                     PricePolicy.product_id == product.id,
@@ -358,7 +421,9 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
             prior_end = prior["valid_to_value"] or date.max
             current_end = valid_to or date.max
             if (
-                prior["code"] == code
+                not manual_only
+                and not prior["manual_only"]
+                and prior["code"] == code
                 and prior["currency"] == currency
                 and prior["valid_from_value"] <= current_end
                 and valid_from <= prior_end
@@ -373,6 +438,8 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                 **row,
                 "code": code,
                 "currency": currency,
+                "manual_only": manual_only,
+                "margin_class": margin_class,
                 "approved_text_key": approved_text_key,
                 "product_name_value": str(row.get("product_name") or "").strip(),
                 "unit_value": str(row.get("unit") or "unit").strip(),
@@ -383,7 +450,12 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                 "max_rounds": max_rounds,
                 "min_quantity_value": min_quantity,
                 "max_quantity_value": max_quantity,
+                "tier_1_max": tier_1_max,
+                "tier_1_markup": tier_1_markup,
+                "tier_2_max": tier_2_max,
+                "tier_2_markup": tier_2_markup,
                 "quote_valid_days_value": quote_valid_days,
+                "quote_valid_weekday": quote_valid_weekday,
                 "valid_from_value": valid_from,
                 "valid_to_value": valid_to,
                 "product": product,
@@ -404,10 +476,16 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                     name=row["product_name_value"],
                     unit=row["unit_value"],
                     approved_text_key=row["approved_text_key"],
+                    margin_class=row["margin_class"],
                 )
                 session.add(product)
                 await session.flush()
                 product_cache[row["code"]] = product
+            else:
+                product.margin_class = row["margin_class"]
+            if row["manual_only"]:
+                result.applied_rows += 1
+                continue
             session.add(
                 PricePolicy(
                     product_id=product.id,
@@ -419,11 +497,18 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                     concession_step_pct=row["concession"],
                     min_quantity=row["min_quantity_value"],
                     max_quantity=row["max_quantity_value"],
+                    tier_1_max_multiple=row["tier_1_max"],
+                    tier_1_markup_pct=row["tier_1_markup"],
+                    tier_2_max_multiple=row["tier_2_max"],
+                    tier_2_markup_pct=row["tier_2_markup"],
                     quote_valid_days=row["quote_valid_days_value"],
+                    quote_valid_weekday=row["quote_valid_weekday"],
                     standard_incoterm=str(row.get("standard_incoterm") or "EXW"),
                     allowed_incoterms=[v.strip() for v in str(row.get("allowed_incoterms") or "EXW").split(",")],
                     standard_payment_term=str(row.get("standard_payment_term") or "100% before shipment"),
                     allowed_payment_terms=[v.strip() for v in str(row.get("allowed_payment_terms") or "").split(",") if v.strip()],
+                    taxes_included=_bool(row.get("taxes_included")),
+                    freight_included=_bool(row.get("freight_included")),
                     valid_from=row["valid_from_value"],
                     valid_to=row["valid_to_value"],
                     source_hash=result.source_hash,
