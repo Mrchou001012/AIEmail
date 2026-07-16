@@ -135,6 +135,8 @@ The implementation uses the official `anthropic.AsyncAnthropic` SDK and typed Py
 
 Adaptive thinking and effort controls are sent only to model families known to support them. Claude Haiku 4.5, Claude Opus 4.5, Claude Sonnet 4.5, and unknown compatible model identifiers run without optional thinking controls so a supported structured-output request is not rejected by an incompatible inference parameter.
 
+The inbound-analysis schema requires every property while retaining nullable values and explicit false/empty defaults in the response. This avoids the exponential grammar cost of many optional properties without changing the downstream safety decisions.
+
 Keep `MAIL_TRANSPORT=file`, `SAFE_MODE=true`, and `AUTO_SEND_ENABLED=false` while testing real Claude.
 
 ## Gmail and DingTalk activation

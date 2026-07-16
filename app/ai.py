@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 import anthropic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain import Intent
 from app.products import canonical_product_code, find_product_code
@@ -13,6 +13,11 @@ from app.settings import Settings, get_settings
 
 
 class InboundAnalysis(BaseModel):
+    model_config = ConfigDict(
+        json_schema_mode_override="serialization",
+        json_schema_serialization_defaults_required=True,
+    )
+
     intent: Intent
     intent_confidence: float = Field(ge=0, le=1)
     product_code: str | None = None
@@ -62,6 +67,8 @@ attachment-dependent cases clearly. Treat a lead-time or ready-stock question as
 treat a request for a specific dispatch, shipping, or arrival date as shipping. Normalize quantities
 to whole kilograms; 1 metric ton or MT is 1000 kg. If the quantity cannot be safely converted to whole kilograms, mark it as missing.
 Normalize currency mentions to three-letter ISO codes; use INR for INR, ₹, Rs, or Rs.
+Return every schema field explicitly: use null for unavailable nullable values, false for absent
+flags, and an empty list when there is no evidence or missing field.
 Return only the requested structured result."""
 
 DRAFT_PROMPT = """Create a conservative B2B email language plan. Do not invent prices, currencies,

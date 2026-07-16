@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.ai import AIClient, _anthropic_inference_options, stub_analyze, validate_rendered_email
+from app.ai import AIClient, InboundAnalysis, _anthropic_inference_options, stub_analyze, validate_rendered_email
 from app.domain import Intent, PricingPolicy, counteroffer
 from app.imports import load_content
 from app.mail import build_message, parse_mime
@@ -31,6 +31,11 @@ def test_anthropic_inference_options_enable_supported_adaptive_thinking() -> Non
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": "high"},
     }
+
+
+def test_inbound_analysis_schema_has_no_optional_properties() -> None:
+    schema = InboundAnalysis.model_json_schema()
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 def test_stub_detects_prompt_injection_as_customer_data() -> None:
