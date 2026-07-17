@@ -45,6 +45,7 @@ from app.history import (
 from app.imap_poller import poll_folder_once
 from app.mail import parse_mime
 from app.recovery import (
+    FalseCounterofferDuplicateSource,
     FalseCounterofferRecoveryRequest,
     recover_false_counteroffer,
 )
@@ -696,6 +697,92 @@ async def test_counteroffer_hands_off_without_changing_quote(
     assert handoff.reason_code == HandoffReason.PRICE_NEGOTIATION.value
 
 
+async def _add_false_counteroffer_recovery_source(
+    db_session: AsyncSession,
+    case: SalesCase,
+    *,
+    message_id: str,
+    requested_quantity: int,
+    received_at: datetime,
+) -> tuple[EmailMessage, Handoff, str]:
+    expected_body = f"Please quote {requested_quantity} kg PRODUCT WIDGET-100 instead."
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = message_id
+    message["In-Reply-To"] = "<original-quote@example.com>"
+    message["References"] = "<root@example.com> <original-quote@example.com>"
+    message.set_content(
+        f"{expected_body}\n\n"
+        "On Friday, July 17, 2026 Seller <sales-agent@example.com> wrote:\n"
+        "Quantity: 100 kg\n"
+        "Unit price: USD 100.0000 per kg"
+    )
+    raw = message.as_bytes()
+    parsed = parse_mime(raw)
+    assert parsed.body_text == expected_body
+
+    polluted_body = (
+        f"{expected_body}\n\n"
+        "Seller wrote:\n"
+        "Quantity: 100 kg\n"
+        "Unit price: USD 100.0000 per kg"
+    )
+    email_row = EmailMessage(
+        case_id=case.id,
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="INBOUND",
+        mailbox="integration-test",
+        mailbox_folder="INBOX",
+        message_id=parsed.message_id,
+        in_reply_to=parsed.in_reply_to,
+        references_json=parsed.references,
+        from_address=parsed.from_address,
+        to_addresses=parsed.to_addresses,
+        subject=parsed.subject,
+        body_text=polluted_body,
+        body_html=parsed.body_html,
+        attachment_metadata=parsed.attachments,
+        raw_sha256=parsed.raw_sha256,
+        received_at=received_at,
+    )
+    db_session.add(email_row)
+    await db_session.flush()
+
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.PRICE_NEGOTIATION.value,
+        summary="Inbound counteroffer requires human review",
+        extracted_facts={"intent": "counteroffer", "quantity": requested_quantity},
+        status="OPEN",
+        dingtalk_status="SENT",
+    )
+    db_session.add(handoff)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Job(
+                kind="process_inbound",
+                payload={"email_id": email_row.id},
+                status=JobStatus.DONE,
+                idempotency_key=f"process-inbound:{email_row.id}",
+            ),
+            Job(
+                kind="notify_handoff",
+                payload={"handoff_id": handoff.id},
+                status=JobStatus.DONE,
+                idempotency_key=f"handoff-notify:{handoff.id}",
+            ),
+        ]
+    )
+    archive = get_settings().runtime_dir / "inbound_archive" / f"{parsed.raw_sha256}.eml"
+    archive.write_bytes(raw)
+    return email_row, handoff, polluted_body
+
+
 async def test_false_counteroffer_recovery_reparses_and_reprocesses(
     db_session: AsyncSession,
 ) -> None:
@@ -850,6 +937,273 @@ async def test_false_counteroffer_recovery_reparses_and_reprocesses(
             ),
         )
     ) == 2
+
+
+async def test_false_counteroffer_recovery_collapses_duplicate_sources(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    case.status = CaseStatus.WAITING_HUMAN
+    canonical_received_at = datetime(2026, 7, 17, 2, 20, 12, tzinfo=UTC)
+    duplicate_email, duplicate_handoff, _ = await _add_false_counteroffer_recovery_source(
+        db_session,
+        case,
+        message_id="<false-counteroffer-duplicate-earlier@example.com>",
+        requested_quantity=200,
+        received_at=canonical_received_at - timedelta(seconds=55),
+    )
+    canonical_email, canonical_handoff, _ = await _add_false_counteroffer_recovery_source(
+        db_session,
+        case,
+        message_id="<false-counteroffer-duplicate-canonical@example.com>",
+        requested_quantity=200,
+        received_at=canonical_received_at,
+    )
+    await db_session.commit()
+    case_id = case.id
+    canonical_email_id = canonical_email.id
+    canonical_handoff_id = canonical_handoff.id
+    duplicate_email_id = duplicate_email.id
+    duplicate_handoff_id = duplicate_handoff.id
+
+    result = await recover_false_counteroffer(
+        FalseCounterofferRecoveryRequest(
+            email_id=canonical_email_id,
+            case_id=case_id,
+            handoff_id=canonical_handoff_id,
+            expected_body="Please quote 200 kg PRODUCT WIDGET-100 instead.",
+            expected_existing_quantity=100,
+            expected_new_quantity=200,
+            expected_recipient="internal@example.com",
+            recovery_commit="test-duplicate-recovery-commit",
+            duplicate_sources=(
+                FalseCounterofferDuplicateSource(
+                    email_id=duplicate_email_id,
+                    handoff_id=duplicate_handoff_id,
+                ),
+            ),
+        )
+    )
+
+    db_session.expire_all()
+    recovered_case = await db_session.get(SalesCase, case_id)
+    recovered_canonical_email = await db_session.get(EmailMessage, canonical_email_id)
+    recovered_duplicate_email = await db_session.get(EmailMessage, duplicate_email_id)
+    recovered_canonical_handoff = await db_session.get(Handoff, canonical_handoff_id)
+    recovered_duplicate_handoff = await db_session.get(Handoff, duplicate_handoff_id)
+    assert recovered_case is not None
+    assert recovered_canonical_email is not None
+    assert recovered_duplicate_email is not None
+    assert recovered_canonical_handoff is not None
+    assert recovered_duplicate_handoff is not None
+
+    assert result.canonical_email_id == canonical_email_id
+    assert result.duplicate_email_ids == (duplicate_email_id,)
+    assert result.resolved_handoff_ids == (canonical_handoff_id, duplicate_handoff_id)
+    assert recovered_case.status == CaseStatus.ACTIVE
+    assert recovered_case.negotiation_round == 1
+    assert recovered_canonical_email.body_text == "Please quote 200 kg PRODUCT WIDGET-100 instead."
+    assert recovered_duplicate_email.body_text == "Please quote 200 kg PRODUCT WIDGET-100 instead."
+    assert recovered_canonical_handoff.status == "RESOLVED"
+    assert recovered_canonical_handoff.source_email_id is None
+    assert recovered_canonical_handoff.dingtalk_status == "SENT"
+    assert recovered_canonical_handoff.extracted_facts["recovery_role"] == "canonical"
+    assert recovered_duplicate_handoff.status == "RESOLVED"
+    assert recovered_duplicate_handoff.source_email_id == duplicate_email_id
+    assert recovered_duplicate_handoff.dingtalk_status == "SENT"
+    assert recovered_duplicate_handoff.extracted_facts["recovery_role"] == "duplicate"
+    assert recovered_duplicate_handoff.extracted_facts["duplicate_of_email_id"] == canonical_email_id
+
+    quotes = list(
+        (
+            await db_session.scalars(
+                select(Quote).where(Quote.case_id == case_id).order_by(Quote.round_number)
+            )
+        ).all()
+    )
+    assert [(quote.round_number, quote.quantity) for quote in quotes] == [(0, 100), (1, 200)]
+    outboxes = list((await db_session.scalars(select(Outbox))).all())
+    assert len(outboxes) == 1
+    outbox = outboxes[0]
+    assert outbox.id == result.outbox_id
+    assert outbox.business_key == f"inbound-reply:{canonical_email_id}"
+    assert outbox.status == DeliveryStatus.PENDING
+    assert outbox.recipient == "internal@example.com"
+    parsed_outbound = parse_mime(outbox.raw_message.encode("utf-8"))
+    assert parsed_outbound.in_reply_to == recovered_canonical_email.message_id
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Outbox)
+        .where(Outbox.business_key.like(f"inbound-reply:{duplicate_email_id}%"))
+    ) == 0
+
+    reparse_audits = list(
+        (
+            await db_session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.case_id == case_id,
+                    AuditEvent.event_type == "email.reparsed_for_recovery",
+                )
+            )
+        ).all()
+    )
+    resolved_audits = list(
+        (
+            await db_session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.case_id == case_id,
+                    AuditEvent.event_type == "handoff.false_positive_resolved",
+                )
+            )
+        ).all()
+    )
+    duplicate_audits = list(
+        (
+            await db_session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.case_id == case_id,
+                    AuditEvent.event_type == "email.duplicate_suppressed",
+                )
+            )
+        ).all()
+    )
+    assert {(event.data["email_id"], event.data["role"]) for event in reparse_audits} == {
+        (canonical_email_id, "canonical"),
+        (duplicate_email_id, "duplicate"),
+    }
+    assert {(event.data["handoff_id"], event.data["role"]) for event in resolved_audits} == {
+        (canonical_handoff_id, "canonical"),
+        (duplicate_handoff_id, "duplicate"),
+    }
+    assert len(duplicate_audits) == 1
+    assert duplicate_audits[0].data == {
+        "email_id": duplicate_email_id,
+        "handoff_id": duplicate_handoff_id,
+        "canonical_email_id": canonical_email_id,
+        "commit": "test-duplicate-recovery-commit",
+    }
+
+    counts_before_replay = (
+        await db_session.scalar(select(func.count()).select_from(Quote)),
+        await db_session.scalar(select(func.count()).select_from(Outbox)),
+        await db_session.scalar(select(func.count()).select_from(Handoff)),
+        await db_session.scalar(select(func.count()).select_from(AuditEvent)),
+        await db_session.scalar(select(func.count()).select_from(Job)),
+    )
+    await process_inbound(db_session, duplicate_email_id)
+    counts_after_replay = (
+        await db_session.scalar(select(func.count()).select_from(Quote)),
+        await db_session.scalar(select(func.count()).select_from(Outbox)),
+        await db_session.scalar(select(func.count()).select_from(Handoff)),
+        await db_session.scalar(select(func.count()).select_from(AuditEvent)),
+        await db_session.scalar(select(func.count()).select_from(Job)),
+    )
+    assert counts_after_replay == counts_before_replay
+
+
+@pytest.mark.parametrize(
+    ("duplicate_quantity", "duplicate_time_offset", "error_match"),
+    [
+        (201, -55, "unexpected cleaned body"),
+        (200, 1, "canonical email must be the latest request"),
+        (200, -301, "not within 300s"),
+    ],
+)
+async def test_false_counteroffer_duplicate_guard_rolls_back_everything(
+    db_session: AsyncSession,
+    duplicate_quantity: int,
+    duplicate_time_offset: int,
+    error_match: str,
+) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    case.status = CaseStatus.WAITING_HUMAN
+    canonical_received_at = datetime(2026, 7, 17, 2, 20, 12, tzinfo=UTC)
+    duplicate_email, duplicate_handoff, duplicate_polluted_body = (
+        await _add_false_counteroffer_recovery_source(
+            db_session,
+            case,
+            message_id=f"<false-counteroffer-guard-duplicate-{duplicate_quantity}-{duplicate_time_offset}@example.com>",
+            requested_quantity=duplicate_quantity,
+            received_at=canonical_received_at + timedelta(seconds=duplicate_time_offset),
+        )
+    )
+    canonical_email, canonical_handoff, canonical_polluted_body = (
+        await _add_false_counteroffer_recovery_source(
+            db_session,
+            case,
+            message_id=f"<false-counteroffer-guard-canonical-{duplicate_quantity}-{duplicate_time_offset}@example.com>",
+            requested_quantity=200,
+            received_at=canonical_received_at,
+        )
+    )
+    await db_session.commit()
+    case_id = case.id
+    canonical_email_id = canonical_email.id
+    canonical_handoff_id = canonical_handoff.id
+    duplicate_email_id = duplicate_email.id
+    duplicate_handoff_id = duplicate_handoff.id
+
+    with pytest.raises(RuntimeError, match=error_match):
+        await recover_false_counteroffer(
+            FalseCounterofferRecoveryRequest(
+                email_id=canonical_email_id,
+                case_id=case_id,
+                handoff_id=canonical_handoff_id,
+                expected_body="Please quote 200 kg PRODUCT WIDGET-100 instead.",
+                expected_existing_quantity=100,
+                expected_new_quantity=200,
+                expected_recipient="internal@example.com",
+                recovery_commit="test-duplicate-guard-rollback",
+                duplicate_sources=(
+                    FalseCounterofferDuplicateSource(
+                        email_id=duplicate_email_id,
+                        handoff_id=duplicate_handoff_id,
+                    ),
+                ),
+            )
+        )
+
+    db_session.expire_all()
+    rolled_back_case = await db_session.get(SalesCase, case_id)
+    rolled_back_canonical_email = await db_session.get(EmailMessage, canonical_email_id)
+    rolled_back_duplicate_email = await db_session.get(EmailMessage, duplicate_email_id)
+    rolled_back_canonical_handoff = await db_session.get(Handoff, canonical_handoff_id)
+    rolled_back_duplicate_handoff = await db_session.get(Handoff, duplicate_handoff_id)
+    assert rolled_back_case is not None
+    assert rolled_back_canonical_email is not None
+    assert rolled_back_duplicate_email is not None
+    assert rolled_back_canonical_handoff is not None
+    assert rolled_back_duplicate_handoff is not None
+    assert rolled_back_case.status == CaseStatus.WAITING_HUMAN
+    assert rolled_back_case.negotiation_round == 0
+    assert rolled_back_canonical_email.body_text == canonical_polluted_body
+    assert rolled_back_duplicate_email.body_text == duplicate_polluted_body
+    assert rolled_back_canonical_handoff.status == "OPEN"
+    assert rolled_back_canonical_handoff.source_email_id == canonical_email_id
+    assert rolled_back_canonical_handoff.dingtalk_status == "SENT"
+    assert "recovery_role" not in rolled_back_canonical_handoff.extracted_facts
+    assert rolled_back_duplicate_handoff.status == "OPEN"
+    assert rolled_back_duplicate_handoff.source_email_id == duplicate_email_id
+    assert rolled_back_duplicate_handoff.dingtalk_status == "SENT"
+    assert "recovery_role" not in rolled_back_duplicate_handoff.extracted_facts
+    assert await db_session.scalar(select(func.count()).select_from(Quote)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.event_type.in_(
+                [
+                    "email.reparsed_for_recovery",
+                    "handoff.false_positive_resolved",
+                    "email.duplicate_suppressed",
+                ]
+            )
+        )
+    ) == 0
+    jobs = list((await db_session.scalars(select(Job).order_by(Job.id))).all())
+    assert len(jobs) == 4
+    assert all(job.status == JobStatus.DONE for job in jobs)
 
 
 async def test_ready_stock_lead_time_gets_bounded_reply(db_session: AsyncSession) -> None:
