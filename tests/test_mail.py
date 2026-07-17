@@ -320,7 +320,7 @@ def test_append_quoted_reply_preserves_full_sanitized_conversation() -> None:
     assert "<script>" not in html_body
     assert "onclick" not in html_body
     assert "javascript:" not in html_body
-    assert "tracker.example" not in html_body
+    assert 'src="https://tracker.example/pixel"' in html_body
 
 
 def test_small_cid_image_without_attachment_disposition_does_not_require_review() -> None:
@@ -335,7 +335,7 @@ def test_small_cid_image_without_attachment_disposition_does_not_require_review(
     )
     html_part = message.get_payload()[-1]
     html_part.add_related(
-        b"small-inline-logo",
+        b"\x89PNG\r\n\x1a\nsmall-inline-logo",
         maintype="application",
         subtype="octet-stream",
         cid="<client-logo.png>",
@@ -347,17 +347,15 @@ def test_small_cid_image_without_attachment_disposition_does_not_require_review(
 
     parsed = parse_mime(message.as_bytes())
 
-    assert parsed.attachments == [
-        {
-            "filename": "client-logo.png",
-            "content_type": "application/octet-stream",
-            "disposition": None,
-            "content_id": "<client-logo.png>",
-            "size": 17,
-            "sha256": "ade8c678ed8abd428eac9e3965f528c3afcb8cc114922f78ef21900c2258eb9b",
-        }
-    ]
-    assert attachments_require_review(parsed.attachments) is False
+    assert len(parsed.attachments) == 1
+    attachment = parsed.attachments[0]
+    assert attachment["filename"] == "client-logo.png"
+    assert attachment["content_type"] == "application/octet-stream"
+    assert attachment["detected_content_type"] == "image/png"
+    assert attachment["disposition"] is None
+    assert attachment["content_id"] == "<client-logo.png>"
+    assert attachment["inline_content"] is True
+    assert attachments_require_review(parsed.attachments, parsed.body_html) is False
 
 
 def test_cid_image_marked_as_attachment_still_requires_review() -> None:

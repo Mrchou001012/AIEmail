@@ -55,13 +55,16 @@ from app.history import resolve_unique_contact
 from app.imports import ContentBundle, load_content
 from app.integrations import DingTalkNotifier
 from app.mail import (
+    FullReplySource,
     GmailIMAPClient,
+    InlineImageAsset,
     ParsedEmail,
     append_quoted_reply,
     attachments_require_review,
     build_message,
-    extract_full_message_bodies,
+    extract_full_reply_source,
     has_thread_subject_prefix,
+    html_requires_mime_resources,
     match_case,
     normalized_subject,
     parse_mime,
@@ -526,13 +529,13 @@ async def queue_human_reply(
         for line in clean_body.splitlines()
     ]
     signed_html = "".join(html_lines) + bundle.signature_html
-    source_text, source_html = _reply_source_bodies(source_email)
+    source = _reply_source(source_email)
     signed_text, signed_html = append_quoted_reply(
         signed_text,
         signed_html,
         from_address=source_email.from_address,
-        source_body=source_text,
-        source_html=source_html,
+        source_body=source.body_text,
+        source_html=source.body_html,
         occurred_at=source_email.received_at,
     )
     references = _reply_references(source_email)
@@ -546,6 +549,7 @@ async def queue_human_reply(
         stable_key=business_key,
         in_reply_to=source_email.message_id,
         references=references,
+        inline_images=source.inline_images,
     )
     parsed_outbound = parse_mime(raw.encode("utf-8"))
     now = datetime.now(UTC)
@@ -613,11 +617,11 @@ def _reply_references(source_email: EmailMessage) -> list[str]:
     )
 
 
-MAX_REPLY_SOURCE_ARCHIVE_BYTES = 10 * 1024 * 1024
+MAX_REPLY_SOURCE_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
-def _reply_source_bodies(source_email: EmailMessage) -> tuple[str, str | None]:
-    """Load the complete direct-parent body used only for visible reply quoting."""
+def _reply_source(source_email: EmailMessage) -> FullReplySource:
+    """Load the complete direct-parent display body and its inline resources."""
     archive_folder = "mail_archive" if source_email.is_history else "inbound_archive"
     archive_path = (
         get_settings().runtime_dir
@@ -625,22 +629,31 @@ def _reply_source_bodies(source_email: EmailMessage) -> tuple[str, str | None]:
         / f"{source_email.raw_sha256}.eml"
     )
     try:
-        if archive_path.stat().st_size > MAX_REPLY_SOURCE_ARCHIVE_BYTES:
-            logger.warning(
-                "Reply source archive exceeds %s bytes; using stored body for email_id=%s",
-                MAX_REPLY_SOURCE_ARCHIVE_BYTES,
-                source_email.id,
-            )
-        else:
-            return extract_full_message_bodies(archive_path.read_bytes())
-    except (OSError, ValueError, LookupError, RecursionError) as exc:
+        archive_size = archive_path.stat().st_size
+        raw = archive_path.read_bytes()
+    except OSError as exc:
+        if html_requires_mime_resources(source_email.body_html):
+            raise RuntimeError(
+                f"complete reply source with inline images is unavailable for email_id={source_email.id}"
+            ) from exc
         logger.warning(
-            "Complete reply source unavailable for email_id=%s path=%s: %s",
+            "Complete reply archive unavailable for email_id=%s; using stored body without MIME resources",
             source_email.id,
-            archive_path,
-            type(exc).__name__,
         )
-    return source_email.body_text, source_email.body_html
+        return FullReplySource(
+            body_text=source_email.body_text,
+            body_html=source_email.body_html,
+        )
+    if archive_size > MAX_REPLY_SOURCE_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"complete reply source exceeds {MAX_REPLY_SOURCE_ARCHIVE_BYTES} bytes"
+        )
+    try:
+        return extract_full_reply_source(raw)
+    except (ValueError, LookupError, RecursionError) as exc:
+        raise RuntimeError(
+            f"complete reply source could not preserve inline content for email_id={source_email.id}"
+        ) from exc
 
 
 async def active_policy(session: AsyncSession, product_id: int, currency: str) -> PricePolicy | None:
@@ -786,6 +799,7 @@ async def freeze_outbox(
     business_key: str,
     in_reply_to: str | None = None,
     references: list[str] | None = None,
+    inline_images: tuple[InlineImageAsset, ...] = (),
 ) -> Outbox | None:
     message_id, raw = build_message(
         from_address=get_settings().mail_from,
@@ -796,6 +810,7 @@ async def freeze_outbox(
         stable_key=business_key,
         in_reply_to=in_reply_to,
         references=references,
+        inline_images=inline_images,
     )
     parsed_outbound = parse_mime(raw.encode("utf-8"))
     try:
@@ -1783,7 +1798,12 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         )
         return
     analysis = analysis.model_copy(
-        update={"risky_attachment": attachments_require_review(email_row.attachment_metadata)}
+        update={
+            "risky_attachment": attachments_require_review(
+                email_row.attachment_metadata,
+                email_row.body_html,
+            )
+        }
     )
     analysis_facts = analysis.model_dump(mode="json")
     session.add(
@@ -1987,13 +2007,13 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             taxes_included=policy_row.taxes_included,
             freight_included=policy_row.freight_included,
         )
-        source_text, source_html = _reply_source_bodies(email_row)
+        source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
             text,
             html_body,
             from_address=email_row.from_address,
-            source_body=source_text,
-            source_html=source_html,
+            source_body=source.body_text,
+            source_html=source.body_html,
             occurred_at=email_row.received_at,
         )
     except Exception as exc:
@@ -2039,6 +2059,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         business_key=f"inbound-reply:{email_row.id}",
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
+        inline_images=source.inline_images,
     )
 
 

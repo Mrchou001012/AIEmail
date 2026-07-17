@@ -1,4 +1,5 @@
 import base64
+import binascii
 import email
 import hashlib
 import html
@@ -18,6 +19,7 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from bs4 import BeautifulSoup, Comment
 from sqlalchemy import select
@@ -29,28 +31,9 @@ from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 SIGNATURE_LOGO_CID = "lanyachem-logo"
-
-
-def _attach_signature_logo(message: MIMEEmailMessage, html_body: str, token: str) -> None:
-    if f"cid:{SIGNATURE_LOGO_CID}" not in html_body:
-        return
-    logo_path = get_settings().content_dir / "email_signature_logo.b64"
-    try:
-        logo_bytes = base64.b64decode(logo_path.read_text(encoding="ascii").strip(), validate=True)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"signature logo asset is unavailable or invalid: {logo_path}") from exc
-    if not logo_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise RuntimeError("signature logo asset is not a PNG image")
-    html_part = message.get_payload()[-1]
-    html_part.add_related(
-        logo_bytes,
-        maintype="image",
-        subtype="png",
-        cid=f"<{SIGNATURE_LOGO_CID}>",
-        filename="lanyachem-logo.png",
-        disposition="inline",
-    )
-    html_part.set_boundary(f"=_sales_agent_related_{token}")
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_INLINE_IMAGES_TOTAL_BYTES = 15 * 1024 * 1024
+MAX_OUTBOUND_MESSAGE_BYTES = 24 * 1024 * 1024
 
 
 def _imap_mailbox_arg(folder: str) -> str:
@@ -75,11 +58,25 @@ class ParsedEmail:
     occurred_at: datetime | None
 
 
-SAFE_INLINE_IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+@dataclass(frozen=True)
+class InlineImageAsset:
+    content_id: str
+    content_type: str
+    filename: str
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class FullReplySource:
+    body_text: str
+    body_html: str | None
+    inline_images: tuple[InlineImageAsset, ...] = ()
+
+
+SAFE_INLINE_IMAGE_SUFFIXES = frozenset(
+    {".avif", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+)
 SAFE_INLINE_IMAGE_CONTENT_TYPES = frozenset({"application/octet-stream"})
-MAX_SAFE_INLINE_IMAGE_BYTES = 256 * 1024
-MAX_QUOTED_REPLY_CHARS = 200_000
-MAX_QUOTED_HTML_CHARS = 500_000
 
 QUOTED_HTML_ALLOWED_TAGS = frozenset(
     {
@@ -99,6 +96,7 @@ QUOTED_HTML_ALLOWED_TAGS = frozenset(
         "h6",
         "hr",
         "i",
+        "img",
         "li",
         "ol",
         "p",
@@ -116,6 +114,45 @@ QUOTED_HTML_ALLOWED_TAGS = frozenset(
         "tr",
         "u",
         "ul",
+    }
+)
+QUOTED_HTML_SAFE_STYLE_PROPERTIES = frozenset(
+    {
+        "background-color",
+        "border",
+        "border-bottom",
+        "border-collapse",
+        "border-color",
+        "border-left",
+        "border-right",
+        "border-spacing",
+        "border-style",
+        "border-top",
+        "border-width",
+        "color",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "height",
+        "line-height",
+        "margin",
+        "margin-bottom",
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "max-width",
+        "min-width",
+        "padding",
+        "padding-bottom",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "text-align",
+        "text-decoration",
+        "vertical-align",
+        "white-space",
+        "width",
     }
 )
 QUOTED_HTML_DANGEROUS_TAGS = frozenset(
@@ -137,30 +174,78 @@ QUOTED_HTML_DANGEROUS_TAGS = frozenset(
         "textarea",
     }
 )
+SAFE_DATA_IMAGE_PATTERN = re.compile(
+    r"^data:image/(?:png|jpe?g|gif|webp|bmp|tiff?|x-icon|vnd\.microsoft\.icon);base64,([a-z0-9+/=\s]+)$",
+    flags=re.I,
+)
 
 
-def is_safe_inline_image_attachment(item: dict[str, Any]) -> bool:
-    """Recognize small CID images embedded by mail clients and signatures."""
+def is_safe_inline_image_attachment(
+    item: dict[str, Any],
+    referenced_content_ids: set[str] | None = None,
+    referenced_content_locations: set[str] | None = None,
+) -> bool:
+    """Recognize a raster image that is actually referenced by the HTML body."""
     filename = str(item.get("filename") or "").strip()
     content_id = str(item.get("content_id") or "").strip()
-    disposition = str(item.get("disposition") or "").strip().casefold()
+    content_location = str(item.get("content_location") or "").strip()
     content_type = str(item.get("content_type") or "").strip().casefold()
+    detected_content_type = str(item.get("detected_content_type") or "").strip().casefold()
     try:
         size = int(item.get("size") or 0)
     except (TypeError, ValueError):
         return False
+    normalized_cid = _normalize_content_id(content_id) if content_id else ""
+    normalized_location = (
+        _normalized_content_location(content_location) if content_location else ""
+    )
+    is_referenced = bool(
+        item.get("inline_content") is True
+        or (
+            normalized_cid
+            and referenced_content_ids is not None
+            and normalized_cid in referenced_content_ids
+        )
+        or (
+            normalized_location
+            and referenced_content_locations is not None
+            and normalized_location in referenced_content_locations
+        )
+    )
+    if "detected_content_type" in item:
+        raster_type_is_safe = detected_content_type.startswith("image/")
+    else:
+        # Compatibility for rows parsed before detected MIME types were stored.
+        raster_type_is_safe = bool(
+            content_type.startswith("image/")
+            or (
+                content_type in SAFE_INLINE_IMAGE_CONTENT_TYPES
+                and Path(filename).suffix.casefold() in SAFE_INLINE_IMAGE_SUFFIXES
+            )
+        )
     return bool(
-        content_id
-        and disposition != "attachment"
-        and Path(filename).suffix.casefold() in SAFE_INLINE_IMAGE_SUFFIXES
-        and (content_type.startswith("image/") or content_type in SAFE_INLINE_IMAGE_CONTENT_TYPES)
-        and 0 < size <= MAX_SAFE_INLINE_IMAGE_BYTES
+        (normalized_cid or normalized_location)
+        and is_referenced
+        and raster_type_is_safe
+        and 0 < size <= MAX_INLINE_IMAGE_BYTES
     )
 
 
-def attachments_require_review(attachments: list[dict[str, Any]]) -> bool:
-    """Require review for every attachment except a tightly bounded inline image."""
-    return any(not is_safe_inline_image_attachment(item) for item in attachments)
+def attachments_require_review(
+    attachments: list[dict[str, Any]],
+    body_html: str | None = None,
+) -> bool:
+    """Require review only for real attachments, not HTML-referenced body images."""
+    referenced_content_ids = _referenced_inline_content_ids(body_html)
+    referenced_content_locations = _referenced_inline_content_locations(body_html)
+    return any(
+        not is_safe_inline_image_attachment(
+            item,
+            referenced_content_ids,
+            referenced_content_locations,
+        )
+        for item in attachments
+    )
 
 
 def append_quoted_reply(
@@ -182,18 +267,6 @@ def append_quoted_reply(
         clean_source = html_source_text
     if not clean_source:
         return text_body, html_body
-    source_was_truncated = len(clean_source) > MAX_QUOTED_REPLY_CHARS
-    if source_was_truncated:
-        clean_source = (
-            clean_source[:MAX_QUOTED_REPLY_CHARS].rstrip()
-            + "\n[Earlier quoted conversation omitted for safety]"
-        )
-    if source_was_truncated or len(quoted_html) > MAX_QUOTED_HTML_CHARS:
-        quoted_html = (
-            '<div style="white-space:pre-wrap">'
-            + html.escape(clean_source)
-            + "</div>"
-        )
     timestamp = occurred_at or datetime.now(UTC)
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
@@ -223,8 +296,152 @@ def _decode_part(part: email.message.Message) -> str:
     return payload.decode(charset, errors="replace")
 
 
-def extract_full_message_bodies(raw: bytes) -> tuple[str, str | None]:
-    """Extract the display body without removing the message's existing reply chain."""
+def _normalize_content_id(value: str) -> str:
+    return unquote(html.unescape(value)).strip().strip("<>").casefold()
+
+
+def _referenced_inline_content_ids(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    soup = BeautifulSoup(value, "html.parser")
+    result: set[str] = set()
+    for image in soup.find_all("img"):
+        source = str(image.get("src") or "").strip()
+        if source.casefold().startswith("cid:"):
+            normalized = _normalize_content_id(source[4:])
+            if normalized:
+                result.add(normalized)
+    return result
+
+
+def _referenced_inline_content_locations(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    soup = BeautifulSoup(value, "html.parser")
+    return {
+        _normalized_content_location(source)
+        for image in soup.find_all("img")
+        if (source := str(image.get("src") or "").strip())
+        and not re.match(r"^(?:cid:|data:image/)", source, flags=re.I)
+    }
+
+
+def html_requires_mime_resources(value: str | None) -> bool:
+    """Return whether HTML references a non-self-contained embedded resource."""
+    if not value:
+        return False
+    soup = BeautifulSoup(value, "html.parser")
+    for image in soup.find_all("img"):
+        source = str(image.get("src") or "").strip()
+        if source and not re.match(r"^(?:https?://|data:image/)", source, flags=re.I):
+            return True
+    return False
+
+
+def _sniff_inline_image_content_type(payload: bytes) -> str | None:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return "image/webp"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    if payload.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if payload.startswith(b"\x00\x00\x01\x00"):
+        return "image/x-icon"
+    if len(payload) >= 12 and payload[4:8] == b"ftyp" and payload[8:12] in {
+        b"avif",
+        b"avis",
+    }:
+        return "image/avif"
+    return None
+
+
+def _iter_mime_tree(
+    part: email.message.Message,
+    path: tuple[int, ...] = (),
+) -> list[tuple[tuple[int, ...], email.message.Message]]:
+    """Walk a message without descending into attached message/rfc822 files."""
+    result = [(path, part)]
+    if not part.is_multipart() or part.get_content_type() == "message/rfc822":
+        return result
+    payload = part.get_payload()
+    if not isinstance(payload, list):
+        return result
+    for index, child in enumerate(payload):
+        result.extend(_iter_mime_tree(child, (*path, index)))
+    return result
+
+
+def _normalized_content_location(value: str) -> str:
+    return unquote(html.unescape(value)).strip().casefold()
+
+
+def _image_filename(content_type: str, digest: str, raw_filename: str | None) -> str:
+    suffix = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tiff",
+        "image/x-icon": ".ico",
+        "image/avif": ".avif",
+    }[content_type]
+    filename = re.sub(
+        r"[^a-zA-Z0-9_.-]",
+        "_",
+        Path(str(raw_filename or "")).name,
+    )[:200]
+    return filename or f"quoted-inline-{digest[:12]}{suffix}"
+
+
+def _inline_image_asset(payload: bytes, raw_filename: str | None = None) -> InlineImageAsset:
+    content_type = _sniff_inline_image_content_type(payload)
+    if content_type is None:
+        raise ValueError("referenced inline content is not a supported raster image")
+    if len(payload) > MAX_INLINE_IMAGE_BYTES:
+        raise ValueError(
+            f"referenced inline image exceeds {MAX_INLINE_IMAGE_BYTES} bytes"
+        )
+    digest = hashlib.sha256(payload).hexdigest()
+    content_id = f"quoted-{digest[:32]}@aiemail"
+    return InlineImageAsset(
+        content_id=content_id,
+        content_type=content_type,
+        filename=_image_filename(content_type, digest, raw_filename),
+        payload=payload,
+    )
+
+
+def _rewrite_referenced_image_sources(
+    value: str,
+    *,
+    cid_replacements: dict[str, str],
+    location_replacements: dict[str, str],
+    data_replacements: dict[str, str],
+) -> str:
+    soup = BeautifulSoup(value, "html.parser")
+    for image in soup.find_all("img"):
+        source = str(image.get("src") or "").strip()
+        replacement: str | None = None
+        if source.casefold().startswith("cid:"):
+            replacement = cid_replacements.get(_normalize_content_id(source[4:]))
+        elif source.casefold().startswith("data:image/"):
+            replacement = data_replacements.get(source)
+        elif not re.match(r"^https?://", source, flags=re.I):
+            replacement = location_replacements.get(_normalized_content_location(source))
+        if replacement:
+            image["src"] = f"cid:{replacement}"
+    return str(soup)
+
+
+def extract_full_reply_source(raw: bytes) -> FullReplySource:
+    """Extract complete display content and referenced inline images from one email."""
     message = BytesParser(policy=policy.default).parsebytes(raw)
     plain_part = message.get_body(preferencelist=("plain",))
     html_part = message.get_body(preferencelist=("html",))
@@ -236,7 +453,119 @@ def extract_full_message_bodies(raw: bytes) -> tuple[str, str | None]:
     body_html = _decode_part(html_part).strip() if html_part is not None else None
     if not body_text and body_html:
         body_text = _html_to_full_text(_sanitize_quoted_html(body_html))
-    return body_text, body_html
+    if not body_html:
+        return FullReplySource(body_text=body_text, body_html=body_html)
+
+    soup = BeautifulSoup(body_html, "html.parser")
+    image_sources = [
+        str(image.get("src") or "").strip()
+        for image in soup.find_all("img")
+        if str(image.get("src") or "").strip()
+    ]
+    referenced_cids = {
+        _normalize_content_id(source[4:])
+        for source in image_sources
+        if source.casefold().startswith("cid:")
+    }
+    referenced_locations = {
+        _normalized_content_location(source)
+        for source in image_sources
+        if not source.casefold().startswith(("cid:", "data:image/"))
+    }
+    data_sources = {
+        source for source in image_sources if source.casefold().startswith("data:image/")
+    }
+    if not referenced_cids and not referenced_locations and not data_sources:
+        return FullReplySource(body_text=body_text, body_html=body_html)
+
+    tree = _iter_mime_tree(message)
+    html_path = next((path for path, part in tree if part is html_part), ())
+    related_scope: tuple[int, ...] = ()
+    for path, part in tree:
+        if (
+            len(path) <= len(html_path)
+            and html_path[: len(path)] == path
+            and part.get_content_type() == "multipart/related"
+        ):
+            related_scope = path
+    scoped_parts = [
+        part
+        for path, part in tree
+        if path[: len(related_scope)] == related_scope and not part.is_multipart()
+    ]
+    parts_by_cid: dict[str, list[email.message.Message]] = {}
+    parts_by_location: dict[str, list[email.message.Message]] = {}
+    for part in scoped_parts:
+        if part.get("Content-ID"):
+            parts_by_cid.setdefault(
+                _normalize_content_id(str(part.get("Content-ID"))), []
+            ).append(part)
+        if part.get("Content-Location"):
+            parts_by_location.setdefault(
+                _normalized_content_location(str(part.get("Content-Location"))), []
+            ).append(part)
+
+    cid_replacements: dict[str, str] = {}
+    location_replacements: dict[str, str] = {}
+    data_replacements: dict[str, str] = {}
+    assets_by_cid: dict[str, InlineImageAsset] = {}
+    for original_cid in sorted(referenced_cids):
+        candidates = parts_by_cid.get(original_cid, [])
+        if len(candidates) != 1:
+            raise ValueError(f"referenced inline image is missing from MIME: {original_cid}")
+        part = candidates[0]
+        payload = part.get_payload(decode=True) or b""
+        asset = _inline_image_asset(payload, part.get_filename())
+        cid_replacements[original_cid] = asset.content_id
+        assets_by_cid.setdefault(asset.content_id, asset)
+    for original_location in sorted(referenced_locations):
+        candidates = parts_by_location.get(original_location, [])
+        if not candidates and re.match(r"^https?://", original_location, flags=re.I):
+            continue
+        if len(candidates) != 1:
+            raise ValueError(
+                f"referenced inline image location is missing from MIME: {original_location}"
+            )
+        part = candidates[0]
+        asset = _inline_image_asset(part.get_payload(decode=True) or b"", part.get_filename())
+        location_replacements[original_location] = asset.content_id
+        assets_by_cid.setdefault(asset.content_id, asset)
+    for source in sorted(data_sources):
+        data_match = SAFE_DATA_IMAGE_PATTERN.fullmatch(source)
+        if data_match is None:
+            raise ValueError("referenced data image is invalid or unsupported")
+        try:
+            payload = base64.b64decode(
+                re.sub(r"\s+", "", data_match.group(1)),
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("referenced data image is invalid") from exc
+        asset = _inline_image_asset(payload)
+        data_replacements[source] = asset.content_id
+        assets_by_cid.setdefault(asset.content_id, asset)
+    total_inline_bytes = sum(len(asset.payload) for asset in assets_by_cid.values())
+    if total_inline_bytes > MAX_INLINE_IMAGES_TOTAL_BYTES:
+        raise ValueError(
+            "referenced inline images exceed the complete-history message limit"
+        )
+    rewritten_html = _rewrite_referenced_image_sources(
+        body_html,
+        cid_replacements=cid_replacements,
+        location_replacements=location_replacements,
+        data_replacements=data_replacements,
+    )
+    return FullReplySource(
+        body_text=body_text,
+        body_html=rewritten_html,
+        inline_images=tuple(assets_by_cid.values()),
+    )
+
+
+def extract_full_message_bodies(raw: bytes) -> tuple[str, str | None]:
+    """Compatibility helper returning complete text and HTML display bodies."""
+    source = extract_full_reply_source(raw)
+    return source.body_text, source.body_html
 
 
 def _clean_plain(text: str) -> str:
@@ -290,12 +619,58 @@ def _html_to_full_text(value: str) -> str:
     return "\n".join(result).strip()
 
 
+def _sanitize_quoted_style(value: str) -> str:
+    safe_declarations: list[str] = []
+    for declaration in value.split(";"):
+        if ":" not in declaration:
+            continue
+        property_name, property_value = declaration.split(":", 1)
+        property_name = property_name.strip().casefold()
+        property_value = property_value.strip()
+        lowered_value = property_value.casefold()
+        if (
+            property_name not in QUOTED_HTML_SAFE_STYLE_PROPERTIES
+            or not property_value
+            or len(property_value) > 200
+            or any(
+                marker in lowered_value
+                for marker in (
+                    "url(",
+                    "expression(",
+                    "javascript:",
+                    "data:",
+                    "@import",
+                    "behavior:",
+                    "-moz-binding",
+                )
+            )
+        ):
+            continue
+        safe_declarations.append(f"{property_name}:{property_value}")
+    return ";".join(safe_declarations)
+
+
+def _safe_quoted_image_source(value: str) -> str | None:
+    source = html.unescape(value).strip()
+    if re.match(r"^https?://", source, flags=re.I):
+        return source
+    if source.casefold().startswith("cid:") and _normalize_content_id(source[4:]):
+        return source
+    data_match = SAFE_DATA_IMAGE_PATTERN.fullmatch(source)
+    if data_match is None:
+        return None
+    try:
+        payload = base64.b64decode(re.sub(r"\s+", "", data_match.group(1)), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return source if _sniff_inline_image_content_type(payload) is not None else None
+
+
 def _sanitize_quoted_html(value: str | None) -> str:
     """Keep readable email formatting while removing active and tracking content."""
     if not value:
         return ""
-    bounded_value = value[:MAX_QUOTED_HTML_CHARS]
-    soup = BeautifulSoup(bounded_value, "html.parser")
+    soup = BeautifulSoup(value, "html.parser")
     for comment in soup.find_all(string=lambda item: isinstance(item, Comment)):
         comment.extract()
     for tag in soup(QUOTED_HTML_DANGEROUS_TAGS):
@@ -303,15 +678,27 @@ def _sanitize_quoted_html(value: str | None) -> str:
     root = soup.body or soup
     for tag in list(root.find_all(True)):
         name = tag.name.casefold()
-        if name == "img":
-            alt = str(tag.get("alt") or "").strip()
-            tag.replace_with(f"[Image omitted: {alt}]" if alt else "")
-            continue
         if name not in QUOTED_HTML_ALLOWED_TAGS:
             tag.unwrap()
             continue
         safe_attributes: dict[str, str] = {}
-        if name == "a":
+        if name == "img":
+            source = _safe_quoted_image_source(str(tag.get("src") or ""))
+            alt = str(tag.get("alt") or "").strip()[:500]
+            if source is None:
+                tag.replace_with(alt)
+                continue
+            safe_attributes["src"] = source
+            if alt:
+                safe_attributes["alt"] = alt
+            title = str(tag.get("title") or "").strip()[:500]
+            if title:
+                safe_attributes["title"] = title
+            for attribute in ("width", "height"):
+                dimension = str(tag.get(attribute) or "").strip()
+                if re.fullmatch(r"\d{1,5}(?:px|%)?", dimension, flags=re.I):
+                    safe_attributes[attribute] = dimension
+        elif name == "a":
             href = str(tag.get("href") or "").strip()
             if re.match(r"^(?:https?://|mailto:)", href, flags=re.I):
                 safe_attributes["href"] = href
@@ -321,6 +708,9 @@ def _sanitize_quoted_html(value: str | None) -> str:
                 value = str(tag.get(attribute) or "").strip()
                 if value.isdigit() and 1 <= int(value) <= 100:
                     safe_attributes[attribute] = value
+        safe_style = _sanitize_quoted_style(str(tag.get("style") or ""))
+        if safe_style:
+            safe_attributes["style"] = safe_style
         tag.attrs = safe_attributes
     return "".join(str(child) for child in root.contents).strip()
 
@@ -336,14 +726,25 @@ def parse_mime(raw: bytes) -> ParsedEmail:
         disposition = part.get_content_disposition()
         filename = part.get_filename()
         content_type = part.get_content_type()
-        if disposition == "attachment" or filename:
+        content_id = str(part.get("Content-ID") or "").strip() or None
+        content_location = str(part.get("Content-Location") or "").strip() or None
+        if (
+            disposition == "attachment"
+            or filename
+            or (
+                (content_id or content_location)
+                and content_type not in {"text/plain", "text/html"}
+            )
+        ):
             payload = part.get_payload(decode=True) or b""
             attachments.append(
                 {
                     "filename": filename or "unnamed",
                     "content_type": content_type,
+                    "detected_content_type": _sniff_inline_image_content_type(payload),
                     "disposition": disposition,
-                    "content_id": str(part.get("Content-ID") or "").strip() or None,
+                    "content_id": content_id,
+                    "content_location": content_location,
                     "size": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 }
@@ -354,6 +755,22 @@ def parse_mime(raw: bytes) -> ParsedEmail:
         elif content_type == "text/html":
             html_parts.append(_decode_part(part))
     body_html = "\n".join(html_parts) or None
+    referenced_content_ids = _referenced_inline_content_ids(body_html)
+    referenced_content_locations = _referenced_inline_content_locations(body_html)
+    for item in attachments:
+        content_id = str(item.get("content_id") or "")
+        content_location = str(item.get("content_location") or "")
+        item["inline_content"] = bool(
+            (
+                content_id
+                and _normalize_content_id(content_id) in referenced_content_ids
+            )
+            or (
+                content_location
+                and _normalized_content_location(content_location)
+                in referenced_content_locations
+            )
+        )
     body_text = _clean_plain("\n".join(plain_parts))
     if not body_text and body_html:
         body_text = _html_to_text(body_html)
@@ -415,6 +832,74 @@ def has_thread_subject_prefix(subject: str) -> bool:
 def normalized_subject(subject: str) -> str:
     result = THREAD_SUBJECT_PREFIX.sub("", subject.strip())
     return re.sub(r"\s+", " ", result).lower()
+
+
+def _signature_logo_asset() -> InlineImageAsset:
+    logo_path = get_settings().content_dir / "email_signature_logo.b64"
+    try:
+        logo_bytes = base64.b64decode(
+            logo_path.read_text(encoding="ascii").strip(),
+            validate=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"signature logo asset is unavailable or invalid: {logo_path}"
+        ) from exc
+    if _sniff_inline_image_content_type(logo_bytes) != "image/png":
+        raise RuntimeError("signature logo asset is not a PNG image")
+    return InlineImageAsset(
+        content_id=SIGNATURE_LOGO_CID,
+        content_type="image/png",
+        filename="lanyachem-logo.png",
+        payload=logo_bytes,
+    )
+
+
+def _attach_related_images(
+    message: MIMEEmailMessage,
+    html_body: str,
+    token: str,
+    inline_images: tuple[InlineImageAsset, ...],
+) -> None:
+    referenced_cids = _referenced_inline_content_ids(html_body)
+    assets_by_cid: dict[str, InlineImageAsset] = {}
+    if _normalize_content_id(SIGNATURE_LOGO_CID) in referenced_cids:
+        logo = _signature_logo_asset()
+        assets_by_cid[_normalize_content_id(logo.content_id)] = logo
+    for asset in inline_images:
+        normalized_cid = _normalize_content_id(asset.content_id)
+        if normalized_cid not in referenced_cids:
+            continue
+        existing = assets_by_cid.get(normalized_cid)
+        if existing is not None and existing.payload != asset.payload:
+            raise ValueError(f"conflicting inline image Content-ID: {asset.content_id}")
+        detected_type = _sniff_inline_image_content_type(asset.payload)
+        if detected_type is None or detected_type != asset.content_type.casefold():
+            raise ValueError(f"invalid inline image payload: {asset.content_id}")
+        if len(asset.payload) > MAX_INLINE_IMAGE_BYTES:
+            raise ValueError(f"inline image is too large: {asset.content_id}")
+        assets_by_cid[normalized_cid] = asset
+    missing_cids = referenced_cids.difference(assets_by_cid)
+    if missing_cids:
+        raise ValueError(
+            "HTML contains unresolved inline images: " + ", ".join(sorted(missing_cids))
+        )
+    if not assets_by_cid:
+        return
+    if sum(len(asset.payload) for asset in assets_by_cid.values()) > MAX_INLINE_IMAGES_TOTAL_BYTES:
+        raise ValueError("inline image content exceeds the complete-history message limit")
+    html_part = message.get_payload()[-1]
+    for asset in assets_by_cid.values():
+        maintype, subtype = asset.content_type.split("/", 1)
+        html_part.add_related(
+            asset.payload,
+            maintype=maintype,
+            subtype=subtype,
+            cid=f"<{asset.content_id}>",
+            filename=asset.filename,
+            disposition="inline",
+        )
+    html_part.set_boundary(f"=_sales_agent_related_{token}")
 
 
 async def match_case(
@@ -500,6 +985,7 @@ def build_message(
     stable_key: str,
     in_reply_to: str | None = None,
     references: list[str] | None = None,
+    inline_images: tuple[InlineImageAsset, ...] = (),
 ) -> tuple[str, str]:
     domain = from_address.split("@")[-1] if "@" in from_address else "localhost"
     token = uuid.uuid5(uuid.NAMESPACE_URL, stable_key).hex
@@ -522,9 +1008,12 @@ def build_message(
         msg["References"] = " ".join(ordered_references)
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
-    _attach_signature_logo(msg, html_body, token)
+    _attach_related_images(msg, html_body, token, inline_images)
     msg.set_boundary(f"=_sales_agent_{token}")
-    return message_id, msg.as_string(policy=policy.SMTP)
+    raw = msg.as_string(policy=policy.SMTP)
+    if len(raw.encode("utf-8")) > MAX_OUTBOUND_MESSAGE_BYTES:
+        raise ValueError("complete reply exceeds the outbound email size limit")
+    return message_id, raw
 
 
 class FileMailTransport:

@@ -197,7 +197,7 @@ async def _load_recovery_source(
         f"email {email_id} has unexpected cleaned body: {parsed.body_text[:500]!r}",
     )
     _require(
-        not attachments_require_review(parsed.attachments),
+        not attachments_require_review(parsed.attachments, parsed.body_html),
         f"email {email_id} attachments still require human review",
     )
     return _RecoverySourceState(

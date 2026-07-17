@@ -185,16 +185,35 @@ async def test_safe_inline_image_does_not_force_attachment_handoff(
         "PRODUCT WIDGET-100 Please quote 100 kg.",
         suffix="safe-inline-image",
     )
-    email_row.attachment_metadata = [
-        {
-            "filename": "client-logo.png",
-            "content_type": "application/octet-stream",
-            "disposition": None,
-            "content_id": "<client-logo.png>",
-            "size": 20_135,
-            "sha256": hashlib.sha256(b"client-logo").hexdigest(),
-        }
-    ]
+    source = MIMEMessage()
+    source["From"] = email_row.from_address
+    source["To"] = "sales-agent@example.com"
+    source["Subject"] = email_row.subject
+    source["Message-ID"] = email_row.message_id
+    source.set_content(email_row.body_text)
+    source.add_alternative(
+        '<p>PRODUCT WIDGET-100 Please quote 100 kg.</p><img src="cid:client-logo.png">',
+        subtype="html",
+    )
+    source.get_payload()[-1].add_related(
+        b"\x89PNG\r\n\x1a\n" + (b"client-logo" * 1_700),
+        maintype="application",
+        subtype="octet-stream",
+        cid="<client-logo.png>",
+        filename="client-logo.png",
+        disposition="inline",
+    )
+    source_raw = source.as_bytes()
+    source_parsed = parse_mime(source_raw)
+    email_row.body_html = source_parsed.body_html
+    email_row.attachment_metadata = source_parsed.attachments
+    email_row.raw_sha256 = source_parsed.raw_sha256
+    archive = (
+        get_settings().runtime_dir
+        / "inbound_archive"
+        / f"{source_parsed.raw_sha256}.eml"
+    )
+    archive.write_bytes(source_raw)
     await db_session.commit()
 
     async def overcautious_analyze(self, subject, body, attachments):
@@ -245,6 +264,7 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
     )
     source.add_alternative(
         "<p>PRODUCT WIDGET-100 Please quote 100 kg. CURRENT REQUEST TOKEN</p>"
+        '<img src="cid:buyer-signature@example.com" alt="Buyer signature">'
         "<div>On Thu, 16 Jul 2026, sales-agent@example.com wrote:"
         "<blockquote><p>PREVIOUS QUOTE TOKEN</p>"
         "<div>On Wed, 15 Jul 2026, internal@example.com wrote:"
@@ -252,10 +272,19 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
         "</blockquote></div>",
         subtype="html",
     )
+    source.get_payload()[-1].add_related(
+        b"\x89PNG\r\n\x1a\ncomplete-reference-chain-logo",
+        maintype="application",
+        subtype="octet-stream",
+        cid="<buyer-signature@example.com>",
+        filename="buyer-signature.png",
+        disposition="inline",
+    )
     source_raw = source.as_bytes()
     source_parsed = parse_mime(source_raw)
     email_row.body_text = source_parsed.body_text
     email_row.body_html = source_parsed.body_html
+    email_row.attachment_metadata = source_parsed.attachments
     email_row.raw_sha256 = source_parsed.raw_sha256
     email_row.references_json = ["<thread-root@example.com>"]
     email_row.in_reply_to = "<parent-only@example.com>"
@@ -297,6 +326,14 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
     assert html_body.count("CURRENT REQUEST TOKEN") == 1
     assert html_body.count("PREVIOUS QUOTE TOKEN") == 1
     assert html_body.count("ROOT INQUIRY TOKEN") == 1
+    quoted_image = next(
+        part
+        for part in mime.walk()
+        if str(part.get("Content-ID") or "").startswith("<quoted-")
+    )
+    assert quoted_image.get_payload(decode=True) == (
+        b"\x89PNG\r\n\x1a\ncomplete-reference-chain-logo"
+    )
     full_text, full_html = extract_full_message_bodies(outbox.raw_message.encode("utf-8"))
     assert "CURRENT REQUEST TOKEN" in full_text
     assert full_html is not None
@@ -429,8 +466,37 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
     )
     source_email = await db_session.get(EmailMessage, handoff.source_email_id)
     assert source_email is not None
+    source = MIMEMessage()
+    source["From"] = source_email.from_address
+    source["To"] = "sales-agent@example.com"
+    source["Subject"] = source_email.subject
+    source["Message-ID"] = source_email.message_id
+    source.set_content(source_email.body_text)
+    source.add_alternative(
+        '<p>Please review this inquiry.</p><img src="cid:review-signature@example.com">',
+        subtype="html",
+    )
+    source.get_payload()[-1].add_related(
+        b"\x89PNG\r\n\x1a\nhuman-review-signature",
+        maintype="image",
+        subtype="png",
+        cid="<review-signature@example.com>",
+        filename="review-signature.png",
+        disposition="inline",
+    )
+    source_raw = source.as_bytes()
+    source_parsed = parse_mime(source_raw)
+    source_email.body_html = source_parsed.body_html
+    source_email.attachment_metadata = source_parsed.attachments
+    source_email.raw_sha256 = source_parsed.raw_sha256
     source_email.references_json = ["<thread-root@example.com>"]
     source_email.in_reply_to = "<parent-only@example.com>"
+    archive = (
+        get_settings().runtime_dir
+        / "inbound_archive"
+        / f"{source_parsed.raw_sha256}.eml"
+    )
+    archive.write_bytes(source_raw)
     await db_session.commit()
 
     outbox = await queue_human_reply(
@@ -465,6 +531,14 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
     assert '<div class="aiemail-quoted-reply gmail_quote"' in mime.get_body(
         preferencelist=("html",)
     ).get_content()
+    historical_image = next(
+        part
+        for part in mime.walk()
+        if str(part.get("Content-ID") or "").startswith("<quoted-")
+    )
+    assert historical_image.get_payload(decode=True) == (
+        b"\x89PNG\r\n\x1a\nhuman-review-signature"
+    )
     assert case.status == CaseStatus.HUMAN_TAKEOVER
     assert handoff.status == "RESOLVED"
     approval = await db_session.scalar(
