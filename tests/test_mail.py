@@ -9,6 +9,7 @@ from pathlib import Path
 from app.mail import (
     GmailIMAPClient,
     _imap_mailbox_arg,
+    append_quoted_reply,
     attachments_require_review,
     build_message,
     has_thread_subject_prefix,
@@ -216,6 +217,23 @@ def test_mime_prefers_plain_and_records_attachment() -> None:
     assert parsed.attachments[0]["disposition"] == "attachment"
     assert parsed.attachments[0]["content_id"] is None
     assert attachments_require_review(parsed.attachments) is True
+
+
+def test_append_quoted_reply_uses_sanitized_single_previous_message() -> None:
+    text, html_body = append_quoted_reply(
+        "Reply body\n\nSignature",
+        "<p>Reply body</p><p>Signature</p>",
+        from_address="buyer@example.com",
+        source_body="Please quote <script>alert(1)</script>.\nThank you.",
+        occurred_at=datetime(2026, 7, 17, 2, 0, tzinfo=UTC),
+    )
+
+    assert "On Fri, 17 Jul 2026 02:00 +0000, buyer@example.com wrote:" in text
+    assert "> Please quote <script>alert(1)</script>." in text
+    assert text.index("Signature") < text.index("buyer@example.com wrote:")
+    assert '<div class="aiemail-quoted-reply"' in html_body
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_body
+    assert "<script>" not in html_body
 
 
 def test_small_cid_image_without_attachment_disposition_does_not_require_review() -> None:

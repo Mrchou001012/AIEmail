@@ -2,7 +2,9 @@ import hashlib
 import smtplib
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from email import policy
 from email.message import EmailMessage as MIMEMessage
+from email.parser import BytesParser
 from email.utils import format_datetime
 
 import pytest
@@ -239,6 +241,15 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
         "<parent-only@example.com>",
         email_row.message_id,
     ]
+    mime = BytesParser(policy=policy.default).parsebytes(
+        outbox.raw_message.encode("utf-8")
+    )
+    assert "> PRODUCT WIDGET-100 Please quote 100 kg." in mime.get_body(
+        preferencelist=("plain",)
+    ).get_content()
+    assert '<div class="aiemail-quoted-reply"' in mime.get_body(
+        preferencelist=("html",)
+    ).get_content()
 
 
 async def test_recovered_processing_does_not_duplicate_handoff(db_session: AsyncSession) -> None:
@@ -393,6 +404,15 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         "<parent-only@example.com>",
         source_email.message_id,
     ]
+    mime = BytesParser(policy=policy.default).parsebytes(
+        outbox.raw_message.encode("utf-8")
+    )
+    assert "> Please review this inquiry." in mime.get_body(
+        preferencelist=("plain",)
+    ).get_content()
+    assert '<div class="aiemail-quoted-reply"' in mime.get_body(
+        preferencelist=("html",)
+    ).get_content()
     assert case.status == CaseStatus.HUMAN_TAKEOVER
     assert handoff.status == "RESOLVED"
     approval = await db_session.scalar(

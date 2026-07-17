@@ -57,6 +57,7 @@ from app.integrations import DingTalkNotifier
 from app.mail import (
     GmailIMAPClient,
     ParsedEmail,
+    append_quoted_reply,
     attachments_require_review,
     build_message,
     has_thread_subject_prefix,
@@ -524,6 +525,13 @@ async def queue_human_reply(
         for line in clean_body.splitlines()
     ]
     signed_html = "".join(html_lines) + bundle.signature_html
+    signed_text, signed_html = append_quoted_reply(
+        signed_text,
+        signed_html,
+        from_address=source_email.from_address,
+        source_body=source_email.body_text,
+        occurred_at=source_email.received_at,
+    )
     references = _reply_references(source_email)
     business_key = f"handoff-reply:{handoff.id}"
     message_id, raw = build_message(
@@ -1945,6 +1953,13 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             valid_until=valid_until,
             taxes_included=policy_row.taxes_included,
             freight_included=policy_row.freight_included,
+        )
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=email_row.from_address,
+            source_body=email_row.body_text,
+            occurred_at=email_row.received_at,
         )
     except Exception as exc:
         await create_handoff(

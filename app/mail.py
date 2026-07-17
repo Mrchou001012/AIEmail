@@ -1,6 +1,7 @@
 import base64
 import email
 import hashlib
+import html
 import imaplib
 import logging
 import re
@@ -77,6 +78,7 @@ class ParsedEmail:
 SAFE_INLINE_IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 SAFE_INLINE_IMAGE_CONTENT_TYPES = frozenset({"application/octet-stream"})
 MAX_SAFE_INLINE_IMAGE_BYTES = 256 * 1024
+MAX_QUOTED_REPLY_CHARS = 20_000
 
 
 def is_safe_inline_image_attachment(item: dict[str, Any]) -> bool:
@@ -101,6 +103,43 @@ def is_safe_inline_image_attachment(item: dict[str, Any]) -> bool:
 def attachments_require_review(attachments: list[dict[str, Any]]) -> bool:
     """Require review for every attachment except a tightly bounded inline image."""
     return any(not is_safe_inline_image_attachment(item) for item in attachments)
+
+
+def append_quoted_reply(
+    text_body: str,
+    html_body: str,
+    *,
+    from_address: str,
+    source_body: str,
+    occurred_at: datetime | None,
+) -> tuple[str, str]:
+    """Append one sanitized previous-message block without nesting older quotes."""
+    clean_source = source_body.strip()
+    if not clean_source:
+        return text_body, html_body
+    if len(clean_source) > MAX_QUOTED_REPLY_CHARS:
+        clean_source = (
+            clean_source[:MAX_QUOTED_REPLY_CHARS].rstrip()
+            + "\n[Previous message truncated]"
+        )
+    timestamp = occurred_at or datetime.now(UTC)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    intro = f"On {timestamp.strftime('%a, %d %b %Y %H:%M %z')}, {from_address} wrote:"
+    quoted_plain = "\n".join(f"> {line}" if line else ">" for line in clean_source.splitlines())
+    quoted_html = "<br>".join(
+        html.escape(line) if line else "&nbsp;" for line in clean_source.splitlines()
+    )
+    return (
+        f"{text_body.rstrip()}\n\n{intro}\n{quoted_plain}",
+        (
+            f"{html_body.rstrip()}"
+            '<div class="aiemail-quoted-reply" style="margin-top:1em">'
+            f"<div>{html.escape(intro)}</div>"
+            '<blockquote style="margin:0.5em 0 0 0.8ex;border-left:1px solid #ccc;'
+            f'padding-left:1ex">{quoted_html}</blockquote></div>'
+        ),
+    )
 
 
 def _decode_part(part: email.message.Message) -> str:
