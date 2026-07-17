@@ -57,6 +57,7 @@ from app.integrations import DingTalkNotifier
 from app.mail import (
     GmailIMAPClient,
     ParsedEmail,
+    attachments_require_review,
     build_message,
     has_thread_subject_prefix,
     match_case,
@@ -1726,6 +1727,9 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
+    analysis = analysis.model_copy(
+        update={"risky_attachment": attachments_require_review(email_row.attachment_metadata)}
+    )
     analysis_facts = analysis.model_dump(mode="json")
     session.add(
         AIInvocation(

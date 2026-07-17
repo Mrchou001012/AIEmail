@@ -9,6 +9,7 @@ from pathlib import Path
 from app.mail import (
     GmailIMAPClient,
     _imap_mailbox_arg,
+    attachments_require_review,
     build_message,
     has_thread_subject_prefix,
     normalized_subject,
@@ -212,6 +213,60 @@ def test_mime_prefers_plain_and_records_attachment() -> None:
     assert parsed.in_reply_to == "<original@example.com>"
     assert parsed.references == ["<older@example.com>", "<original@example.com>"]
     assert parsed.attachments[0]["filename"] == "po.pdf"
+    assert parsed.attachments[0]["disposition"] == "attachment"
+    assert parsed.attachments[0]["content_id"] is None
+    assert attachments_require_review(parsed.attachments) is True
+
+
+def test_small_cid_image_without_attachment_disposition_does_not_require_review() -> None:
+    message = EmailMessage()
+    message["From"] = "Buyer <buyer@example.com>"
+    message["To"] = "sales@example.com"
+    message["Subject"] = "Re: Quote"
+    message.set_content("Please quote 600 kg.")
+    message.add_alternative(
+        '<p>Please quote 600 kg.</p><img src="cid:client-logo.png">',
+        subtype="html",
+    )
+    html_part = message.get_payload()[-1]
+    html_part.add_related(
+        b"small-inline-logo",
+        maintype="application",
+        subtype="octet-stream",
+        cid="<client-logo.png>",
+        filename="client-logo.png",
+    )
+    image_part = next(part for part in message.walk() if part.get("Content-ID") == "<client-logo.png>")
+    image_part.set_param("name", "client-logo.png", header="Content-Type")
+    del image_part["Content-Disposition"]
+
+    parsed = parse_mime(message.as_bytes())
+
+    assert parsed.attachments == [
+        {
+            "filename": "client-logo.png",
+            "content_type": "application/octet-stream",
+            "disposition": None,
+            "content_id": "<client-logo.png>",
+            "size": 17,
+            "sha256": "ade8c678ed8abd428eac9e3965f528c3afcb8cc114922f78ef21900c2258eb9b",
+        }
+    ]
+    assert attachments_require_review(parsed.attachments) is False
+
+
+def test_cid_image_marked_as_attachment_still_requires_review() -> None:
+    assert attachments_require_review(
+        [
+            {
+                "filename": "customer-image.png",
+                "content_type": "image/png",
+                "disposition": "attachment",
+                "content_id": "<customer-image.png>",
+                "size": 20_135,
+            }
+        ]
+    ) is True
 
 
 def test_stable_message_id_and_thread_headers() -> None:

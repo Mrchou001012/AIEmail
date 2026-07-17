@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai import stub_analyze
 from app.api import dashboard_data
 from app.auto_replies import AutomatedReplyType
 from app.db import (
@@ -163,6 +164,52 @@ async def test_risky_intents_create_specific_handoffs(
     assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
     await db_session.refresh(case)
     assert case.status == CaseStatus.WAITING_HUMAN
+
+
+async def test_safe_inline_image_does_not_force_attachment_handoff(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        suffix="safe-inline-image",
+    )
+    email_row.attachment_metadata = [
+        {
+            "filename": "client-logo.png",
+            "content_type": "application/octet-stream",
+            "disposition": None,
+            "content_id": "<client-logo.png>",
+            "size": 20_135,
+            "sha256": hashlib.sha256(b"client-logo").hexdigest(),
+        }
+    ]
+    await db_session.commit()
+
+    async def overcautious_analyze(self, subject, body, attachments):
+        analysis = stub_analyze(subject, body, attachments).model_copy(
+            update={"risky_attachment": True}
+        )
+        return analysis, {
+            "provider": "stub",
+            "model": "stub-overcautious-attachment",
+            "request_hash": hashlib.sha256(f"{subject}\n{body}".encode()).hexdigest(),
+        }
+
+    monkeypatch.setattr("app.services.AIClient.analyze", overcautious_analyze)
+
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
+    )
+    assert handoff is None
+    assert outbox is not None
+    assert outbox.status == DeliveryStatus.PENDING
 
 
 async def test_recovered_processing_does_not_duplicate_handoff(db_session: AsyncSession) -> None:

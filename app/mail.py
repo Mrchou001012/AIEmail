@@ -74,6 +74,35 @@ class ParsedEmail:
     occurred_at: datetime | None
 
 
+SAFE_INLINE_IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+SAFE_INLINE_IMAGE_CONTENT_TYPES = frozenset({"application/octet-stream"})
+MAX_SAFE_INLINE_IMAGE_BYTES = 256 * 1024
+
+
+def is_safe_inline_image_attachment(item: dict[str, Any]) -> bool:
+    """Recognize small CID images embedded by mail clients and signatures."""
+    filename = str(item.get("filename") or "").strip()
+    content_id = str(item.get("content_id") or "").strip()
+    disposition = str(item.get("disposition") or "").strip().casefold()
+    content_type = str(item.get("content_type") or "").strip().casefold()
+    try:
+        size = int(item.get("size") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        content_id
+        and disposition != "attachment"
+        and Path(filename).suffix.casefold() in SAFE_INLINE_IMAGE_SUFFIXES
+        and (content_type.startswith("image/") or content_type in SAFE_INLINE_IMAGE_CONTENT_TYPES)
+        and 0 < size <= MAX_SAFE_INLINE_IMAGE_BYTES
+    )
+
+
+def attachments_require_review(attachments: list[dict[str, Any]]) -> bool:
+    """Require review for every attachment except a tightly bounded inline image."""
+    return any(not is_safe_inline_image_attachment(item) for item in attachments)
+
+
 def _decode_part(part: email.message.Message) -> str:
     payload = part.get_payload(decode=True) or b""
     charset = part.get_content_charset() or "utf-8"
@@ -117,6 +146,8 @@ def parse_mime(raw: bytes) -> ParsedEmail:
                 {
                     "filename": filename or "unnamed",
                     "content_type": content_type,
+                    "disposition": disposition,
+                    "content_id": str(part.get("Content-ID") or "").strip() or None,
                     "size": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 }
