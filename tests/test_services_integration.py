@@ -26,6 +26,7 @@ from app.db import (
     EmailMessage,
     Handoff,
     Job,
+    JobStatus,
     MailboxCursor,
     MailboxDailyUsage,
     MailboxThrottle,
@@ -43,6 +44,10 @@ from app.history import (
 )
 from app.imap_poller import poll_folder_once
 from app.mail import parse_mime
+from app.recovery import (
+    FalseCounterofferRecoveryRequest,
+    recover_false_counteroffer,
+)
 from app.services import (
     active_policy,
     assign_handoff_case,
@@ -689,6 +694,162 @@ async def test_counteroffer_hands_off_without_changing_quote(
     handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.PRICE_NEGOTIATION.value
+
+
+async def test_false_counteroffer_recovery_reparses_and_reprocesses(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=True)
+    case.status = CaseStatus.WAITING_HUMAN
+
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Industrial Widget 100 quotation"
+    message["Message-ID"] = "<false-counteroffer-recovery@example.com>"
+    message.set_content(
+        "Please quote 200 kg PRODUCT WIDGET-100 instead.\n\n"
+        "Seller <sales-agent@example.com&gt;&nbsp;"
+        "在 2026年7月17日 周五 10:02 写道：\n"
+        "Quantity: 100 kg\n"
+        "Unit price: USD 100.0000 per kg"
+    )
+    raw = message.as_bytes()
+    parsed = parse_mime(raw)
+    email_row = EmailMessage(
+        case_id=case.id,
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="INBOUND",
+        mailbox="integration-test",
+        message_id=parsed.message_id,
+        from_address=parsed.from_address,
+        to_addresses=parsed.to_addresses,
+        subject=parsed.subject,
+        body_text=(
+            "Please quote 200 kg PRODUCT WIDGET-100 instead.\n\n"
+            "Seller wrote:\nQuantity: 100 kg\nUnit price: USD 100.0000 per kg"
+        ),
+        body_html=parsed.body_html,
+        attachment_metadata=parsed.attachments,
+        raw_sha256=parsed.raw_sha256,
+    )
+    db_session.add(email_row)
+    await db_session.flush()
+
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.PRICE_NEGOTIATION.value,
+        summary="Inbound counteroffer requires human review",
+        extracted_facts={"intent": "counteroffer", "quantity": 200},
+        status="OPEN",
+        dingtalk_status="SENT",
+    )
+    db_session.add(handoff)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Job(
+                kind="process_inbound",
+                payload={"email_id": email_row.id},
+                status=JobStatus.DONE,
+                idempotency_key=f"process-inbound:{email_row.id}",
+            ),
+            Job(
+                kind="notify_handoff",
+                payload={"handoff_id": handoff.id},
+                status=JobStatus.DONE,
+                idempotency_key=f"handoff-notify:{handoff.id}",
+            ),
+        ]
+    )
+    await db_session.commit()
+    email_id = email_row.id
+    case_id = case.id
+    handoff_id = handoff.id
+
+    archive = get_settings().runtime_dir / "inbound_archive" / f"{parsed.raw_sha256}.eml"
+    archive.write_bytes(raw)
+
+    with pytest.raises(RuntimeError, match="expected second-round quantity quote"):
+        await recover_false_counteroffer(
+            FalseCounterofferRecoveryRequest(
+                email_id=email_id,
+                case_id=case_id,
+                handoff_id=handoff_id,
+                expected_body="Please quote 200 kg PRODUCT WIDGET-100 instead.",
+                expected_existing_quantity=100,
+                expected_new_quantity=201,
+                expected_recipient="internal@example.com",
+                recovery_commit="test-rollback-commit",
+            )
+        )
+
+    db_session.expire_all()
+    rolled_back_email = await db_session.get(EmailMessage, email_id)
+    rolled_back_case = await db_session.get(SalesCase, case_id)
+    rolled_back_handoff = await db_session.get(Handoff, handoff_id)
+    assert rolled_back_email is not None
+    assert rolled_back_case is not None
+    assert rolled_back_handoff is not None
+    assert "Seller wrote:" in rolled_back_email.body_text
+    assert rolled_back_case.status == CaseStatus.WAITING_HUMAN
+    assert rolled_back_case.negotiation_round == 0
+    assert rolled_back_handoff.status == "OPEN"
+    assert rolled_back_handoff.source_email_id == email_id
+    assert await db_session.scalar(select(func.count()).select_from(Quote)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.event_type.in_(
+                ["email.reparsed_for_recovery", "handoff.false_positive_resolved"]
+            )
+        )
+    ) == 0
+
+    result = await recover_false_counteroffer(
+        FalseCounterofferRecoveryRequest(
+            email_id=email_id,
+            case_id=case_id,
+            handoff_id=handoff_id,
+            expected_body="Please quote 200 kg PRODUCT WIDGET-100 instead.",
+            expected_existing_quantity=100,
+            expected_new_quantity=200,
+            expected_recipient="internal@example.com",
+            recovery_commit="test-recovery-commit",
+        ),
+    )
+
+    db_session.expire_all()
+    recovered_email = await db_session.get(EmailMessage, email_id)
+    recovered_case = await db_session.get(SalesCase, case_id)
+    recovered_handoff = await db_session.get(Handoff, handoff_id)
+    assert recovered_email is not None
+    assert recovered_case is not None
+    assert recovered_handoff is not None
+    assert recovered_email.body_text == "Please quote 200 kg PRODUCT WIDGET-100 instead."
+    assert recovered_case.status == CaseStatus.ACTIVE
+    assert recovered_case.negotiation_round == 1
+    assert recovered_handoff.status == "RESOLVED"
+    assert recovered_handoff.source_email_id is None
+    assert recovered_handoff.dingtalk_status == "SENT"
+    assert recovered_handoff.extracted_facts["recovery_source_email_id"] == email_id
+    assert result.quote_quantity == 200
+    assert result.outbox_status == DeliveryStatus.PENDING.value
+    assert result.recipient == "internal@example.com"
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(
+            AuditEvent.case_id == case_id,
+            AuditEvent.event_type.in_(
+                ["email.reparsed_for_recovery", "handoff.false_positive_resolved"]
+            ),
+        )
+    ) == 2
 
 
 async def test_ready_stock_lead_time_gets_bounded_reply(db_session: AsyncSession) -> None:
