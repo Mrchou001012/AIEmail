@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from app.ai import AIClient, InboundAnalysis, _anthropic_inference_options, stub_analyze, validate_rendered_email
+from app.ai import (
+    AIClient,
+    InboundAnalysis,
+    _anthropic_inference_options,
+    _normalize_quantity_revision,
+    stub_analyze,
+    validate_rendered_email,
+)
 from app.domain import Intent, PricingPolicy, counteroffer
 from app.imports import load_content
 from app.mail import build_message, parse_mime
@@ -56,6 +63,33 @@ def test_stub_treats_ready_stock_lead_time_as_quote_request() -> None:
     )
     assert result.intent == Intent.QUOTE_REQUEST
     assert result.shipping_requested
+
+
+def test_quantity_only_revision_is_not_a_counteroffer() -> None:
+    misclassified = InboundAnalysis(
+        intent=Intent.COUNTEROFFER,
+        intent_confidence=0.95,
+        product_code="YAC-TEOS40",
+        product_confidence=1.0,
+        quantity=800,
+        requested_unit_price=None,
+        currency=None,
+        incoterm=None,
+        payment_term=None,
+        numeric_confidence=1.0,
+    )
+
+    normalized = _normalize_quantity_revision(
+        misclassified,
+        "Please quote 800 kg YAC-TEOS40 instead.",
+    )
+    genuine_counteroffer = _normalize_quantity_revision(
+        misclassified,
+        "Your price is too high. Please quote 800 kg at a better price.",
+    )
+
+    assert normalized.intent == Intent.QUOTE_REQUEST
+    assert genuine_counteroffer.intent == Intent.COUNTEROFFER
 
 
 def test_demo_end_to_end_flow() -> None:

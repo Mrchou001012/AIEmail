@@ -151,11 +151,24 @@ def _decode_part(part: email.message.Message) -> str:
 def _clean_plain(text: str) -> str:
     lines: list[str] = []
     for line in text.replace("\r\n", "\n").split("\n"):
+        normalized_line = html.unescape(line).replace("\xa0", " ").strip()
         if line.lstrip().startswith(">"):
             continue
-        if re.match(r"^On .+ wrote:$", line.strip(), re.I):
+        if re.match(r"^On .+ wrote:$", normalized_line, re.I):
             break
-        if line.strip() in {"--", "-- "}:
+        if re.search(
+            r"在\s*\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日.*?写道\s*[:：]",
+            normalized_line,
+            re.I,
+        ):
+            break
+        if re.match(
+            r"^-+\s*(?:Original Message|原始邮件|原始郵件)\s*-+$",
+            normalized_line,
+            re.I,
+        ):
+            break
+        if normalized_line in {"--", "-- "}:
             break
         lines.append(line)
     return "\n".join(lines).strip()[:100_000]

@@ -66,6 +66,10 @@ order, pre-book, packaging, shipping, delivery-time, technical, quality, complai
 attachment-dependent cases clearly. Treat a lead-time or ready-stock question as a quote request;
 treat a request for a specific dispatch, shipping, or arrival date as shipping. Normalize quantities
 to whole kilograms; 1 metric ton or MT is 1000 kg. If the quantity cannot be safely converted to whole kilograms, mark it as missing.
+Treat a request to quote a different quantity as quote_request when the customer does not challenge
+the price or request a discount, concession, better price, or target price. Classify counteroffer only
+when the customer's new text actually challenges the price or asks for a price concession. Ignore
+quoted prior-message history when deciding intent.
 Normalize currency mentions to three-letter ISO codes; use INR for INR, ₹, Rs, or Rs.
 Return every schema field explicitly: use null for unavailable nullable values, false for absent
 flags, and an empty list when there is no evidence or missing field.
@@ -123,6 +127,43 @@ def _intent_from_text(text: str) -> Intent:
 def _normalized_currency(value: str) -> str:
     normalized = value.strip().upper().replace(".", "")
     return "INR" if normalized in {"₹", "RS"} else normalized
+
+
+PRICE_NEGOTIATION_MARKERS = (
+    "counteroffer",
+    "counter offer",
+    "can you do",
+    "target price",
+    "too high",
+    "too expensive",
+    "discount",
+    "better price",
+    "best price",
+    "lower price",
+    "reduce the price",
+    "reduce your price",
+    "price reduction",
+    "price concession",
+)
+
+
+def _normalize_quantity_revision(
+    result: InboundAnalysis,
+    body: str,
+) -> InboundAnalysis:
+    """Do not treat a quantity-only re-quote request as a price counteroffer."""
+    lowered = body.casefold()
+    asks_for_quote = any(term in lowered for term in ("quote", "quotation", "price"))
+    has_negotiation_language = any(term in lowered for term in PRICE_NEGOTIATION_MARKERS)
+    if (
+        result.intent == Intent.COUNTEROFFER
+        and result.requested_unit_price is None
+        and result.quantity is not None
+        and asks_for_quote
+        and not has_negotiation_language
+    ):
+        return result.model_copy(update={"intent": Intent.QUOTE_REQUEST})
+    return result
 
 
 def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> InboundAnalysis:
@@ -226,7 +267,10 @@ class AIClient:
         )
         request_hash = hashlib.sha256(request_text.encode()).hexdigest()
         if self._client is None:
-            result = stub_analyze(subject, body, attachments)
+            result = _normalize_quantity_revision(
+                stub_analyze(subject, body, attachments),
+                body,
+            )
             return result, {"provider": "stub", "model": "stub-v1", "request_hash": request_hash}
         response = await self._client.messages.parse(
             model=self.settings.anthropic_model,
@@ -243,6 +287,7 @@ class AIClient:
             parsed_output = parsed_output.model_copy(
                 update={"product_code": canonical_product_code(parsed_output.product_code)}
             )
+        parsed_output = _normalize_quantity_revision(parsed_output, body)
         return parsed_output, {
             "provider": "anthropic",
             "model": response.model,

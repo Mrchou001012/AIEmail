@@ -219,6 +219,24 @@ def test_mime_prefers_plain_and_records_attachment() -> None:
     assert attachments_require_review(parsed.attachments) is True
 
 
+def test_mime_strips_wecom_localized_quoted_history() -> None:
+    message = EmailMessage()
+    message["From"] = "Buyer <buyer@example.com>"
+    message["To"] = "sales@example.com"
+    message["Subject"] = "回复：Re: Quote"
+    message.set_content(
+        "Please quote 800 kg YAC-TEOS40 instead.\n\n"
+        "shreyasaxena<shreyasaxena@lanyachemindia.com&gt;&nbsp;"
+        "在 2026年7月17日 周五 10:02 写道：\n"
+        "Product: YAC-TEOS40\n"
+        "Unit price: INR 293.7500 per kg"
+    )
+
+    parsed = parse_mime(message.as_bytes())
+
+    assert parsed.body_text == "Please quote 800 kg YAC-TEOS40 instead."
+
+
 def test_append_quoted_reply_uses_sanitized_single_previous_message() -> None:
     text, html_body = append_quoted_reply(
         "Reply body\n\nSignature",
