@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -37,6 +38,16 @@ class Settings(BaseSettings):
     dingtalk_transport: Literal["log", "webhook"] = "log"
     dingtalk_webhook_url: str | None = None
 
+    commercial_gate_enabled: bool = True
+    commercial_data_provider: Literal["database"] = "database"
+    commercial_scope: str = "default"
+    business_timezone: str = "Asia/Kolkata"
+    business_open_hour: int = 9
+    commercial_refresh_check_seconds: int = 60
+    commercial_retry_minutes: int = 15
+    commercial_update_url: str | None = None
+    crm_review_url_template: str | None = None
+
     safe_mode: bool = True
     auto_send_enabled: bool = False
     recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
@@ -62,7 +73,13 @@ class Settings(BaseSettings):
     product_confidence_threshold: float = 0.85
     numeric_confidence_threshold: float = 0.90
 
-    @field_validator("ai_provider", "mail_transport", "dingtalk_transport", mode="before")
+    @field_validator(
+        "ai_provider",
+        "mail_transport",
+        "dingtalk_transport",
+        "commercial_data_provider",
+        mode="before",
+    )
     @classmethod
     def normalize_mode(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
@@ -88,6 +105,22 @@ class Settings(BaseSettings):
             raise ValueError("ANTHROPIC_MODEL must be an exact Claude model identifier")
         return value
 
+    @field_validator("business_timezone")
+    @classmethod
+    def valid_business_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("BUSINESS_TIMEZONE must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("business_open_hour")
+    @classmethod
+    def valid_business_open_hour(cls, value: int) -> int:
+        if not 0 <= value <= 23:
+            raise ValueError("BUSINESS_OPEN_HOUR must be between 0 and 23")
+        return value
+
     @field_validator("imap_batch_size")
     @classmethod
     def valid_imap_batch_size(cls, value: int) -> int:
@@ -106,6 +139,8 @@ class Settings(BaseSettings):
         "mx_cache_ttl_hours",
         "mx_lookup_timeout_seconds",
         "mx_temporary_retry_minutes",
+        "commercial_refresh_check_seconds",
+        "commercial_retry_minutes",
     )
     @classmethod
     def positive_limit(cls, value: int) -> int:

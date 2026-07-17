@@ -174,6 +174,36 @@ async def test_risky_intents_create_specific_handoffs(
     assert case.status == CaseStatus.WAITING_HUMAN
 
 
+async def test_pending_weekly_prices_do_not_hide_non_quote_handoffs(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please send a sample.",
+        suffix="pending-weekly-price-sample",
+    )
+    settings = Settings(
+        _env_file=None,
+        demo_mode=False,
+        commercial_gate_enabled=True,
+        commercial_scope="pending-non-quote-test",
+        business_timezone="Asia/Kolkata",
+        business_open_hour=0,
+    )
+    monkeypatch.setattr("app.services.get_settings", lambda: settings)
+
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.SAMPLE_REQUEST.value
+
+
 async def test_safe_inline_image_does_not_force_attachment_handoff(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,

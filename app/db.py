@@ -115,10 +115,57 @@ class Product(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class CommercialDataCycle(Base, TimestampMixin):
+    """A durable price-and-inventory confirmation window for one business week."""
+
+    __tablename__ = "commercial_data_cycles"
+    __table_args__ = (
+        UniqueConstraint("scope", "week_start", name="uq_commercial_cycle_scope_week"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    week_start: Mapped[date] = mapped_column(Date, index=True)
+    week_end: Mapped[date] = mapped_column(Date)
+    price_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    inventory_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    price_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    inventory_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    price_source_system: Mapped[str | None] = mapped_column(String(64))
+    inventory_source_system: Mapped[str | None] = mapped_column(String(64))
+    price_source_ref: Mapped[str | None] = mapped_column(String(255))
+    inventory_source_ref: Mapped[str | None] = mapped_column(String(255))
+    reminder_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class InventorySnapshot(Base, TimestampMixin):
+    """Per-product stock fact supplied for a commercial data cycle."""
+
+    __tablename__ = "inventory_snapshots"
+    __table_args__ = (
+        UniqueConstraint("cycle_id", "product_id", name="uq_inventory_cycle_product"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(
+        ForeignKey("commercial_data_cycles.id", ondelete="CASCADE"), index=True
+    )
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    availability: Mapped[str] = mapped_column(String(32), default="UNKNOWN", index=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    warehouse: Mapped[str | None] = mapped_column(String(128))
+    source_system: Mapped[str] = mapped_column(String(64), default="manual")
+    external_id: Mapped[str | None] = mapped_column(String(255))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class PricePolicy(Base, TimestampMixin):
     __tablename__ = "price_policies"
     __table_args__ = (Index("ix_price_policy_lookup", "product_id", "currency", "valid_from", "valid_to"),)
     id: Mapped[int] = mapped_column(primary_key=True)
+    commercial_cycle_id: Mapped[int | None] = mapped_column(
+        ForeignKey("commercial_data_cycles.id", ondelete="SET NULL"), index=True
+    )
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
     currency: Mapped[str] = mapped_column(String(3))
     standard_price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
@@ -271,6 +318,9 @@ class Quote(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True)
     price_policy_id: Mapped[int] = mapped_column(ForeignKey("price_policies.id"))
+    commercial_cycle_id: Mapped[int | None] = mapped_column(
+        ForeignKey("commercial_data_cycles.id", ondelete="SET NULL"), index=True
+    )
     round_number: Mapped[int] = mapped_column(Integer)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
     currency: Mapped[str] = mapped_column(String(3))
@@ -324,6 +374,10 @@ class Outbox(Base):
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)
+    quote_id: Mapped[int | None] = mapped_column(
+        ForeignKey("quotes.id", ondelete="SET NULL"), index=True
+    )
+    message_kind: Mapped[str] = mapped_column(String(32), default="GENERAL", index=True)
     business_key: Mapped[str] = mapped_column(String(255))
     message_id: Mapped[str] = mapped_column(String(998))
     recipient: Mapped[str] = mapped_column(String(320))

@@ -9,8 +9,9 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email.utils import parseaddr
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,11 +19,22 @@ from sqlalchemy.orm import selectinload
 from app.ai import AIClient, validate_rendered_email
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.bounces import BounceType, classify_bounce, classify_smtp_failure
+from app.commercial import (
+    QuoteContext,
+    QuoteContextStatus,
+    get_commercial_data_provider,
+    get_or_create_current_cycle,
+    is_business_day,
+    is_business_open,
+    lock_commercial_scope,
+    next_business_open,
+)
 from app.db import (
     AIInvocation,
     AuditEvent,
     CaseStage,
     CaseStatus,
+    CommercialDataCycle,
     Contact,
     Customer,
     DeliveryStatus,
@@ -45,7 +57,6 @@ from app.domain import (
     Intent,
     PricingPolicy,
     SendContext,
-    counteroffer,
     evaluate_send_policy,
     initial_quote,
     quote_valid_until,
@@ -100,6 +111,15 @@ class NewInquiryResolution:
     reason: HandoffReason | None = None
     summary: str | None = None
     facts: dict[str, Any] | None = None
+
+
+class JobDeferred(RuntimeError):
+    """A durable business wait that must not consume the job retry budget."""
+
+    def __init__(self, reason: str, available_at: datetime):
+        super().__init__(reason)
+        self.reason = reason
+        self.available_at = available_at
 
 
 def _pricing_policy(row: PricePolicy) -> PricingPolicy:
@@ -298,6 +318,64 @@ async def enqueue_job(
         # ORM instances that callers may continue to use.
         await session.commit()
         return None
+
+
+async def ensure_weekly_commercial_refresh(
+    session: AsyncSession,
+    settings: Settings | None = None,
+    *,
+    at: datetime | None = None,
+) -> bool:
+    """Durably request one DingTalk price/inventory reminder per business week."""
+
+    settings = settings or get_settings()
+    observed_at = at or datetime.now(UTC)
+    if (
+        settings.demo_mode
+        or not settings.commercial_gate_enabled
+        or not is_business_day(settings, observed_at)
+        or not is_business_open(settings, observed_at)
+    ):
+        return False
+    cycle = await get_or_create_current_cycle(session, settings, at=observed_at)
+    if cycle.price_status == "CONFIRMED" and cycle.inventory_status == "CONFIRMED":
+        await session.commit()
+        return False
+    job = await enqueue_job(
+        session,
+        "notify_commercial_refresh",
+        {"cycle_id": cycle.id},
+        f"weekly-commercial-refresh:{cycle.scope}:{cycle.week_start.isoformat()}",
+    )
+    return job is not None
+
+
+async def _commercial_quote_context(
+    session: AsyncSession,
+    *,
+    product_id: int,
+    currency: str,
+    settings: Settings,
+    requested_quantity: Decimal | int | None = None,
+    at: datetime | None = None,
+) -> QuoteContext | None:
+    if settings.demo_mode or not settings.commercial_gate_enabled:
+        return None
+    context = await get_commercial_data_provider(settings).get_quote_context(
+        session,
+        product_id=product_id,
+        currency=currency,
+        requested_quantity=requested_quantity,
+        at=at,
+    )
+    if context.status is QuoteContextStatus.WAITING:
+        await ensure_weekly_commercial_refresh(session, settings, at=at)
+        raise JobDeferred(
+            f"commercial data waiting: {context.reason}",
+            context.next_check_at
+            or (datetime.now(UTC) + timedelta(minutes=settings.commercial_retry_minutes)),
+        )
+    return context
 
 
 async def create_handoff(
@@ -555,6 +633,7 @@ async def queue_human_reply(
     now = datetime.now(UTC)
     outbox = Outbox(
         case_id=case.id,
+        message_kind="HUMAN_REPLY",
         business_key=business_key,
         message_id=message_id,
         recipient=case.contact.email,
@@ -657,7 +736,8 @@ def _reply_source(source_email: EmailMessage) -> FullReplySource:
 
 
 async def active_policy(session: AsyncSession, product_id: int, currency: str) -> PricePolicy | None:
-    today = date.today()
+    settings = get_settings()
+    today = datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date()
     return await session.scalar(
         select(PricePolicy)
         .where(
@@ -817,6 +897,8 @@ async def freeze_outbox(
         async with session.begin_nested():
             row = Outbox(
                 case_id=case.id,
+                quote_id=quote.id,
+                message_kind="AUTO_QUOTE",
                 business_key=business_key,
                 message_id=message_id,
                 recipient=case.contact.email,
@@ -956,6 +1038,8 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
 async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -> None:
     case_id = int(payload["case_id"])
     quantity = int(payload.get("quantity") or 1)
+    reprice = bool(payload.get("reprice"))
+    settings = get_settings()
     case = await session.scalar(
         select(SalesCase)
         .options(
@@ -1013,11 +1097,39 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             summary="Initial outreach blocked by customer/contact send eligibility",
         )
         return
-    business_key = f"initial-quote:case:{case.id}"
+    commercial_context = await _commercial_quote_context(
+        session,
+        product_id=case.product_id,
+        currency=case.currency,
+        settings=settings,
+        requested_quantity=quantity,
+    )
+    if commercial_context is not None and commercial_context.status is QuoteContextStatus.UNAVAILABLE:
+        unavailable_reason = (
+            HandoffReason.INVENTORY_UNAVAILABLE
+            if commercial_context.reason.startswith("INVENTORY")
+            else HandoffReason.NONSTANDARD
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=unavailable_reason,
+            summary=f"Current commercial data cannot quote {case.product.code}: {commercial_context.reason}",
+            facts={"commercial_cycle_id": commercial_context.cycle.id},
+        )
+        return
+    cycle_id = commercial_context.cycle.id if commercial_context is not None else None
+    business_key = (
+        f"initial-quote:case:{case.id}:cycle:{cycle_id}"
+        if cycle_id is not None
+        else f"initial-quote:case:{case.id}"
+    )
     if await session.scalar(select(Outbox.id).where(Outbox.business_key == business_key)) is not None:
         return
-    existing_quote = await session.scalar(select(Quote.id).where(Quote.case_id == case.id).limit(1))
-    if existing_quote is not None:
+    existing_quote = await session.scalar(
+        select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc()).limit(1)
+    )
+    if existing_quote is not None and not reprice:
         await create_handoff(
             session,
             case=case,
@@ -1025,7 +1137,11 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             summary="Case already has a quotation but no matching initial-outreach outbox record",
         )
         return
-    policy_row = await active_policy(session, case.product_id, case.currency)
+    policy_row = (
+        commercial_context.policy
+        if commercial_context is not None
+        else await active_policy(session, case.product_id, case.currency)
+    )
     if policy_row is None:
         await create_handoff(
             session,
@@ -1047,6 +1163,7 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
     valid_until = quote_valid_until(
         quote_valid_days=policy_row.quote_valid_days,
         quote_valid_weekday=policy_row.quote_valid_weekday,
+        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
     )
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
@@ -1088,10 +1205,12 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             summary=f"Initial outreach drafting failed: {type(exc).__name__}",
         )
         return
+    round_number = existing_quote.round_number + 1 if existing_quote is not None else 0
     quote = Quote(
         case_id=case.id,
         price_policy_id=policy_row.id,
-        round_number=0,
+        commercial_cycle_id=cycle_id,
+        round_number=round_number,
         unit_price=decision.unit_price,
         currency=policy_row.currency,
         quantity=quantity,
@@ -1108,6 +1227,7 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
         },
     )
     session.add(quote)
+    case.negotiation_round = round_number
     await session.flush()
     subject = f"{case.product.name} quotation"
     case.subject_key = subject.lower()
@@ -1768,7 +1888,8 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             or_(
                 Outbox.business_key == reply_key,
                 Outbox.business_key.like(f"{reply_key}:quote:%"),
-            )
+            ),
+            Outbox.status != DeliveryStatus.CANCELLED,
         )
     )
     if existing_reply is not None:
@@ -1785,6 +1906,8 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     await session.refresh(case, ["customer", "contact", "product"])
     if await _handle_automated_reply(session, case=case, email_row=email_row):
         return
+    settings = get_settings()
+    commercial_context: QuoteContext | None = None
     ai = AIClient()
     try:
         analysis, metadata = await ai.analyze(email_row.subject, email_row.body_text, email_row.attachment_metadata)
@@ -1826,7 +1949,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
-    if analysis.intent not in {Intent.QUOTE_REQUEST, Intent.COUNTEROFFER}:
+    # Weekly commercial-data readiness blocks only an autonomous quotation.
+    # Unsubscribe, counteroffers, samples, orders, complaints, and all other
+    # human-review paths must still be classified and surfaced immediately.
+    if analysis.intent != Intent.QUOTE_REQUEST:
         send_decision = evaluate_send_policy(
             SendContext(
                 intent=analysis.intent,
@@ -1857,26 +1983,15 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    policy_row = await active_policy(session, case.product_id, case.currency)
     latest_quote = await session.scalar(
         select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc())
     )
-    if policy_row is None or (latest_quote is not None and latest_quote.currency != case.currency):
+    if latest_quote is not None and latest_quote.currency != case.currency:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.NONSTANDARD,
-            summary="No standard policy or compatible case currency matched the inbound request",
-            facts=analysis_facts,
-            source_email_id=email_row.id,
-        )
-        return
-    if latest_quote is None and analysis.intent == Intent.COUNTEROFFER:
-        await create_handoff(
-            session,
-            case=case,
-            reason=HandoffReason.PRICE_NEGOTIATION,
-            summary="A new email thread contains a counteroffer without reliable quotation history",
+            summary="The current case currency does not match its latest quotation",
             facts=analysis_facts,
             source_email_id=email_row.id,
         )
@@ -1888,6 +2003,56 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             case=case,
             reason=HandoffReason.LOW_CONFIDENCE,
             summary="Initial inquiry does not contain a reliable quotation quantity",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return
+    commercial_context = await _commercial_quote_context(
+        session,
+        product_id=case.product_id,
+        currency=case.currency,
+        settings=settings,
+        requested_quantity=quantity,
+    )
+    if commercial_context is not None and commercial_context.status is QuoteContextStatus.UNAVAILABLE:
+        unavailable_reason = (
+            HandoffReason.INVENTORY_UNAVAILABLE
+            if commercial_context.reason.startswith("INVENTORY")
+            else HandoffReason.NONSTANDARD
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=unavailable_reason,
+            summary=(
+                f"Current commercial data cannot quote {case.product.code}: "
+                f"{commercial_context.reason}"
+            ),
+            facts={
+                **analysis_facts,
+                "commercial_cycle_id": commercial_context.cycle.id,
+                "requested_quantity": quantity,
+                "available_quantity": (
+                    str(commercial_context.inventory.quantity)
+                    if commercial_context.inventory is not None
+                    and commercial_context.inventory.quantity is not None
+                    else None
+                ),
+            },
+            source_email_id=email_row.id,
+        )
+        return
+    policy_row = (
+        commercial_context.policy
+        if commercial_context is not None
+        else await active_policy(session, case.product_id, case.currency)
+    )
+    if policy_row is None:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.NONSTANDARD,
+            summary="No standard price policy matched the inbound request",
             facts=analysis_facts,
             source_email_id=email_row.id,
         )
@@ -1918,7 +2083,11 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             prebook_requested=analysis.prebook_requested,
             packaging_requested=analysis.packaging_requested,
             delivery_requested=analysis.shipping_requested,
-            ready_stock_available=True,
+            ready_stock_available=(
+                commercial_context.ready_stock_available
+                if commercial_context is not None
+                else True
+            ),
         ),
         intent_threshold=get_settings().intent_confidence_threshold,
         product_threshold=get_settings().product_confidence_threshold,
@@ -1934,26 +2103,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    if analysis.intent == Intent.COUNTEROFFER:
-        if analysis.requested_unit_price is None:
-            await create_handoff(
-                session,
-                case=case,
-                reason=HandoffReason.LOW_CONFIDENCE,
-                summary="Counteroffer did not contain a reliable requested unit price",
-                facts=analysis_facts,
-                source_email_id=email_row.id,
-            )
-            return
-        price_decision = counteroffer(
-            _pricing_policy(policy_row),
-            Decimal(latest_quote.unit_price),
-            analysis.requested_unit_price,
-            case.negotiation_round,
-            quantity,
-        )
-    else:
-        price_decision = initial_quote(_pricing_policy(policy_row), quantity)
+    price_decision = initial_quote(_pricing_policy(policy_row), quantity)
     if not price_decision.approved or price_decision.unit_price is None:
         reason = HandoffReason.BELOW_FLOOR if price_decision.reason and "floor" in price_decision.reason else HandoffReason.NONSTANDARD
         await create_handoff(
@@ -1972,6 +2122,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     valid_until = quote_valid_until(
         quote_valid_days=policy_row.quote_valid_days,
         quote_valid_weekday=policy_row.quote_valid_weekday,
+        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
     )
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
@@ -2033,6 +2184,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     quote = Quote(
         case_id=case.id,
         price_policy_id=policy_row.id,
+        commercial_cycle_id=(commercial_context.cycle.id if commercial_context is not None else None),
         round_number=round_number,
         unit_price=price_decision.unit_price,
         currency=policy_row.currency,
@@ -2056,7 +2208,11 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         subject=f"Re: {email_row.subject}",
         text_body=text,
         html_body=html_body,
-        business_key=f"inbound-reply:{email_row.id}",
+        business_key=(
+            f"inbound-reply:{email_row.id}:quote:{commercial_context.cycle.id}"
+            if commercial_context is not None
+            else f"inbound-reply:{email_row.id}"
+        ),
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
         inline_images=source.inline_images,
@@ -2072,6 +2228,24 @@ async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
         handoff.dingtalk_status = await DingTalkNotifier().notify(handoff, case)
     except Exception as exc:
         handoff.dingtalk_status = "FAILED"
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        await session.commit()
+
+
+async def notify_commercial_refresh(session: AsyncSession, cycle_id: int) -> None:
+    cycle = await session.get(CommercialDataCycle, cycle_id)
+    if cycle is None or cycle.reminder_status in {"SENT", "LOGGED", "NOT_REQUIRED"}:
+        return
+    if cycle.price_status == "CONFIRMED" and cycle.inventory_status == "CONFIRMED":
+        cycle.reminder_status = "NOT_REQUIRED"
+        await session.commit()
+        return
+    try:
+        cycle.reminder_status = await DingTalkNotifier().notify_commercial_refresh(cycle)
+        cycle.reminder_sent_at = datetime.now(UTC)
+    except Exception as exc:
+        cycle.reminder_status = "FAILED"
         raise RuntimeError(str(exc)) from exc
     finally:
         await session.commit()
@@ -2160,9 +2334,72 @@ async def _set_mailbox_cooldown(
     throttle.updated_at = datetime.now(UTC)
 
 
-async def send_one_outbox(session: AsyncSession, settings: Settings | None = None) -> bool:
+async def _cancel_and_requeue_stale_quote(
+    session: AsyncSession,
+    *,
+    row: Outbox,
+    quote: Quote | None,
+    cycle: CommercialDataCycle,
+    reason: str,
+) -> None:
+    """Cancel immutable old quote mail and create one cycle-scoped reprice job."""
+
+    row.status = DeliveryStatus.CANCELLED
+    row.last_error = f"commercial data gate cancelled frozen quote: {reason}"[:2000]
+    await session.execute(
+        delete(EmailMessage).where(
+            EmailMessage.direction == "OUTBOUND",
+            EmailMessage.message_id == row.message_id,
+            EmailMessage.is_history.is_(False),
+        )
+    )
+    await audit(
+        session,
+        "outbox.cancelled_stale_commercial_data",
+        case_id=row.case_id,
+        actor="commercial_gate",
+        data={
+            "outbox_id": row.id,
+            "quote_id": quote.id if quote else None,
+            "old_cycle_id": quote.commercial_cycle_id if quote else None,
+            "new_cycle_id": cycle.id,
+            "reason": reason,
+        },
+    )
+    inbound_match = re.fullmatch(r"inbound-reply:(\d+)(?::quote:\d+)?", row.business_key)
+    initial_match = re.fullmatch(r"initial-quote:case:(\d+)(?::cycle:\d+)?", row.business_key)
+    if inbound_match:
+        email_id = int(inbound_match.group(1))
+        await enqueue_job(
+            session,
+            "process_inbound",
+            {"email_id": email_id, "reprice": True},
+            f"commercial-reprice:inbound:{email_id}:cycle:{cycle.id}",
+        )
+        return
+    if initial_match and row.case_id is not None:
+        await enqueue_job(
+            session,
+            "case_outreach",
+            {
+                "case_id": row.case_id,
+                "quantity": quote.quantity if quote is not None else 1,
+                "reprice": True,
+            },
+            f"commercial-reprice:case:{row.case_id}:cycle:{cycle.id}",
+        )
+        return
+    await session.commit()
+
+
+async def send_one_outbox(
+    session: AsyncSession,
+    settings: Settings | None = None,
+    *,
+    at: datetime | None = None,
+) -> bool:
     settings = settings or get_settings()
-    now = datetime.now(UTC)
+    now = at or datetime.now(UTC)
     stale_before = now - timedelta(seconds=settings.outbox_lease_seconds)
     row = await session.scalar(
         select(Outbox)
@@ -2212,6 +2449,17 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
         and row.human_approved_by
         and row.human_approved_at is not None
     )
+    if (
+        settings.commercial_gate_enabled
+        and not settings.demo_mode
+        and not human_approved
+        and not is_business_day(settings, now)
+    ):
+        row.status = DeliveryStatus.PENDING
+        row.available_at = next_business_open(settings, now)
+        row.last_error = "commercial gate deferred automated mail until Monday"
+        await session.commit()
+        return True
     if row.case_id:
         case = await session.scalar(
             select(SalesCase)
@@ -2241,6 +2489,52 @@ async def send_one_outbox(session: AsyncSession, settings: Settings | None = Non
             row.status = DeliveryStatus.CANCELLED
             row.last_error = "case/contact eligibility changed after message was queued"
             await session.commit()
+            return True
+    is_auto_quote = not human_approved and (
+        row.message_kind == "AUTO_QUOTE" or row.quote_id is not None
+    )
+    if settings.commercial_gate_enabled and not settings.demo_mode and is_auto_quote:
+        quote = await session.get(Quote, row.quote_id) if row.quote_id is not None else None
+        if case is None:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = "commercial gate could not resolve the quote case"
+            await session.commit()
+            return True
+        await lock_commercial_scope(session, settings.commercial_scope)
+        context = await get_commercial_data_provider(settings).get_quote_context(
+            session,
+            product_id=case.product_id,
+            currency=case.currency,
+            requested_quantity=quote.quantity if quote is not None else None,
+            at=now,
+        )
+        same_frozen_version = bool(
+            quote is not None
+            and quote.commercial_cycle_id == context.cycle.id
+            and context.policy is not None
+            and quote.price_policy_id == context.policy.id
+        )
+        if context.status is QuoteContextStatus.WAITING and same_frozen_version:
+            await ensure_weekly_commercial_refresh(session, settings, at=now)
+            row.status = DeliveryStatus.PENDING
+            row.available_at = context.next_check_at or (
+                now + timedelta(minutes=settings.commercial_retry_minutes)
+            )
+            row.last_error = f"commercial data gate waiting: {context.reason}"[:2000]
+            await session.commit()
+            return True
+        if context.status is not QuoteContextStatus.AVAILABLE or not same_frozen_version:
+            await _cancel_and_requeue_stale_quote(
+                session,
+                row=row,
+                quote=quote,
+                cycle=context.cycle,
+                reason=(
+                    context.reason
+                    if context.status is not QuoteContextStatus.AVAILABLE
+                    else "frozen quote belongs to an older commercial data version"
+                ),
+            )
             return True
     if settings.mail_transport == "smtp":
         recipient = row.recipient.lower()
@@ -2457,6 +2751,9 @@ JOB_HANDLERS = {
     "case_outreach": lambda session, payload: create_case_outreach(session, payload),
     "process_inbound": lambda session, payload: process_inbound(session, int(payload["email_id"])),
     "notify_handoff": lambda session, payload: notify_handoff(session, int(payload["handoff_id"])),
+    "notify_commercial_refresh": lambda session, payload: notify_commercial_refresh(
+        session, int(payload["cycle_id"])
+    ),
 }
 
 
@@ -2492,6 +2789,21 @@ async def claim_and_run_job(
         await handler(session, job.payload)
         job.status = JobStatus.DONE
         job.last_error = None
+        job.locked_at = None
+        job.locked_by = None
+        job.updated_at = datetime.now(UTC)
+        await session.commit()
+    except JobDeferred as exc:
+        await session.rollback()
+        job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+        if job is None:
+            raise RuntimeError(f"claimed job {job_id} disappeared") from exc
+        job.status = JobStatus.PENDING
+        job.attempts = max(0, job.attempts - 1)
+        job.available_at = exc.available_at
+        job.locked_at = None
+        job.locked_by = None
+        job.last_error = f"DEFERRED: {exc.reason}"[:2000]
         job.updated_at = datetime.now(UTC)
         await session.commit()
     except Exception as exc:
@@ -2510,6 +2822,8 @@ async def claim_and_run_job(
         else:
             job.status = JobStatus.PENDING
             job.available_at = datetime.now(UTC) + timedelta(seconds=min(300, 2**job.attempts))
+        job.locked_at = None
+        job.locked_by = None
         job.updated_at = datetime.now(UTC)
         await session.commit()
     return True

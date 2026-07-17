@@ -111,6 +111,63 @@ Invalid email, missing product, overlapping active price policy, invalid currenc
 
 The generated import-ready workbook is `outputs/inr_price_policy_20260715/AIEmail_印度现货价格导入_20260715.xlsx`. Its `calculation_check` sheet exposes every quantity boundary and calculated unit price for review.
 
+### Weekly price and inventory gate
+
+Production automation treats each India business week (Monday through Friday,
+`Asia/Kolkata`) as a separate commercial-data version. Price and inventory are
+confirmed independently. An active price row is not considered proof of stock.
+
+- Saturday and Sunday automated mail is held until Monday. Explicitly approved
+  human replies may still be sent.
+- On Monday after `BUSINESS_OPEN_HOUR`, the worker creates one idempotent DingTalk
+  reminder for the week when either price or inventory is still pending.
+- Automatic quotation generation waits without consuming the normal job retry
+  budget until both confirmations are complete.
+- A frozen quotation from a previous week is cancelled before SMTP delivery and
+  re-created from the current week's data. The old amount is never sent merely
+  because it was already in the outbox.
+- An explicitly unavailable product is routed to human review instead of being
+  described as ready stock.
+
+Apply a reviewed weekly price workbook atomically with
+`POST /admin/imports/prices?apply=true&replace_active=true`. This deactivates the
+previous active batch only after the complete replacement validates, records the
+new weekly source hash, and resets inventory to pending. Then confirm every
+priced product through `POST /admin/commercial/current/inventory`, for example:
+
+```json
+{
+  "price_source_ref": "copy the current price_source_ref from GET /admin/commercial/current",
+  "source_system": "manual",
+  "source_ref": "2026-W30 stock check",
+  "items": [
+    {
+      "product_code": "YAC-TEOS40",
+      "availability": "AVAILABLE",
+      "quantity": 1200,
+      "warehouse": "India warehouse"
+    }
+  ]
+}
+```
+
+`GET /admin/commercial/current` reports the current cycle, missing product stock
+confirmations, and whether autonomous quotation is ready. These routes use the
+same administrator authentication as the other protected operations endpoints.
+Waiting inbound jobs are made runnable immediately after the last inventory item
+is confirmed. The built-in URL is a status/API endpoint rather than an editing
+form; until a CRM/WMS page is configured, operators upload the workbook and
+submit inventory through these protected endpoints.
+
+The default `COMMERCIAL_DATA_PROVIDER=database` uses the local weekly snapshot.
+The quotation workflow depends on a `CommercialDataProvider` boundary rather
+than spreadsheet-specific logic, so a later CRM/WMS adapter can supply the same
+versioned price and stock facts without changing mail policy. Set
+`COMMERCIAL_UPDATE_URL` to a CRM/WMS commercial-data page and
+`CRM_REVIEW_URL_TEMPLATE` to a CRM mailbox/review route (supporting
+`{handoff_id}` and `{case_id}`) when those interfaces exist. DingTalk links then
+open the CRM UI directly; leaving them blank keeps links in this application.
+
 ## Local approved content
 
 Review and replace these before production use:
@@ -197,7 +254,7 @@ An inbound message without thread headers that does not satisfy the narrow reply
 
 The message is handed to a human without sending when it refers to prior commercial context (for example, a previous quotation or an earlier discussion), contains unmatched thread headers, maps the sender to multiple customer records, names zero or multiple products, or has ambiguous currency/catalog data. Standard policy checks still route counteroffers, samples, orders, packaging, shipping commitments, risky attachments, and low-confidence extraction to the existing handoff and DingTalk workflow.
 
-Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC threading. Their visible quoted section is built from the complete direct-parent MIME body in the immutable mail archive, so any conversation already quoted by the sender remains visible. AI analysis continues to use only the cleaned new-message text. Quoted HTML is allowlist-sanitized, tracking/inline images and active content are removed, and original attachments are never reattached.
+Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC threading. Their visible quoted section is built from the complete direct-parent MIME body in the immutable mail archive, so any conversation already quoted by the sender remains visible. AI analysis continues to use only the cleaned new-message text. Quoted HTML is allowlist-sanitized and active content or remote tracking is not fetched; safe `cid:` inline images from the quoted message are copied into the reply MIME so signatures and inline mail content remain intact. Ordinary file attachments are not reattached.
 
 ### Human review workflow
 

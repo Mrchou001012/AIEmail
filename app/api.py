@@ -1,28 +1,37 @@
 import secrets
 import tempfile
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.commercial import (
+    commercial_update_link,
+    get_or_create_current_cycle,
+    lock_commercial_scope,
+)
 from app.db import (
     AIInvocation,
     AuditEvent,
     CaseStatus,
+    CommercialDataCycle,
     Contact,
     Customer,
     DeliveryStatus,
     EmailAddressStatus,
     EmailMessage,
     Handoff,
+    InventorySnapshot,
     Job,
+    JobStatus,
     MailboxCursor,
     MailboxDailyUsage,
     MailboxThrottle,
@@ -36,6 +45,7 @@ from app.db import (
 )
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
+from app.products import canonical_product_code
 from app.services import (
     active_policy,
     assign_handoff_case,
@@ -109,6 +119,21 @@ class HandoffReplyRequest(BaseModel):
     body_text: str = Field(min_length=1, max_length=50_000)
     note: str = Field(default="", max_length=2_000)
     resume_automation: bool = False
+
+
+class InventoryItemRequest(BaseModel):
+    product_code: str = Field(min_length=1, max_length=64)
+    availability: Literal["AVAILABLE", "OUT_OF_STOCK"]
+    quantity: Decimal | None = Field(default=None, ge=0)
+    warehouse: str | None = Field(default=None, max_length=128)
+    external_id: str | None = Field(default=None, max_length=255)
+
+
+class InventoryConfirmationRequest(BaseModel):
+    price_source_ref: str = Field(min_length=1, max_length=255)
+    items: list[InventoryItemRequest] = Field(min_length=1, max_length=10_000)
+    source_system: str = Field(default="manual", min_length=1, max_length=64)
+    source_ref: str | None = Field(default=None, max_length=255)
 
 
 def _dashboard_headers() -> dict[str, str]:
@@ -665,17 +690,268 @@ async def customers_import(
 
 @router.post("/admin/imports/prices")
 async def prices_import(
-    _: Admin,
+    actor: Admin,
     session: Session,
     file: UploadFile = File(...),
     apply: bool = Query(False),
+    replace_active: bool = Query(False),
 ) -> dict[str, Any]:
     path = await _save_upload(file)
     try:
-        result = await import_prices(path, session, apply=apply)
+        result = await import_prices(
+            path,
+            session,
+            apply=apply,
+            replace_active=replace_active,
+            actor=actor,
+        )
         return result.__dict__ | {"ok": result.ok}
     finally:
         path.unlink(missing_ok=True)
+
+
+async def _commercial_cycle_payload(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[str, Any]:
+    priced_rows = (
+        await session.execute(
+            select(Product, PricePolicy)
+            .join(PricePolicy, PricePolicy.product_id == Product.id)
+            .where(
+                PricePolicy.commercial_cycle_id == cycle.id,
+                PricePolicy.active.is_(True),
+            )
+            .order_by(Product.code, PricePolicy.currency)
+        )
+    ).all()
+    snapshots = {
+        row.product_id: row
+        for row in (
+            (
+                await session.execute(
+                    select(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    products: dict[int, dict[str, Any]] = {}
+    for product, policy in priced_rows:
+        item = products.setdefault(
+            product.id,
+            {
+                "product_id": product.id,
+                "product_code": product.code,
+                "currencies": [],
+            },
+        )
+        item["currencies"].append(policy.currency)
+    missing_inventory: list[str] = []
+    product_payload: list[dict[str, Any]] = []
+    for product_id, item in products.items():
+        snapshot = snapshots.get(product_id)
+        if snapshot is None or snapshot.availability == "UNKNOWN":
+            missing_inventory.append(item["product_code"])
+        product_payload.append(
+            {
+                **item,
+                "inventory": (
+                    {
+                        "availability": snapshot.availability,
+                        "quantity": str(snapshot.quantity) if snapshot.quantity is not None else None,
+                        "warehouse": snapshot.warehouse,
+                        "source_system": snapshot.source_system,
+                        "external_id": snapshot.external_id,
+                        "updated_at": snapshot.updated_at.isoformat(),
+                    }
+                    if snapshot
+                    else None
+                ),
+            }
+        )
+    return {
+        "cycle_id": cycle.id,
+        "scope": cycle.scope,
+        "week_start": cycle.week_start.isoformat(),
+        "week_end": cycle.week_end.isoformat(),
+        "price_status": cycle.price_status,
+        "inventory_status": cycle.inventory_status,
+        "automation_ready": (
+            cycle.price_status == "CONFIRMED" and cycle.inventory_status == "CONFIRMED"
+        ),
+        "price_confirmed_at": (
+            cycle.price_confirmed_at.isoformat() if cycle.price_confirmed_at else None
+        ),
+        "inventory_confirmed_at": (
+            cycle.inventory_confirmed_at.isoformat() if cycle.inventory_confirmed_at else None
+        ),
+        "price_source_system": cycle.price_source_system,
+        "price_source_ref": cycle.price_source_ref,
+        "inventory_source_system": cycle.inventory_source_system,
+        "inventory_source_ref": cycle.inventory_source_ref,
+        "reminder_status": cycle.reminder_status,
+        "reminder_sent_at": cycle.reminder_sent_at.isoformat() if cycle.reminder_sent_at else None,
+        "missing_inventory_products": missing_inventory,
+        "products": product_payload,
+        "update_url": commercial_update_link(settings, cycle),
+    }
+
+
+@router.get("/admin/commercial/current")
+async def current_commercial_cycle(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    cycle = await get_or_create_current_cycle(session, settings)
+    await session.commit()
+    return await _commercial_cycle_payload(session, settings, cycle)
+
+
+@router.post("/admin/commercial/current/inventory")
+async def confirm_current_inventory(
+    request: InventoryConfirmationRequest,
+    actor: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    await lock_commercial_scope(session, settings.commercial_scope)
+    cycle = await get_or_create_current_cycle(session, settings)
+    cycle = await session.scalar(
+        select(CommercialDataCycle)
+        .where(CommercialDataCycle.id == cycle.id)
+        .with_for_update()
+    )
+    if cycle is None:
+        raise HTTPException(409, "The current commercial-data cycle no longer exists")
+    if cycle.price_status != "CONFIRMED":
+        raise HTTPException(409, "Apply the current week's price list before confirming inventory")
+    if not cycle.price_source_ref or request.price_source_ref != cycle.price_source_ref:
+        raise HTTPException(
+            409,
+            "The price batch changed; reload current commercial status and confirm inventory again",
+        )
+    in_flight_quote_id = await session.scalar(
+        select(Outbox.id)
+        .join(Quote, Quote.id == Outbox.quote_id)
+        .join(
+            CommercialDataCycle,
+            CommercialDataCycle.id == Quote.commercial_cycle_id,
+        )
+        .where(
+            CommercialDataCycle.scope == cycle.scope,
+            Outbox.message_kind == "AUTO_QUOTE",
+            Outbox.status.in_([DeliveryStatus.CLAIMED, DeliveryStatus.UNKNOWN]),
+        )
+        .limit(1)
+    )
+    if in_flight_quote_id is not None:
+        raise HTTPException(
+            409,
+            "Inventory update is temporarily blocked while an automatic quote "
+            f"is in flight (outbox {in_flight_quote_id})",
+        )
+
+    priced_products = (
+        (
+            await session.execute(
+                select(Product)
+                .join(PricePolicy, PricePolicy.product_id == Product.id)
+                .where(
+                    PricePolicy.commercial_cycle_id == cycle.id,
+                    PricePolicy.active.is_(True),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not priced_products:
+        raise HTTPException(409, "The current price confirmation contains no active products")
+    products_by_code = {product.code: product for product in priced_products}
+    normalized_codes = [canonical_product_code(item.product_code) for item in request.items]
+    if len(set(normalized_codes)) != len(normalized_codes):
+        raise HTTPException(422, "Each product may appear only once in an inventory confirmation")
+    unknown = sorted(set(normalized_codes) - set(products_by_code))
+    if unknown:
+        raise HTTPException(
+            422,
+            f"Inventory contains products outside the current price batch: {', '.join(unknown)}",
+        )
+
+    for item, code in zip(request.items, normalized_codes, strict=True):
+        product = products_by_code[code]
+        snapshot = await session.scalar(
+            select(InventorySnapshot).where(
+                InventorySnapshot.cycle_id == cycle.id,
+                InventorySnapshot.product_id == product.id,
+            )
+        )
+        if snapshot is None:
+            snapshot = InventorySnapshot(cycle_id=cycle.id, product_id=product.id)
+            session.add(snapshot)
+        snapshot.availability = item.availability
+        snapshot.quantity = item.quantity
+        snapshot.warehouse = item.warehouse.strip() if item.warehouse else None
+        snapshot.source_system = request.source_system.strip()
+        snapshot.external_id = item.external_id.strip() if item.external_id else None
+        snapshot.metadata_json = {"confirmed_by": actor}
+    await session.flush()
+
+    confirmed_product_ids = set(
+        (
+            await session.execute(
+                select(InventorySnapshot.product_id).where(
+                    InventorySnapshot.cycle_id == cycle.id,
+                    InventorySnapshot.availability.in_(["AVAILABLE", "OUT_OF_STOCK"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    expected_product_ids = {product.id for product in priced_products}
+    complete = expected_product_ids == confirmed_product_ids
+    now = datetime.now(UTC)
+    cycle.inventory_status = "CONFIRMED" if complete else "PENDING"
+    cycle.inventory_confirmed_at = now if complete else None
+    cycle.inventory_source_system = request.source_system.strip()
+    cycle.inventory_source_ref = request.source_ref or now.isoformat()
+    cycle.metadata_json = {
+        **(cycle.metadata_json or {}),
+        "inventory_confirmed_products": len(confirmed_product_ids),
+        "inventory_expected_products": len(expected_product_ids),
+        "inventory_confirmed_by": actor,
+    }
+    session.add(
+        AuditEvent(
+            actor=actor,
+            event_type="commercial.inventory_updated",
+            data={
+                "cycle_id": cycle.id,
+                "complete": complete,
+                "confirmed_products": len(confirmed_product_ids),
+                "expected_products": len(expected_product_ids),
+                "source_system": request.source_system,
+                "price_source_ref": request.price_source_ref,
+            },
+        )
+    )
+    if complete:
+        await session.execute(
+            update(Job)
+            .where(
+                Job.status == JobStatus.PENDING,
+                Job.last_error.like("DEFERRED: commercial%"),
+            )
+            .values(available_at=now, updated_at=now)
+        )
+    await session.commit()
+    return await _commercial_cycle_payload(session, settings, cycle)
 
 
 @router.get("/admin/cases")

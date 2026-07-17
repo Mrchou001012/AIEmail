@@ -2,18 +2,33 @@ import csv
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 from email_validator import EmailNotValidError, validate_email
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import CaseStatus, Contact, Customer, PricePolicy, Product, SalesCase
+from app.commercial import get_or_create_current_cycle, lock_commercial_scope
+from app.db import (
+    AuditEvent,
+    CaseStatus,
+    CommercialDataCycle,
+    Contact,
+    Customer,
+    DeliveryStatus,
+    InventorySnapshot,
+    Outbox,
+    PricePolicy,
+    Product,
+    Quote,
+    SalesCase,
+)
 from app.history import reconcile_email_history
 from app.products import canonical_product_code, product_text_key
 from app.settings import get_settings
@@ -74,6 +89,9 @@ class ImportResult:
     created_cases: int = 0
     missing_product_codes: list[str] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
+    commercial_cycle_id: int | None = None
+    already_applied: bool = False
+    inventory_confirmation_required: bool = False
 
     @property
     def ok(self) -> bool:
@@ -364,10 +382,18 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
     return result
 
 
-async def import_prices(path: Path, session: AsyncSession, apply: bool = False) -> ImportResult:
+async def import_prices(
+    path: Path,
+    session: AsyncSession,
+    apply: bool = False,
+    replace_active: bool = False,
+    actor: str = "system",
+) -> ImportResult:
     rows = _rows(path)
     result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
-    content = load_content(get_settings().content_dir)
+    settings = get_settings()
+    business_today = datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date()
+    content = load_content(settings.content_dir)
     parsed: list[dict[str, Any]] = []
     for number, row in enumerate(rows, start=2):
         errors: list[str] = []
@@ -405,11 +431,11 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
             tier_1_max = tier_2_max = None
             tier_1_markup = tier_2_markup = Decimal("0")
         try:
-            valid_from = _date(row.get("valid_from")) or date.today()
+            valid_from = _date(row.get("valid_from")) or business_today
             valid_to = _date(row.get("valid_to"))
         except ValueError:
             errors.append("valid_from and valid_to must be ISO dates")
-            valid_from = date.today()
+            valid_from = business_today
             valid_to = None
         try:
             max_rounds = int(
@@ -452,7 +478,7 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
             errors.append(
                 f"approved_text_key must match existing product key: {product.approved_text_key}"
             )
-        if product is not None and not manual_only:
+        if product is not None and not manual_only and not replace_active:
             overlap = await session.scalar(
                 select(PricePolicy.id).where(
                     PricePolicy.product_id == product.id,
@@ -517,6 +543,97 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
         )
     result.valid_rows = len(parsed)
     if apply and result.ok:
+        await lock_commercial_scope(session, settings.commercial_scope)
+        cycle = await get_or_create_current_cycle(session, settings)
+        cycle = await session.scalar(
+            select(CommercialDataCycle)
+            .where(CommercialDataCycle.id == cycle.id)
+            .with_for_update()
+        )
+        if cycle is None:
+            raise RuntimeError("current commercial-data cycle disappeared")
+        result.commercial_cycle_id = cycle.id
+        active_rows = [row for row in parsed if not row["manual_only"]]
+        if not active_rows:
+            result.errors.append(
+                {"row": 0, "errors": ["at least one non-manual price row is required to confirm weekly prices"]}
+            )
+            await session.rollback()
+            return result
+        already_applied = await session.scalar(
+            select(PricePolicy.id).where(
+                PricePolicy.commercial_cycle_id == cycle.id,
+                PricePolicy.source_hash == result.source_hash,
+                PricePolicy.active.is_(True),
+            )
+        )
+        if already_applied is not None:
+            result.already_applied = True
+            result.applied_rows = len(parsed)
+            result.inventory_confirmation_required = cycle.inventory_status != "CONFIRMED"
+            await session.commit()
+            return result
+
+        in_flight_quote_id = await session.scalar(
+            select(Outbox.id)
+            .join(Quote, Quote.id == Outbox.quote_id)
+            .join(
+                CommercialDataCycle,
+                CommercialDataCycle.id == Quote.commercial_cycle_id,
+            )
+            .where(
+                CommercialDataCycle.scope == cycle.scope,
+                Outbox.message_kind == "AUTO_QUOTE",
+                Outbox.status.in_([DeliveryStatus.CLAIMED, DeliveryStatus.UNKNOWN]),
+            )
+            .limit(1)
+        )
+        if in_flight_quote_id is not None:
+            result.errors.append(
+                {
+                    "row": 0,
+                    "errors": [
+                        "price replacement is temporarily blocked while an automatic quote "
+                        f"is in flight (outbox {in_flight_quote_id})"
+                    ],
+                }
+            )
+            await session.rollback()
+            return result
+
+        deactivated_policies = 0
+        if replace_active:
+            currencies = sorted({row["currency"] for row in active_rows})
+            scoped_cycle_ids = select(CommercialDataCycle.id).where(
+                CommercialDataCycle.scope == cycle.scope
+            )
+            scope_predicate = PricePolicy.commercial_cycle_id.in_(scoped_cycle_ids)
+            if cycle.scope == "default":
+                scope_predicate = or_(
+                    scope_predicate,
+                    PricePolicy.commercial_cycle_id.is_(None),
+                )
+            update_result = await session.execute(
+                update(PricePolicy)
+                .where(
+                    PricePolicy.currency.in_(currencies),
+                    PricePolicy.active.is_(True),
+                    scope_predicate,
+                )
+                .values(active=False)
+            )
+            deactivated_policies = int(update_result.rowcount or 0)
+
+        # Any changed price batch invalidates prior stock confirmation for the
+        # same week. The operator (or future WMS adapter) must confirm stock
+        # against the new priced-product set before automated quotes resume.
+        await session.execute(delete(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id))
+        cycle.inventory_status = "PENDING"
+        cycle.inventory_confirmed_at = None
+        cycle.inventory_source_system = None
+        cycle.inventory_source_ref = None
+        cycle.price_status = "PENDING"
+        cycle.price_confirmed_at = None
         product_cache = {
             row["code"]: row["product"]
             for row in parsed
@@ -542,6 +659,7 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                 continue
             session.add(
                 PricePolicy(
+                    commercial_cycle_id=cycle.id,
                     product_id=product.id,
                     currency=row["currency"],
                     standard_price=row["standard"],
@@ -569,5 +687,29 @@ async def import_prices(path: Path, session: AsyncSession, apply: bool = False) 
                 )
             )
             result.applied_rows += 1
+        cycle.price_status = "CONFIRMED"
+        cycle.price_confirmed_at = datetime.now(UTC)
+        cycle.price_source_system = "price_import"
+        cycle.price_source_ref = result.source_hash
+        cycle.metadata_json = {
+            **(cycle.metadata_json or {}),
+            "price_rows": len(active_rows),
+            "price_replace_active": replace_active,
+        }
+        session.add(
+            AuditEvent(
+                actor=actor,
+                event_type="commercial.price_replaced",
+                data={
+                    "cycle_id": cycle.id,
+                    "scope": cycle.scope,
+                    "source_hash": result.source_hash,
+                    "replace_active": replace_active,
+                    "deactivated_policies": deactivated_policies,
+                    "new_policies": len(active_rows),
+                },
+            )
+        )
+        result.inventory_confirmation_required = True
         await session.commit()
     return result
