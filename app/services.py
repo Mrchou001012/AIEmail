@@ -524,8 +524,7 @@ async def queue_human_reply(
         for line in clean_body.splitlines()
     ]
     signed_html = "".join(html_lines) + bundle.signature_html
-    references = list(dict.fromkeys([*source_email.references_json, source_email.message_id]))
-    references = [item for item in references if item]
+    references = _reply_references(source_email)
     business_key = f"handoff-reply:{handoff.id}"
     message_id, raw = build_message(
         from_address=get_settings().mail_from,
@@ -586,6 +585,21 @@ async def queue_human_reply(
     )
     await session.commit()
     return outbox
+
+
+def _reply_references(source_email: EmailMessage) -> list[str]:
+    """Build a complete, ordered RFC reply chain for a response."""
+    return list(
+        dict.fromkeys(
+            item
+            for item in [
+                *source_email.references_json,
+                source_email.in_reply_to,
+                source_email.message_id,
+            ]
+            if item
+        )
+    )
 
 
 async def active_policy(session: AsyncSession, product_id: int, currency: str) -> PricePolicy | None:
@@ -1974,7 +1988,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         html_body=html_body,
         business_key=f"inbound-reply:{email_row.id}",
         in_reply_to=email_row.message_id,
-        references=[*email_row.references_json, email_row.message_id] if email_row.message_id else email_row.references_json,
+        references=_reply_references(email_row),
     )
 
 

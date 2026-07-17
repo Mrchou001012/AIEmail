@@ -212,6 +212,35 @@ async def test_safe_inline_image_does_not_force_attachment_handoff(
     assert outbox.status == DeliveryStatus.PENDING
 
 
+async def test_autonomous_reply_preserves_complete_reference_chain(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        suffix="complete-autonomous-references",
+    )
+    email_row.references_json = ["<thread-root@example.com>"]
+    email_row.in_reply_to = "<parent-only@example.com>"
+    await db_session.commit()
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-reply:{email_row.id}")
+    )
+    assert outbox is not None
+    parsed = parse_mime(outbox.raw_message.encode("utf-8"))
+    assert parsed.in_reply_to == email_row.message_id
+    assert parsed.references == [
+        "<thread-root@example.com>",
+        "<parent-only@example.com>",
+        email_row.message_id,
+    ]
+
+
 async def test_recovered_processing_does_not_duplicate_handoff(db_session: AsyncSession) -> None:
     case = await _seed_case(db_session, with_quote=False)
     email_row = await _add_inbound(
@@ -335,6 +364,11 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         case_id=case.id,
         actor="reviewer",
     )
+    source_email = await db_session.get(EmailMessage, handoff.source_email_id)
+    assert source_email is not None
+    source_email.references_json = ["<thread-root@example.com>"]
+    source_email.in_reply_to = "<parent-only@example.com>"
+    await db_session.commit()
 
     outbox = await queue_human_reply(
         db_session,
@@ -352,6 +386,13 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
     assert outbox.human_approved_by == "reviewer"
     assert outbox.human_approved_at is not None
     assert "Shreya Saxena" in outbox.raw_message
+    parsed = parse_mime(outbox.raw_message.encode("utf-8"))
+    assert parsed.in_reply_to == source_email.message_id
+    assert parsed.references == [
+        "<thread-root@example.com>",
+        "<parent-only@example.com>",
+        source_email.message_id,
+    ]
     assert case.status == CaseStatus.HUMAN_TAKEOVER
     assert handoff.status == "RESOLVED"
     approval = await db_session.scalar(
