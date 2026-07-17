@@ -12,6 +12,7 @@ from app.mail import (
     append_quoted_reply,
     attachments_require_review,
     build_message,
+    extract_full_message_bodies,
     has_thread_subject_prefix,
     normalized_subject,
     parse_mime,
@@ -237,21 +238,89 @@ def test_mime_strips_wecom_localized_quoted_history() -> None:
     assert parsed.body_text == "Please quote 800 kg YAC-TEOS40 instead."
 
 
-def test_append_quoted_reply_uses_sanitized_single_previous_message() -> None:
+def test_full_reply_source_is_separate_from_ai_analysis_body() -> None:
+    message = EmailMessage()
+    message["From"] = "Buyer <buyer@example.com>"
+    message["To"] = "sales@example.com"
+    message["Subject"] = "Re: Quote"
+    message.set_content(
+        "Please quote 800 kg instead.\n\n"
+        "On Thu, 16 Jul 2026, sales@example.com wrote:\n"
+        "> Quotation for 600 kg.\n"
+        ">\n"
+        "> On Wed, 15 Jul 2026, buyer@example.com wrote:\n"
+        "> > Please quote 600 kg."
+    )
+    message.add_alternative(
+        "<p>Please quote 800 kg instead.</p>"
+        "<div>On Thu, 16 Jul 2026, sales@example.com wrote:"
+        "<blockquote><p>Quotation for 600 kg.</p>"
+        "<div>On Wed, 15 Jul 2026, buyer@example.com wrote:"
+        "<blockquote><p>Please quote 600 kg.</p></blockquote></div>"
+        "</blockquote></div>",
+        subtype="html",
+    )
+    attached = EmailMessage()
+    attached["From"] = "other@example.com"
+    attached["To"] = "buyer@example.com"
+    attached["Subject"] = "Attached message must not be quoted"
+    attached.set_content("ATTACHED PRIVATE MESSAGE TOKEN")
+    message.add_attachment(attached)
+
+    raw = message.as_bytes()
+    parsed = parse_mime(raw)
+    full_text, full_html = extract_full_message_bodies(raw)
+
+    assert parsed.body_text == "Please quote 800 kg instead."
+    assert "Quotation for 600 kg." in full_text
+    assert "> > Please quote 600 kg." in full_text
+    assert full_html is not None
+    assert "Quotation for 600 kg." in full_html
+    assert "Please quote 600 kg." in full_html
+    assert "ATTACHED PRIVATE MESSAGE TOKEN" not in full_text
+    assert "ATTACHED PRIVATE MESSAGE TOKEN" not in full_html
+
+
+def test_append_quoted_reply_preserves_full_sanitized_conversation() -> None:
     text, html_body = append_quoted_reply(
         "Reply body\n\nSignature",
         "<p>Reply body</p><p>Signature</p>",
         from_address="buyer@example.com",
-        source_body="Please quote <script>alert(1)</script>.\nThank you.",
+        source_body=(
+            "Please quote 800 kg instead.\n\n"
+            "On Thu, 16 Jul 2026, sales@example.com wrote:\n"
+            "> Quotation for 600 kg.\n"
+            ">\n"
+            "> On Wed, 15 Jul 2026, buyer@example.com wrote:\n"
+            "> > Please quote 600 kg."
+        ),
+        source_html=(
+            "<html><body><p onclick=\"steal()\">Please quote 800 kg instead.</p>"
+            "<div>On Thu, 16 Jul 2026, sales@example.com wrote:"
+            "<blockquote><p>Quotation for 600 kg.</p>"
+            "<div>On Wed, 15 Jul 2026, buyer@example.com wrote:"
+            "<blockquote><p>Please quote 600 kg.</p></blockquote></div>"
+            "</blockquote></div><script>alert(1)</script>"
+            "<img src=\"https://tracker.example/pixel\" alt=\"tracker\">"
+            "<a href=\"javascript:alert(1)\">unsafe</a></body></html>"
+        ),
         occurred_at=datetime(2026, 7, 17, 2, 0, tzinfo=UTC),
     )
 
     assert "On Fri, 17 Jul 2026 02:00 +0000, buyer@example.com wrote:" in text
-    assert "> Please quote <script>alert(1)</script>." in text
+    assert "> Please quote 800 kg instead." in text
+    assert "> > Quotation for 600 kg." in text
+    assert "> > > Please quote 600 kg." in text
     assert text.index("Signature") < text.index("buyer@example.com wrote:")
-    assert '<div class="aiemail-quoted-reply"' in html_body
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_body
+    assert '<div class="aiemail-quoted-reply gmail_quote"' in html_body
+    assert 'blockquote type="cite"' in html_body
+    assert "Please quote 800 kg instead." in html_body
+    assert "Quotation for 600 kg." in html_body
+    assert "Please quote 600 kg." in html_body
     assert "<script>" not in html_body
+    assert "onclick" not in html_body
+    assert "javascript:" not in html_body
+    assert "tracker.example" not in html_body
 
 
 def test_small_cid_image_without_attachment_disposition_does_not_require_review() -> None:
@@ -329,6 +398,26 @@ def test_stable_message_id_and_thread_headers() -> None:
     assert first_id == second_id
     assert first_raw == second_raw
     assert "In-Reply-To: <incoming@example.com>" in first_raw
+
+
+def test_long_reference_chain_retains_root_and_recent_messages() -> None:
+    references = [f"<message-{index}@example.com>" for index in range(25)]
+
+    _, raw = build_message(
+        from_address="sales@example.com",
+        recipient="buyer@example.com",
+        subject="Re: Long thread",
+        text_body="Hello",
+        html_body="<p>Hello</p>",
+        stable_key="long-reference-chain",
+        in_reply_to=references[-1],
+        references=references,
+    )
+    parsed = parse_mime(raw.encode("utf-8"))
+
+    assert len(parsed.references) == 20
+    assert parsed.references[0] == references[0]
+    assert parsed.references[1:] == references[-19:]
 
 
 def test_build_message_embeds_signature_logo() -> None:

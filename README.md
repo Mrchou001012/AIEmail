@@ -197,6 +197,8 @@ An inbound message without thread headers that does not satisfy the narrow reply
 
 The message is handed to a human without sending when it refers to prior commercial context (for example, a previous quotation or an earlier discussion), contains unmatched thread headers, maps the sender to multiple customer records, names zero or multiple products, or has ambiguous currency/catalog data. Standard policy checks still route counteroffers, samples, orders, packaging, shipping commitments, risky attachments, and low-confidence extraction to the existing handoff and DingTalk workflow.
 
+Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC threading. Their visible quoted section is built from the complete direct-parent MIME body in the immutable mail archive, so any conversation already quoted by the sender remains visible. AI analysis continues to use only the cleaned new-message text. Quoted HTML is allowlist-sanitized, tracking/inline images and active content are removed, and original attachments are never reattached.
+
 ### Human review workflow
 
 A handoff is a durable database record, not merely a DingTalk message. Automatic sending stops for the affected case and the DingTalk notifier links to `/admin/handoffs/{id}/review`. The protected review page shows the source email, extracted facts, related cases, contact/product choices, latest quotation, and a conservative editable reply draft.

@@ -43,7 +43,7 @@ from app.history import (
     reconcile_email_history,
 )
 from app.imap_poller import poll_folder_once
-from app.mail import parse_mime
+from app.mail import extract_full_message_bodies, parse_mime
 from app.recovery import (
     FalseCounterofferDuplicateSource,
     FalseCounterofferRecoveryRequest,
@@ -227,11 +227,44 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
     email_row = await _add_inbound(
         db_session,
         case,
-        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        "PRODUCT WIDGET-100 Please quote 100 kg. CURRENT REQUEST TOKEN",
         suffix="complete-autonomous-references",
     )
+    source = MIMEMessage()
+    source["From"] = "internal@example.com"
+    source["To"] = "sales-agent@example.com"
+    source["Subject"] = email_row.subject
+    source["Message-ID"] = email_row.message_id
+    source.set_content(
+        "PRODUCT WIDGET-100 Please quote 100 kg. CURRENT REQUEST TOKEN\n\n"
+        "On Thu, 16 Jul 2026, sales-agent@example.com wrote:\n"
+        "> PREVIOUS QUOTE TOKEN\n"
+        ">\n"
+        "> On Wed, 15 Jul 2026, internal@example.com wrote:\n"
+        "> > ROOT INQUIRY TOKEN"
+    )
+    source.add_alternative(
+        "<p>PRODUCT WIDGET-100 Please quote 100 kg. CURRENT REQUEST TOKEN</p>"
+        "<div>On Thu, 16 Jul 2026, sales-agent@example.com wrote:"
+        "<blockquote><p>PREVIOUS QUOTE TOKEN</p>"
+        "<div>On Wed, 15 Jul 2026, internal@example.com wrote:"
+        "<blockquote><p>ROOT INQUIRY TOKEN</p></blockquote></div>"
+        "</blockquote></div>",
+        subtype="html",
+    )
+    source_raw = source.as_bytes()
+    source_parsed = parse_mime(source_raw)
+    email_row.body_text = source_parsed.body_text
+    email_row.body_html = source_parsed.body_html
+    email_row.raw_sha256 = source_parsed.raw_sha256
     email_row.references_json = ["<thread-root@example.com>"]
     email_row.in_reply_to = "<parent-only@example.com>"
+    archive = (
+        get_settings().runtime_dir
+        / "inbound_archive"
+        / f"{source_parsed.raw_sha256}.eml"
+    )
+    archive.write_bytes(source_raw)
     await db_session.commit()
 
     await process_inbound(db_session, email_row.id)
@@ -250,12 +283,25 @@ async def test_autonomous_reply_preserves_complete_reference_chain(
     mime = BytesParser(policy=policy.default).parsebytes(
         outbox.raw_message.encode("utf-8")
     )
-    assert "> PRODUCT WIDGET-100 Please quote 100 kg." in mime.get_body(
-        preferencelist=("plain",)
-    ).get_content()
-    assert '<div class="aiemail-quoted-reply"' in mime.get_body(
+    plain_body = mime.get_body(preferencelist=("plain",)).get_content()
+    html_body = mime.get_body(preferencelist=("html",)).get_content()
+    assert "> PRODUCT WIDGET-100 Please quote 100 kg. CURRENT REQUEST TOKEN" in plain_body
+    assert "> > PREVIOUS QUOTE TOKEN" in plain_body
+    assert "> > > ROOT INQUIRY TOKEN" in plain_body
+    assert plain_body.count("CURRENT REQUEST TOKEN") == 1
+    assert plain_body.count("PREVIOUS QUOTE TOKEN") == 1
+    assert plain_body.count("ROOT INQUIRY TOKEN") == 1
+    assert '<div class="aiemail-quoted-reply gmail_quote"' in mime.get_body(
         preferencelist=("html",)
     ).get_content()
+    assert html_body.count("CURRENT REQUEST TOKEN") == 1
+    assert html_body.count("PREVIOUS QUOTE TOKEN") == 1
+    assert html_body.count("ROOT INQUIRY TOKEN") == 1
+    full_text, full_html = extract_full_message_bodies(outbox.raw_message.encode("utf-8"))
+    assert "CURRENT REQUEST TOKEN" in full_text
+    assert full_html is not None
+    assert "PREVIOUS QUOTE TOKEN" in full_html
+    assert "ROOT INQUIRY TOKEN" in full_html
 
 
 async def test_recovered_processing_does_not_duplicate_handoff(db_session: AsyncSession) -> None:
@@ -416,7 +462,7 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
     assert "> Please review this inquiry." in mime.get_body(
         preferencelist=("plain",)
     ).get_content()
-    assert '<div class="aiemail-quoted-reply"' in mime.get_body(
+    assert '<div class="aiemail-quoted-reply gmail_quote"' in mime.get_body(
         preferencelist=("html",)
     ).get_content()
     assert case.status == CaseStatus.HUMAN_TAKEOVER

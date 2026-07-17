@@ -19,7 +19,7 @@ from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -78,7 +78,65 @@ class ParsedEmail:
 SAFE_INLINE_IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 SAFE_INLINE_IMAGE_CONTENT_TYPES = frozenset({"application/octet-stream"})
 MAX_SAFE_INLINE_IMAGE_BYTES = 256 * 1024
-MAX_QUOTED_REPLY_CHARS = 20_000
+MAX_QUOTED_REPLY_CHARS = 200_000
+MAX_QUOTED_HTML_CHARS = 500_000
+
+QUOTED_HTML_ALLOWED_TAGS = frozenset(
+    {
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "code",
+        "del",
+        "div",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+    }
+)
+QUOTED_HTML_DANGEROUS_TAGS = frozenset(
+    {
+        "base",
+        "button",
+        "embed",
+        "form",
+        "iframe",
+        "input",
+        "link",
+        "math",
+        "meta",
+        "object",
+        "script",
+        "select",
+        "style",
+        "svg",
+        "textarea",
+    }
+)
 
 
 def is_safe_inline_image_attachment(item: dict[str, Any]) -> bool:
@@ -111,32 +169,49 @@ def append_quoted_reply(
     *,
     from_address: str,
     source_body: str,
+    source_html: str | None = None,
     occurred_at: datetime | None,
 ) -> tuple[str, str]:
-    """Append one sanitized previous-message block without nesting older quotes."""
+    """Append the complete previous message, including its existing quote chain."""
     clean_source = source_body.strip()
+    quoted_html = _sanitize_quoted_html(source_html) if source_html else ""
+    html_source_text = _html_to_full_text(quoted_html) if quoted_html else ""
+    if html_source_text and (
+        not clean_source or len(clean_source) * 4 < len(html_source_text) * 3
+    ):
+        clean_source = html_source_text
     if not clean_source:
         return text_body, html_body
-    if len(clean_source) > MAX_QUOTED_REPLY_CHARS:
+    source_was_truncated = len(clean_source) > MAX_QUOTED_REPLY_CHARS
+    if source_was_truncated:
         clean_source = (
             clean_source[:MAX_QUOTED_REPLY_CHARS].rstrip()
-            + "\n[Previous message truncated]"
+            + "\n[Earlier quoted conversation omitted for safety]"
+        )
+    if source_was_truncated or len(quoted_html) > MAX_QUOTED_HTML_CHARS:
+        quoted_html = (
+            '<div style="white-space:pre-wrap">'
+            + html.escape(clean_source)
+            + "</div>"
         )
     timestamp = occurred_at or datetime.now(UTC)
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
     intro = f"On {timestamp.strftime('%a, %d %b %Y %H:%M %z')}, {from_address} wrote:"
     quoted_plain = "\n".join(f"> {line}" if line else ">" for line in clean_source.splitlines())
-    quoted_html = "<br>".join(
-        html.escape(line) if line else "&nbsp;" for line in clean_source.splitlines()
-    )
+    if not quoted_html:
+        quoted_html = (
+            '<div style="white-space:pre-wrap">'
+            + html.escape(clean_source)
+            + "</div>"
+        )
     return (
         f"{text_body.rstrip()}\n\n{intro}\n{quoted_plain}",
         (
             f"{html_body.rstrip()}"
-            '<div class="aiemail-quoted-reply" style="margin-top:1em">'
+            '<div class="aiemail-quoted-reply gmail_quote" style="margin-top:1em">'
             f"<div>{html.escape(intro)}</div>"
-            '<blockquote style="margin:0.5em 0 0 0.8ex;border-left:1px solid #ccc;'
+            '<blockquote type="cite" style="margin:0.5em 0 0 0.8ex;border-left:1px solid #ccc;'
             f'padding-left:1ex">{quoted_html}</blockquote></div>'
         ),
     )
@@ -146,6 +221,22 @@ def _decode_part(part: email.message.Message) -> str:
     payload = part.get_payload(decode=True) or b""
     charset = part.get_content_charset() or "utf-8"
     return payload.decode(charset, errors="replace")
+
+
+def extract_full_message_bodies(raw: bytes) -> tuple[str, str | None]:
+    """Extract the display body without removing the message's existing reply chain."""
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    plain_part = message.get_body(preferencelist=("plain",))
+    html_part = message.get_body(preferencelist=("html",))
+    body_text = (
+        _decode_part(plain_part).replace("\r\n", "\n").strip()
+        if plain_part is not None
+        else ""
+    )
+    body_html = _decode_part(html_part).strip() if html_part is not None else None
+    if not body_text and body_html:
+        body_text = _html_to_full_text(_sanitize_quoted_html(body_html))
+    return body_text, body_html
 
 
 def _clean_plain(text: str) -> str:
@@ -179,6 +270,59 @@ def _html_to_text(value: str) -> str:
     for tag in soup(["script", "style", "iframe", "object"]):
         tag.decompose()
     return _clean_plain(soup.get_text("\n"))
+
+
+def _html_to_full_text(value: str) -> str:
+    """Convert display HTML to text while retaining nested quoted history."""
+    soup = BeautifulSoup(value, "html.parser")
+    for tag in soup(QUOTED_HTML_DANGEROUS_TAGS):
+        tag.decompose()
+    text = html.unescape(soup.get_text("\n")).replace("\xa0", " ")
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
+    result: list[str] = []
+    previous_blank = False
+    for line in lines:
+        blank = not line.strip()
+        if blank and previous_blank:
+            continue
+        result.append(line)
+        previous_blank = blank
+    return "\n".join(result).strip()
+
+
+def _sanitize_quoted_html(value: str | None) -> str:
+    """Keep readable email formatting while removing active and tracking content."""
+    if not value:
+        return ""
+    bounded_value = value[:MAX_QUOTED_HTML_CHARS]
+    soup = BeautifulSoup(bounded_value, "html.parser")
+    for comment in soup.find_all(string=lambda item: isinstance(item, Comment)):
+        comment.extract()
+    for tag in soup(QUOTED_HTML_DANGEROUS_TAGS):
+        tag.decompose()
+    root = soup.body or soup
+    for tag in list(root.find_all(True)):
+        name = tag.name.casefold()
+        if name == "img":
+            alt = str(tag.get("alt") or "").strip()
+            tag.replace_with(f"[Image omitted: {alt}]" if alt else "")
+            continue
+        if name not in QUOTED_HTML_ALLOWED_TAGS:
+            tag.unwrap()
+            continue
+        safe_attributes: dict[str, str] = {}
+        if name == "a":
+            href = str(tag.get("href") or "").strip()
+            if re.match(r"^(?:https?://|mailto:)", href, flags=re.I):
+                safe_attributes["href"] = href
+                safe_attributes["rel"] = "noopener noreferrer"
+        if name in {"td", "th"}:
+            for attribute in ("colspan", "rowspan"):
+                value = str(tag.get(attribute) or "").strip()
+                if value.isdigit() and 1 <= int(value) <= 100:
+                    safe_attributes[attribute] = value
+        tag.attrs = safe_attributes
+    return "".join(str(child) for child in root.contents).strip()
 
 
 def parse_mime(raw: bytes) -> ParsedEmail:
@@ -372,7 +516,10 @@ def build_message(
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
-        msg["References"] = " ".join(references[-20:])
+        ordered_references = list(dict.fromkeys(item for item in references if item))
+        if len(ordered_references) > 20:
+            ordered_references = [ordered_references[0], *ordered_references[-19:]]
+        msg["References"] = " ".join(ordered_references)
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
     _attach_signature_logo(msg, html_body, token)

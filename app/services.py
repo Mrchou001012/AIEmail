@@ -60,6 +60,7 @@ from app.mail import (
     append_quoted_reply,
     attachments_require_review,
     build_message,
+    extract_full_message_bodies,
     has_thread_subject_prefix,
     match_case,
     normalized_subject,
@@ -525,11 +526,13 @@ async def queue_human_reply(
         for line in clean_body.splitlines()
     ]
     signed_html = "".join(html_lines) + bundle.signature_html
+    source_text, source_html = _reply_source_bodies(source_email)
     signed_text, signed_html = append_quoted_reply(
         signed_text,
         signed_html,
         from_address=source_email.from_address,
-        source_body=source_email.body_text,
+        source_body=source_text,
+        source_html=source_html,
         occurred_at=source_email.received_at,
     )
     references = _reply_references(source_email)
@@ -608,6 +611,36 @@ def _reply_references(source_email: EmailMessage) -> list[str]:
             if item
         )
     )
+
+
+MAX_REPLY_SOURCE_ARCHIVE_BYTES = 10 * 1024 * 1024
+
+
+def _reply_source_bodies(source_email: EmailMessage) -> tuple[str, str | None]:
+    """Load the complete direct-parent body used only for visible reply quoting."""
+    archive_folder = "mail_archive" if source_email.is_history else "inbound_archive"
+    archive_path = (
+        get_settings().runtime_dir
+        / archive_folder
+        / f"{source_email.raw_sha256}.eml"
+    )
+    try:
+        if archive_path.stat().st_size > MAX_REPLY_SOURCE_ARCHIVE_BYTES:
+            logger.warning(
+                "Reply source archive exceeds %s bytes; using stored body for email_id=%s",
+                MAX_REPLY_SOURCE_ARCHIVE_BYTES,
+                source_email.id,
+            )
+        else:
+            return extract_full_message_bodies(archive_path.read_bytes())
+    except (OSError, ValueError, LookupError, RecursionError) as exc:
+        logger.warning(
+            "Complete reply source unavailable for email_id=%s path=%s: %s",
+            source_email.id,
+            archive_path,
+            type(exc).__name__,
+        )
+    return source_email.body_text, source_email.body_html
 
 
 async def active_policy(session: AsyncSession, product_id: int, currency: str) -> PricePolicy | None:
@@ -1954,11 +1987,13 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             taxes_included=policy_row.taxes_included,
             freight_included=policy_row.freight_included,
         )
+        source_text, source_html = _reply_source_bodies(email_row)
         text, html_body = append_quoted_reply(
             text,
             html_body,
             from_address=email_row.from_address,
-            source_body=email_row.body_text,
+            source_body=source_text,
+            source_html=source_html,
             occurred_at=email_row.received_at,
         )
     except Exception as exc:
