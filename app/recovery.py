@@ -25,6 +25,8 @@ from app.mail import ParsedEmail, attachments_require_review, parse_mime
 from app.services import process_inbound
 from app.settings import get_settings
 
+MAX_HEADERLESS_DUPLICATE_GAP_SECONDS = 120
+
 
 @dataclass(frozen=True)
 class FalseCounterofferDuplicateSource:
@@ -240,6 +242,12 @@ async def _prepare_false_counteroffer_recovery(
             )
             for email_id, handoff_id in source_pairs
         ]
+        for state in states:
+            _require(
+                state.email.customer_id == case.customer_id
+                and state.email.contact_id == case.contact_id,
+                f"email {state.email.id} customer or contact differs from case {case.id}",
+            )
 
         open_handoff_ids = set(
             (
@@ -258,18 +266,45 @@ async def _prepare_false_counteroffer_recovery(
         )
 
         canonical = states[0]
-        if request.duplicate_sources:
-            _require(
-                canonical.parsed.in_reply_to is not None,
-                "canonical duplicate candidate has no In-Reply-To",
+        _require(
+            canonical.parsed.message_id is not None,
+            "canonical recovery email has no Message-ID",
+        )
+        has_thread_anchor = bool(canonical.parsed.in_reply_to or canonical.parsed.references)
+        match_basis = (
+            "thread_headers"
+            if request.duplicate_sources and has_thread_anchor
+            else "headerless_exact_120s"
+            if request.duplicate_sources
+            else "single_source"
+        )
+        maximum_duplicate_gap_seconds = (
+            request.max_duplicate_gap_seconds
+            if has_thread_anchor
+            else min(
+                request.max_duplicate_gap_seconds,
+                MAX_HEADERLESS_DUPLICATE_GAP_SECONDS,
             )
+        )
         canonical_recipients = {address.casefold() for address in canonical.parsed.to_addresses}
         canonical_attachments = _attachment_fingerprints(canonical.parsed)
         for duplicate in states[1:]:
             gap_seconds = (canonical.email.received_at - duplicate.email.received_at).total_seconds()
+            if not has_thread_anchor:
+                _require(
+                    canonical.email.uid_validity is not None
+                    and duplicate.email.uid_validity == canonical.email.uid_validity,
+                    f"email {duplicate.email.id} does not share canonical IMAP UIDVALIDITY",
+                )
+                _require(
+                    canonical.email.imap_uid is not None
+                    and duplicate.email.imap_uid is not None
+                    and duplicate.email.imap_uid < canonical.email.imap_uid,
+                    f"email {duplicate.email.id} is not earlier than canonical email in IMAP UID order",
+                )
             _require(
-                0 <= gap_seconds <= request.max_duplicate_gap_seconds,
-                f"email {duplicate.email.id} is not within {request.max_duplicate_gap_seconds}s "
+                0 <= gap_seconds <= maximum_duplicate_gap_seconds,
+                f"email {duplicate.email.id} is not within {maximum_duplicate_gap_seconds}s "
                 f"before canonical email {canonical.email.id}; observed gap is {gap_seconds:g}s, "
                 "and the canonical email must be the latest request",
             )
@@ -305,6 +340,13 @@ async def _prepare_false_counteroffer_recovery(
             _require(
                 duplicate.parsed.subject == canonical.parsed.subject,
                 f"email {duplicate.email.id} subject differs from canonical email",
+            )
+            duplicate_has_thread_anchor = bool(
+                duplicate.parsed.in_reply_to or duplicate.parsed.references
+            )
+            _require(
+                duplicate_has_thread_anchor == has_thread_anchor,
+                f"email {duplicate.email.id} thread-header presence differs from canonical email",
             )
             _require(
                 duplicate.parsed.in_reply_to == canonical.parsed.in_reply_to,
@@ -371,10 +413,15 @@ async def _prepare_false_counteroffer_recovery(
                     "recovery_commit": request.recovery_commit,
                     "recovery_reason": "Localized quoted history caused false counteroffer",
                     "recovery_role": "canonical" if is_canonical else "duplicate",
+                    "recovery_match_basis": match_basis,
                 }
             )
             if not is_canonical:
                 facts["duplicate_of_email_id"] = request.email_id
+                facts["duplicate_gap_seconds"] = int(
+                    (canonical.email.received_at - state.email.received_at).total_seconds()
+                )
+                facts["duplicate_max_gap_seconds"] = maximum_duplicate_gap_seconds
             state.handoff.extracted_facts = facts
             state.handoff.status = "RESOLVED"
             if is_canonical:
@@ -434,7 +481,14 @@ async def _prepare_false_counteroffer_recovery(
                             "email_id": state.email.id,
                             "handoff_id": state.handoff.id,
                             "canonical_email_id": request.email_id,
+                            "canonical_message_id": canonical.email.message_id,
+                            "duplicate_message_id": state.email.message_id,
+                            "canonical_imap_uid": canonical.email.imap_uid,
+                            "duplicate_imap_uid": state.email.imap_uid,
+                            "duplicate_gap_seconds": facts["duplicate_gap_seconds"],
+                            "duplicate_max_gap_seconds": maximum_duplicate_gap_seconds,
                             "commit": request.recovery_commit,
+                            "match_basis": match_basis,
                         },
                         created_at=now,
                     )
@@ -458,6 +512,13 @@ async def _verify_false_counteroffer_recovery(
         _require(email_row is not None, "source email disappeared during reprocessing")
         _require(case is not None, "case disappeared during reprocessing")
         _require(old_handoff is not None, "old handoff disappeared during reprocessing")
+        expected_match_basis = (
+            "thread_headers"
+            if request.duplicate_sources and (email_row.in_reply_to or email_row.references_json)
+            else "headerless_exact_120s"
+            if request.duplicate_sources
+            else "single_source"
+        )
 
         new_handoffs = list(
             (
@@ -474,7 +535,9 @@ async def _verify_false_counteroffer_recovery(
             "old DingTalk audit status changed",
         )
         _require(
-            old_handoff.extracted_facts.get("recovery_role") == "canonical",
+            old_handoff.extracted_facts.get("recovery_role") == "canonical"
+            and old_handoff.extracted_facts.get("recovery_match_basis")
+            == expected_match_basis,
             "old handoff is not marked as the canonical recovery source",
         )
         _require(
@@ -514,7 +577,9 @@ async def _verify_false_counteroffer_recovery(
             _require(
                 duplicate_handoff.extracted_facts.get("recovery_role") == "duplicate"
                 and duplicate_handoff.extracted_facts.get("duplicate_of_email_id")
-                == request.email_id,
+                == request.email_id
+                and duplicate_handoff.extracted_facts.get("recovery_match_basis")
+                == expected_match_basis,
                 f"duplicate handoff {duplicate_source.handoff_id} recovery facts are incomplete",
             )
 

@@ -51,7 +51,15 @@ def parse_args() -> argparse.Namespace:
             "May be repeated; the canonical --email-id must be the latest request."
         ),
     )
-    parser.add_argument("--max-duplicate-gap-seconds", type=int, default=300)
+    parser.add_argument(
+        "--max-duplicate-gap-seconds",
+        type=int,
+        default=300,
+        help=(
+            "Maximum duplicate age when thread headers match. Headerless exact duplicates "
+            "are always capped at 120 seconds."
+        ),
+    )
     parser.add_argument(
         "--apply",
         action="store_true",

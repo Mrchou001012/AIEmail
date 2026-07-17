@@ -704,6 +704,8 @@ async def _add_false_counteroffer_recovery_source(
     message_id: str,
     requested_quantity: int,
     received_at: datetime,
+    imap_uid: int,
+    include_thread_headers: bool = True,
 ) -> tuple[EmailMessage, Handoff, str]:
     expected_body = f"Please quote {requested_quantity} kg PRODUCT WIDGET-100 instead."
     message = MIMEMessage()
@@ -711,8 +713,9 @@ async def _add_false_counteroffer_recovery_source(
     message["To"] = "sales-agent@example.com"
     message["Subject"] = "Re: Industrial Widget 100 quotation"
     message["Message-ID"] = message_id
-    message["In-Reply-To"] = "<original-quote@example.com>"
-    message["References"] = "<root@example.com> <original-quote@example.com>"
+    if include_thread_headers:
+        message["In-Reply-To"] = "<original-quote@example.com>"
+        message["References"] = "<root@example.com> <original-quote@example.com>"
     message.set_content(
         f"{expected_body}\n\n"
         "On Friday, July 17, 2026 Seller <sales-agent@example.com> wrote:\n"
@@ -736,6 +739,8 @@ async def _add_false_counteroffer_recovery_source(
         direction="INBOUND",
         mailbox="integration-test",
         mailbox_folder="INBOX",
+        uid_validity=42,
+        imap_uid=imap_uid,
         message_id=parsed.message_id,
         in_reply_to=parsed.in_reply_to,
         references_json=parsed.references,
@@ -939,8 +944,18 @@ async def test_false_counteroffer_recovery_reparses_and_reprocesses(
     ) == 2
 
 
+@pytest.mark.parametrize(
+    ("include_thread_headers", "expected_match_basis", "expected_max_gap_seconds"),
+    [
+        pytest.param(True, "thread_headers", 300, id="threaded"),
+        pytest.param(False, "headerless_exact_120s", 120, id="headerless"),
+    ],
+)
 async def test_false_counteroffer_recovery_collapses_duplicate_sources(
     db_session: AsyncSession,
+    include_thread_headers: bool,
+    expected_match_basis: str,
+    expected_max_gap_seconds: int,
 ) -> None:
     case = await _seed_case(db_session, with_quote=True)
     case.status = CaseStatus.WAITING_HUMAN
@@ -951,6 +966,8 @@ async def test_false_counteroffer_recovery_collapses_duplicate_sources(
         message_id="<false-counteroffer-duplicate-earlier@example.com>",
         requested_quantity=200,
         received_at=canonical_received_at - timedelta(seconds=55),
+        imap_uid=100,
+        include_thread_headers=include_thread_headers,
     )
     canonical_email, canonical_handoff, _ = await _add_false_counteroffer_recovery_source(
         db_session,
@@ -958,6 +975,8 @@ async def test_false_counteroffer_recovery_collapses_duplicate_sources(
         message_id="<false-counteroffer-duplicate-canonical@example.com>",
         requested_quantity=200,
         received_at=canonical_received_at,
+        imap_uid=101,
+        include_thread_headers=include_thread_headers,
     )
     await db_session.commit()
     case_id = case.id
@@ -1008,11 +1027,24 @@ async def test_false_counteroffer_recovery_collapses_duplicate_sources(
     assert recovered_canonical_handoff.source_email_id is None
     assert recovered_canonical_handoff.dingtalk_status == "SENT"
     assert recovered_canonical_handoff.extracted_facts["recovery_role"] == "canonical"
+    assert (
+        recovered_canonical_handoff.extracted_facts["recovery_match_basis"]
+        == expected_match_basis
+    )
     assert recovered_duplicate_handoff.status == "RESOLVED"
     assert recovered_duplicate_handoff.source_email_id == duplicate_email_id
     assert recovered_duplicate_handoff.dingtalk_status == "SENT"
     assert recovered_duplicate_handoff.extracted_facts["recovery_role"] == "duplicate"
     assert recovered_duplicate_handoff.extracted_facts["duplicate_of_email_id"] == canonical_email_id
+    assert (
+        recovered_duplicate_handoff.extracted_facts["recovery_match_basis"]
+        == expected_match_basis
+    )
+    assert recovered_duplicate_handoff.extracted_facts["duplicate_gap_seconds"] == 55
+    assert (
+        recovered_duplicate_handoff.extracted_facts["duplicate_max_gap_seconds"]
+        == expected_max_gap_seconds
+    )
 
     quotes = list(
         (
@@ -1080,7 +1112,14 @@ async def test_false_counteroffer_recovery_collapses_duplicate_sources(
         "email_id": duplicate_email_id,
         "handoff_id": duplicate_handoff_id,
         "canonical_email_id": canonical_email_id,
+        "canonical_message_id": recovered_canonical_email.message_id,
+        "duplicate_message_id": recovered_duplicate_email.message_id,
+        "canonical_imap_uid": 101,
+        "duplicate_imap_uid": 100,
+        "duplicate_gap_seconds": 55,
+        "duplicate_max_gap_seconds": expected_max_gap_seconds,
         "commit": "test-duplicate-recovery-commit",
+        "match_basis": expected_match_basis,
     }
 
     counts_before_replay = (
@@ -1102,17 +1141,28 @@ async def test_false_counteroffer_recovery_collapses_duplicate_sources(
 
 
 @pytest.mark.parametrize(
-    ("duplicate_quantity", "duplicate_time_offset", "error_match"),
+    (
+        "duplicate_quantity",
+        "duplicate_time_offset",
+        "duplicate_has_thread_headers",
+        "canonical_has_thread_headers",
+        "error_match",
+    ),
     [
-        (201, -55, "unexpected cleaned body"),
-        (200, 1, "canonical email must be the latest request"),
-        (200, -301, "not within 300s"),
+        (201, -55, True, True, "unexpected cleaned body"),
+        (200, 1, True, True, "canonical email must be the latest request"),
+        (200, -301, True, True, "not within 300s"),
+        (200, -55, True, False, "thread-header presence differs"),
+        (200, -55, False, True, "thread-header presence differs"),
+        (200, -121, False, False, "not within 120s"),
     ],
 )
 async def test_false_counteroffer_duplicate_guard_rolls_back_everything(
     db_session: AsyncSession,
     duplicate_quantity: int,
     duplicate_time_offset: int,
+    duplicate_has_thread_headers: bool,
+    canonical_has_thread_headers: bool,
     error_match: str,
 ) -> None:
     case = await _seed_case(db_session, with_quote=True)
@@ -1125,6 +1175,8 @@ async def test_false_counteroffer_duplicate_guard_rolls_back_everything(
             message_id=f"<false-counteroffer-guard-duplicate-{duplicate_quantity}-{duplicate_time_offset}@example.com>",
             requested_quantity=duplicate_quantity,
             received_at=canonical_received_at + timedelta(seconds=duplicate_time_offset),
+            imap_uid=100,
+            include_thread_headers=duplicate_has_thread_headers,
         )
     )
     canonical_email, canonical_handoff, canonical_polluted_body = (
@@ -1134,6 +1186,8 @@ async def test_false_counteroffer_duplicate_guard_rolls_back_everything(
             message_id=f"<false-counteroffer-guard-canonical-{duplicate_quantity}-{duplicate_time_offset}@example.com>",
             requested_quantity=200,
             received_at=canonical_received_at,
+            imap_uid=101,
+            include_thread_headers=canonical_has_thread_headers,
         )
     )
     await db_session.commit()
