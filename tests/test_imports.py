@@ -1,3 +1,4 @@
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -10,10 +11,19 @@ from app.db import Contact, Customer, SalesCase
 from app.imports import (
     CUSTOMER_HEADERS,
     PRICE_HEADERS,
+    _contact_datetime,
     generate_templates,
     import_customers,
     import_prices,
 )
+
+
+def test_contact_datetime_accepts_dates_iso_values_and_excel_serials() -> None:
+    assert _contact_datetime(date(2025, 6, 7), "Asia/Kolkata").date() == date(2025, 6, 7)
+    assert _contact_datetime("2025-06-07", "Asia/Kolkata").date() == date(2025, 6, 7)
+    assert _contact_datetime(45815, "Asia/Kolkata").date() == date(2025, 6, 7)
+    aware = datetime(2025, 6, 7, 12, tzinfo=UTC)
+    assert _contact_datetime(aware, "Asia/Kolkata") == aware
 
 
 def test_template_generation(tmp_path: Path) -> None:
@@ -80,6 +90,9 @@ async def test_contact_only_customer_import_is_applied_idempotently(
     path = tmp_path / "customer_list_template.xlsx"
     workbook = load_workbook(path)
     workbook.active["E2"] = "UNKNOWN-PRODUCT"
+    columns = {cell.value: cell.column for cell in workbook.active[1]}
+    workbook.active.cell(2, columns["first_contact_at"], date(2022, 1, 10))
+    workbook.active.cell(2, columns["last_contact_at"], date(2025, 1, 10))
     workbook.save(path)
 
     first = await import_customers(path, db_session, apply=True)
@@ -94,6 +107,10 @@ async def test_contact_only_customer_import_is_applied_idempotently(
     assert await db_session.scalar(select(func.count()).select_from(Customer)) == 1
     assert await db_session.scalar(select(func.count()).select_from(Contact)) == 1
     assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 0
+    contact = await db_session.scalar(select(Contact))
+    assert contact is not None
+    assert contact.first_contact_at.date() == date(2022, 1, 10)
+    assert contact.last_contact_at.date() == date(2025, 1, 10)
 
 
 @pytest.mark.asyncio

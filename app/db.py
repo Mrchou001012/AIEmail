@@ -101,6 +101,8 @@ class Contact(Base, TimestampMixin):
     email: Mapped[str] = mapped_column(String(320), index=True)
     language: Mapped[str] = mapped_column(String(16), default="en")
     suppressed: Mapped[bool] = mapped_column(Boolean, default=False)
+    first_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     customer: Mapped[Customer] = relationship(back_populates="contacts")
 
 

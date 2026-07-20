@@ -2,15 +2,16 @@ import csv
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from email_validator import EmailNotValidError, validate_email
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.datetime import from_excel
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +44,8 @@ CUSTOMER_HEADERS = [
     "auto_send_allowed",
     "consent_basis",
     "do_not_contact",
+    "first_contact_at",
+    "last_contact_at",
 ]
 PRICE_HEADERS = [
     "product_code",
@@ -134,10 +137,12 @@ def generate_templates(target_dir: Path) -> None:
             False,
             "existing business relationship",
             False,
+            date.today(),
+            date.today(),
         ]
     )
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:I2"
+    ws.auto_filter.ref = f"A1:{ws.cell(1, len(CUSTOMER_HEADERS)).column_letter}2"
     customer.save(target_dir / "customer_list_template.xlsx")
 
     prices = Workbook()
@@ -214,6 +219,32 @@ def _date(value: Any) -> date | None:
     return date.fromisoformat(str(value))
 
 
+def _contact_datetime(value: Any, timezone_name: str) -> datetime | None:
+    """Normalize spreadsheet dates without shifting the displayed business date."""
+    if value is None or value == "":
+        return None
+    timezone = ZoneInfo(timezone_name)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        parsed = from_excel(value)
+        if isinstance(parsed, time):
+            raise ValueError("numeric Excel value does not contain a calendar date")
+        if float(value).is_integer():
+            parsed = datetime.combine(parsed.date(), time(hour=12))
+    elif isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, time(hour=12))
+    else:
+        text = str(value).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            parsed = datetime.combine(date.fromisoformat(text), time(hour=12))
+        else:
+            parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone)
+    return parsed.astimezone(UTC)
+
+
 WEEKDAYS = {
     "MONDAY": 0,
     "TUESDAY": 1,
@@ -243,6 +274,7 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
     parsed: list[dict[str, Any]] = []
     product_cache: dict[str, Product | None] = {}
     missing_product_codes: set[str] = set()
+    activity_timezone = get_settings().business_timezone
     for number, row in enumerate(rows, start=2):
         errors: list[str] = []
         company = str(row.get("company_name") or "").strip()
@@ -269,6 +301,20 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
             errors.append("company_name is required")
         if not name:
             errors.append("contact_name is required")
+        try:
+            first_contact_at = _contact_datetime(
+                row.get("first_contact_at") or row.get("first_contact_date"),
+                activity_timezone,
+            )
+            last_contact_at = _contact_datetime(
+                row.get("last_contact_at") or row.get("last_contact_date"),
+                activity_timezone,
+            )
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            errors.append("first_contact_at and last_contact_at must be ISO dates or datetimes")
+            first_contact_at = last_contact_at = None
+        if first_contact_at and last_contact_at and first_contact_at > last_contact_at:
+            errors.append("first_contact_at cannot be later than last_contact_at")
         if errors:
             result.errors.append({"row": number, "errors": errors})
             continue
@@ -280,6 +326,8 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
                 "product_code": product_code,
                 "company": company,
                 "name": name,
+                "first_contact_at": first_contact_at,
+                "last_contact_at": last_contact_at,
             }
         )
         if product is None:
@@ -334,6 +382,8 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
                     name=row["name"],
                     email=row["email"],
                     language=str(row.get("language") or "en"),
+                    first_contact_at=row["first_contact_at"],
+                    last_contact_at=row["last_contact_at"],
                 )
                 session.add(contact)
                 await session.flush()
@@ -341,6 +391,18 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
             else:
                 contact.name = row["name"]
                 contact.language = str(row.get("language") or "en")
+                if row["first_contact_at"] is not None:
+                    contact.first_contact_at = min(
+                        value
+                        for value in (contact.first_contact_at, row["first_contact_at"])
+                        if value is not None
+                    )
+                if row["last_contact_at"] is not None:
+                    contact.last_contact_at = max(
+                        value
+                        for value in (contact.last_contact_at, row["last_contact_at"])
+                        if value is not None
+                    )
             contact_cache[contact_key] = contact
             if row["product"] is None:
                 result.applied_rows += 1
