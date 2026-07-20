@@ -12,6 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import case as sa_case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -82,6 +83,7 @@ from app.mail import (
     transport_for,
 )
 from app.products import canonical_product_code, find_product_codes, product_codes_match
+from app.reactivation import reactivation_send_guard, record_reactivation_reply
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -1877,6 +1879,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     if email_row.is_bounce:
         await _handle_bounce(session, email_row)
         return
+    # A reply to a reactivation is business-significant even when a mail client
+    # omitted thread headers and the normal case matcher could not link it.
+    if not email_row.is_automated_reply:
+        await record_reactivation_reply(session, email_row)
     if email_row.case_id is None:
         return
     case = await session.get(SalesCase, email_row.case_id)
@@ -2410,7 +2416,12 @@ async def send_one_outbox(
             ),
             Outbox.available_at <= now,
         )
-        .order_by(Outbox.id)
+        # Live replies, quotations, and human-approved mail always stay ahead
+        # of bulk reactivation messages, regardless of creation order.
+        .order_by(
+            sa_case((Outbox.message_kind == "REACTIVATION", 1), else_=0),
+            Outbox.id,
+        )
         .with_for_update(skip_locked=True)
     )
     if row is None:
@@ -2449,6 +2460,19 @@ async def send_one_outbox(
         and row.human_approved_by
         and row.human_approved_at is not None
     )
+    if row.message_kind == "REACTIVATION":
+        guard = await reactivation_send_guard(session, row, settings=settings, at=now)
+        if guard.action == "DEFER":
+            row.status = DeliveryStatus.PENDING
+            row.available_at = guard.available_at or (now + timedelta(minutes=15))
+            row.last_error = guard.reason
+            await session.commit()
+            return True
+        if guard.action == "BLOCK":
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = guard.reason
+            await session.commit()
+            return True
     if (
         settings.commercial_gate_enabled
         and not settings.demo_mode

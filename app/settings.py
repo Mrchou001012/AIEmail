@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     commercial_update_url: str | None = None
     crm_review_url_template: str | None = None
 
+    reactivation_enabled: bool = True
+    reactivation_check_seconds: int = 10
+    reactivation_max_sends_per_day: int = 5
+    reactivation_default_inactive_days: int = 365
+    reactivation_default_second_days: int = 90
+
     safe_mode: bool = True
     auto_send_enabled: bool = False
     recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
@@ -141,6 +147,10 @@ class Settings(BaseSettings):
         "mx_temporary_retry_minutes",
         "commercial_refresh_check_seconds",
         "commercial_retry_minutes",
+        "reactivation_check_seconds",
+        "reactivation_max_sends_per_day",
+        "reactivation_default_inactive_days",
+        "reactivation_default_second_days",
     )
     @classmethod
     def positive_limit(cls, value: int) -> int:

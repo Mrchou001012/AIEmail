@@ -1,0 +1,9 @@
+Dear {contact_name},
+
+I hope you are doing well.
+
+It has been some time since we last spoke. I am writing to reconnect and ask whether you currently have any requirements for {product_code}.
+
+If useful, please send the product and quantity you need. We can then confirm the current availability and price.
+
+We look forward to hearing from you.
