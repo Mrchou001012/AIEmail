@@ -9,9 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import (
+    CommercialProductUpdateRequest,
+    CommercialUpdateRequest,
     InventoryConfirmationRequest,
     InventoryItemRequest,
+    confirm_current_commercial_data,
     confirm_current_inventory,
+    current_commercial_editor,
 )
 from app.commercial import get_or_create_current_cycle
 from app.db import (
@@ -297,6 +301,222 @@ async def test_inventory_confirmation_rejects_a_stale_price_version(
         )
 
     assert exc_info.value.status_code == 409
+    await db_session.rollback()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_builtin_editor_atomically_confirms_weekly_prices_and_inventory(
+    db_session: AsyncSession,
+) -> None:
+    settings = _settings()
+    product = Product(
+        code="YAC-EDITOR",
+        name="Editor Product",
+        unit="kg",
+        approved_text_key="yac_editor",
+        margin_class="A",
+    )
+    db_session.add(product)
+    await db_session.flush()
+    previous = PricePolicy(
+        product_id=product.id,
+        currency="INR",
+        standard_price=Decimal("100"),
+        absolute_floor=Decimal("90"),
+        min_quantity=100,
+        max_quantity=1200,
+        tier_1_max_multiple=Decimal("4"),
+        tier_1_markup_pct=Decimal("0.25"),
+        tier_2_max_multiple=Decimal("12"),
+        tier_2_markup_pct=Decimal("0.20"),
+        quote_valid_weekday=4,
+        valid_from=date(2026, 1, 1),
+        source_hash="previous-week",
+        active=True,
+    )
+    db_session.add(previous)
+    await db_session.commit()
+
+    editor = await current_commercial_editor("operator", db_session, settings)
+    assert editor["automation_ready"] is False
+    assert editor["editor_products"] == [
+        {
+            "product_id": product.id,
+            "product_code": "YAC-EDITOR",
+            "product_name": "Editor Product",
+            "unit": "kg",
+            "margin_class": "A",
+            "currency": "INR",
+            "template_policy_id": previous.id,
+            "current_week_price": None,
+            "previous_price": "100.0000",
+            "min_quantity": 100,
+            "max_quantity": 1200,
+            "tier_1_max_multiple": "4.0000",
+            "tier_1_markup_pct": "0.2500",
+            "tier_2_max_multiple": "12.0000",
+            "tier_2_markup_pct": "0.2000",
+            "inventory": None,
+        }
+    ]
+
+    response = await confirm_current_commercial_data(
+        CommercialUpdateRequest(
+            expected_cycle_id=editor["cycle_id"],
+            expected_price_source_ref=None,
+            source_ref="Monday web confirmation",
+            items=[
+                CommercialProductUpdateRequest(
+                    template_policy_id=previous.id,
+                    product_code=product.code,
+                    standard_price=Decimal("110"),
+                    availability="AVAILABLE",
+                    quantity=Decimal("900"),
+                    warehouse="India warehouse",
+                )
+            ],
+        ),
+        "operator",
+        db_session,
+        settings,
+    )
+
+    assert response["automation_ready"] is True
+    assert response["editor_products"][0]["current_week_price"] == "110.0000"
+    assert response["editor_products"][0]["inventory"]["quantity"] == "900.0000"
+    policies = (
+        (
+            await db_session.execute(
+                select(PricePolicy)
+                .where(PricePolicy.product_id == product.id)
+                .order_by(PricePolicy.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.active for row in policies] == [False, True]
+    assert Decimal(policies[-1].standard_price) == Decimal("110.0000")
+    assert Decimal(policies[-1].absolute_floor) == Decimal("110.0000")
+    assert Decimal(policies[-1].max_discount_pct) == Decimal("0")
+    assert policies[-1].commercial_cycle_id == editor["cycle_id"]
+    audit_types = set(
+        (
+            await db_session.execute(
+                select(AuditEvent.event_type).where(AuditEvent.actor == "operator")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {"commercial.price_replaced", "commercial.inventory_updated"} <= audit_types
+
+    # A browser retry of the exact confirmed batch is a no-op rather than a
+    # duplicate policy version.
+    retry_row = response["editor_products"][0]
+    retry = await confirm_current_commercial_data(
+        CommercialUpdateRequest(
+            expected_cycle_id=response["cycle_id"],
+            expected_price_source_ref=response["price_source_ref"],
+            source_ref="Monday web confirmation",
+            items=[
+                CommercialProductUpdateRequest(
+                    template_policy_id=retry_row["template_policy_id"],
+                    product_code=product.code,
+                    standard_price=Decimal("110"),
+                    availability="AVAILABLE",
+                    quantity=Decimal("900"),
+                    warehouse="India warehouse",
+                )
+            ],
+        ),
+        "operator",
+        db_session,
+        settings,
+    )
+    assert retry["price_source_ref"] == response["price_source_ref"]
+    assert (
+        await db_session.scalar(
+            select(func.count()).select_from(PricePolicy).where(PricePolicy.product_id == product.id)
+        )
+        == 2
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_builtin_editor_rejects_stale_page_and_missing_available_quantity(
+    db_session: AsyncSession,
+) -> None:
+    settings = _settings()
+    product = Product(
+        code="YAC-EDITOR-GUARD",
+        name="Guard Product",
+        unit="kg",
+        approved_text_key="yac_editor_guard",
+    )
+    db_session.add(product)
+    await db_session.flush()
+    policy = PricePolicy(
+        product_id=product.id,
+        currency="INR",
+        standard_price=Decimal("50"),
+        absolute_floor=Decimal("50"),
+        valid_from=date(2026, 1, 1),
+        source_hash="guard-template",
+        active=True,
+    )
+    db_session.add(policy)
+    await db_session.commit()
+    editor = await current_commercial_editor("operator", db_session, settings)
+    item = CommercialProductUpdateRequest(
+        template_policy_id=policy.id,
+        product_code=product.code,
+        standard_price=Decimal("55"),
+        availability="AVAILABLE",
+    )
+
+    with pytest.raises(HTTPException, match="positive quantity") as quantity_error:
+        await confirm_current_commercial_data(
+            CommercialUpdateRequest(
+                expected_cycle_id=editor["cycle_id"],
+                expected_price_source_ref=None,
+                source_ref="missing quantity",
+                items=[item],
+            ),
+            "operator",
+            db_session,
+            settings,
+        )
+    assert quantity_error.value.status_code == 422
+    await db_session.rollback()
+
+    item.quantity = Decimal("100")
+    await confirm_current_commercial_data(
+        CommercialUpdateRequest(
+            expected_cycle_id=editor["cycle_id"],
+            expected_price_source_ref=None,
+            source_ref="valid update",
+            items=[item],
+        ),
+        "operator",
+        db_session,
+        settings,
+    )
+    with pytest.raises(HTTPException, match="changed") as stale_error:
+        await confirm_current_commercial_data(
+            CommercialUpdateRequest(
+                expected_cycle_id=editor["cycle_id"],
+                expected_price_source_ref=None,
+                source_ref="stale update",
+                items=[item],
+            ),
+            "operator",
+            db_session,
+            settings,
+        )
+    assert stale_error.value.status_code == 409
     await db_session.rollback()
 
 

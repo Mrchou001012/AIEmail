@@ -151,13 +151,21 @@ priced product through `POST /admin/commercial/current/inventory`, for example:
 }
 ```
 
+The DingTalk reminder opens the built-in protected editor at
+`/admin/commercial/current/update`. It shows the existing product catalog and
+pricing-rule summary, then accepts this week's INR/kg base price, stock status,
+quantity, warehouse, and an operator note. The complete product batch is checked
+and committed atomically; automatic quoting resumes only after both price and
+inventory succeed. A stale browser page is rejected instead of overwriting a
+newer update. Products without an existing automatic pricing rule remain visible
+as manual-only and cannot accidentally be enabled from the simple editor.
+
 `GET /admin/commercial/current` reports the current cycle, missing product stock
-confirmations, and whether autonomous quotation is ready. These routes use the
+confirmations, and whether autonomous quotation is ready. The spreadsheet and
+JSON endpoints remain available for bulk/system integration. All routes use the
 same administrator authentication as the other protected operations endpoints.
-Waiting inbound jobs are made runnable immediately after the last inventory item
-is confirmed. The built-in URL is a status/API endpoint rather than an editing
-form; until a CRM/WMS page is configured, operators upload the workbook and
-submit inventory through these protected endpoints.
+Waiting inbound jobs are made runnable immediately after the complete price and
+inventory confirmation.
 
 The default `COMMERCIAL_DATA_PROVIDER=database` uses the local weekly snapshot.
 The quotation workflow depends on a `CommercialDataProvider` boundary rather

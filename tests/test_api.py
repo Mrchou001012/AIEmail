@@ -3,7 +3,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.api import HANDOFF_REVIEW_PATH, dashboard, health
+from app.api import (
+    COMMERCIAL_UPDATE_PATH,
+    HANDOFF_REVIEW_PATH,
+    commercial_update_page,
+    dashboard,
+    health,
+)
 
 
 @pytest.mark.asyncio
@@ -50,3 +56,23 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/send" in html
     assert "确认并加入发件队列" in html
     assert "resume_automation" in html
+
+
+@pytest.mark.asyncio
+async def test_commercial_update_page_is_protected_no_store_html() -> None:
+    response = await commercial_update_page("admin")
+
+    assert response.status_code == 200
+    assert "本周价格与库存" in response.body.decode("utf-8")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_commercial_update_page_exposes_atomic_editor_workflow() -> None:
+    html = COMMERCIAL_UPDATE_PATH.read_text(encoding="utf-8")
+
+    assert "/admin/commercial/current/editor" in html
+    assert "/admin/commercial/current/confirm" in html
+    assert "本周基础价" in html
+    assert "库存数量" in html
+    assert "确认并启用本周自动报价" in html

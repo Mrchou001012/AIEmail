@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本周价格与库存</title>
+  <style>
+    :root { color-scheme:light; --bg:#f4f6fa; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#3157d5; --green:#067647; --green-bg:#ecfdf3; --amber:#a15c06; --amber-bg:#fff7e6; --red:#b42318; --red-bg:#fff1f0; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,input,select { font:inherit; }
+    .shell { width:min(1500px,calc(100% - 28px)); margin:0 auto; padding:24px 0 48px; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:18px; }
+    h1,h2,p { margin:0; }
+    h1 { font-size:24px; }
+    h2 { font-size:16px; }
+    .sub,.hint { color:var(--muted); }
+    .top-links { display:flex; gap:14px; align-items:center; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:15px; box-shadow:0 5px 20px rgba(16,24,40,.05); margin-bottom:16px; overflow:hidden; }
+    .card-head { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:16px 18px; border-bottom:1px solid var(--line); }
+    .summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; padding:16px 18px; }
+    .metric { background:#f8fafc; border:1px solid #edf0f5; border-radius:11px; padding:12px; }
+    .metric span { display:block; color:var(--muted); font-size:12px; }
+    .metric strong { display:block; margin-top:5px; font-size:16px; }
+    .pill { display:inline-flex; padding:3px 9px; border-radius:999px; font-weight:700; font-size:12px; }
+    .pill.good { color:var(--green); background:var(--green-bg); }
+    .pill.warn { color:var(--amber); background:var(--amber-bg); }
+    .notice { display:none; margin-bottom:16px; border-radius:11px; padding:12px 14px; }
+    .notice.ok { display:block; color:var(--green); background:var(--green-bg); border:1px solid #abefc6; }
+    .notice.error { display:block; color:var(--red); background:var(--red-bg); border:1px solid #fecdca; }
+    .table-wrap { overflow:auto; }
+    table { width:100%; border-collapse:collapse; min-width:1180px; }
+    th,td { text-align:left; padding:11px 10px; border-bottom:1px solid #edf0f5; vertical-align:top; }
+    th { position:sticky; top:0; z-index:1; background:#f8fafc; color:#475467; font-size:12px; }
+    td:first-child,th:first-child { padding-left:18px; }
+    td:last-child,th:last-child { padding-right:18px; }
+    .product { font-weight:750; white-space:nowrap; }
+    .product small { display:block; color:var(--muted); font-weight:400; }
+    .rule { color:var(--muted); font-size:12px; max-width:260px; }
+    input,select { width:100%; min-width:105px; border:1px solid #c9d2df; border-radius:8px; padding:8px 9px; background:#fff; color:var(--ink); }
+    input:focus,select:focus { outline:2px solid #c7d7fe; border-color:var(--blue); }
+    input:disabled { background:#f2f4f7; color:#98a2b3; }
+    .previous { color:var(--muted); font-size:11px; margin-top:4px; }
+    .actions { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:end; gap:16px; padding:18px; }
+    .source { min-width:min(520px,100%); }
+    label { display:block; font-weight:650; margin-bottom:6px; }
+    button { border:0; border-radius:9px; padding:10px 15px; font-weight:700; cursor:pointer; }
+    button.primary { color:#fff; background:var(--blue); }
+    button.secondary { color:var(--ink); background:#e9eef6; }
+    button:disabled { opacity:.5; cursor:wait; }
+    .manual { padding:14px 18px 18px; }
+    .manual-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .manual-item { padding:7px 10px; border-radius:9px; background:#f2f4f7; color:#475467; }
+    .empty { padding:30px 18px; text-align:center; color:var(--muted); }
+    @media(max-width:900px) { .summary { grid-template-columns:1fr 1fr; } .top { align-items:flex-start; } .top-links { flex-direction:column; align-items:flex-end; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div><h1>本周价格与库存</h1><p class="sub">一次确认整周基础价格和现货数量；全部成功后才恢复 AI 自动报价。</p></div>
+      <div class="top-links"><a href="/dashboard">运行看板</a><button class="secondary" id="reload" type="button">重新读取</button></div>
+    </header>
+    <div id="notice" class="notice" role="status"></div>
+
+    <section class="card">
+      <div class="card-head"><h2>本周状态</h2><span id="ready-pill" class="pill warn">正在读取</span></div>
+      <div class="summary">
+        <div class="metric"><span>业务周</span><strong id="week">—</strong></div>
+        <div class="metric"><span>价格</span><strong id="price-status">—</strong></div>
+        <div class="metric"><span>库存</span><strong id="inventory-status">—</strong></div>
+        <div class="metric"><span>产品数量</span><strong id="product-count">—</strong></div>
+        <div class="metric"><span>最近确认</span><strong id="confirmed-at">—</strong></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div><h2>产品价格和现货</h2><p class="hint">价格为 INR/kg 基础价；原有 MOQ 和分档加价规则保持不变。显示的上次价格仅供参考，不会自动带入新一周。</p></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>产品</th><th>分类</th><th>报价规则</th><th>本周基础价</th><th>库存状态</th><th>库存数量 (kg)</th><th>仓库/备注</th></tr></thead>
+          <tbody id="products"><tr><td colspan="7" class="empty">正在读取产品…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <div class="source"><label for="source-ref">本次更新说明</label><input id="source-ref" maxlength="255" placeholder="例如：2026-W30 周一价格和印度仓库盘点"></div>
+        <button class="primary" id="confirm" type="button">确认并启用本周自动报价</button>
+      </div>
+    </section>
+
+    <section class="card" id="manual-card">
+      <div class="card-head"><h2>继续人工处理的产品</h2><span class="hint">没有可复用的自动报价规则，不会在此页面启用</span></div>
+      <div class="manual"><div class="manual-list" id="manual-products"></div></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    let state = null;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {cache:"no-store", headers:{"Content-Type":"application/json", Accept:"application/json", ...(options.headers || {})}, ...options});
+      if (!response.ok) {
+        let message = `${response.status} ${response.statusText}`;
+        try { message = (await response.json()).detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+    function notice(message, kind = "ok") { const node = $("#notice"); node.className = `notice ${kind}`; node.textContent = message; window.scrollTo({top:0, behavior:"smooth"}); }
+    function pct(value) { return value == null ? "—" : `${(Number(value) * 100).toFixed(0)}%`; }
+    function ruleText(row) {
+      const max = row.max_quantity == null ? "无上限" : `${row.max_quantity} kg`;
+      const tiers = row.tier_1_max_multiple == null ? "无分档加价" : `<${row.tier_1_max_multiple}×MOQ 加 ${pct(row.tier_1_markup_pct)}；≤${row.tier_2_max_multiple}×MOQ 加 ${pct(row.tier_2_markup_pct)}`;
+      return `MOQ ${row.min_quantity} kg；上限 ${max}<br>${tiers}`;
+    }
+    function render(data) {
+      state = data;
+      $("#week").textContent = `${data.week_start} 至 ${data.week_end}`;
+      $("#price-status").textContent = data.price_status;
+      $("#inventory-status").textContent = data.inventory_status;
+      $("#product-count").textContent = data.editor_products.length;
+      $("#confirmed-at").textContent = data.inventory_confirmed_at ? new Date(data.inventory_confirmed_at).toLocaleString() : "尚未确认";
+      const pill = $("#ready-pill");
+      pill.className = `pill ${data.automation_ready ? "good" : "warn"}`;
+      pill.textContent = data.automation_ready ? "自动报价已启用" : "自动报价暂停";
+      $("#products").innerHTML = data.editor_products.length ? data.editor_products.map((row) => {
+        const current = row.current_week_price;
+        const stock = row.inventory || {};
+        return `<tr data-template-id="${esc(row.template_policy_id)}" data-code="${esc(row.product_code)}" data-currency="${esc(row.currency)}">
+          <td><span class="product">${esc(row.product_code)}<small>${esc(row.product_name)} · ${esc(row.currency)}/${esc(row.unit)}</small></span></td>
+          <td>${esc(row.margin_class || "—")}</td>
+          <td><div class="rule">${ruleText(row)}</div></td>
+          <td><input class="price" type="number" min="0.0001" max="1000000000" step="0.0001" value="${esc(current || "")}" placeholder="请输入本周价格" required><div class="previous">上次：${esc(row.previous_price)} ${esc(row.currency)}</div></td>
+          <td><select class="availability" required><option value="">请选择</option><option value="AVAILABLE" ${stock.availability === "AVAILABLE" ? "selected" : ""}>有现货</option><option value="OUT_OF_STOCK" ${stock.availability === "OUT_OF_STOCK" ? "selected" : ""}>无现货</option></select></td>
+          <td><input class="quantity" type="number" min="0" max="1000000000" step="0.0001" value="${esc(stock.quantity || "")}" placeholder="有现货时必填"></td>
+          <td><input class="warehouse" maxlength="128" value="${esc(stock.warehouse || "")}" placeholder="例如：India warehouse"></td>
+        </tr>`;
+      }).join("") : '<tr><td colspan="7" class="empty">没有可编辑的 INR 报价规则，请先导入一次完整价格表。</td></tr>';
+      for (const select of document.querySelectorAll(".availability")) bindAvailability(select);
+      const manual = data.manual_products || [];
+      $("#manual-card").style.display = manual.length ? "block" : "none";
+      $("#manual-products").innerHTML = manual.map((row) => `<span class="manual-item" title="${esc(row.reason)}">${esc(row.product_code)} · ${esc(row.product_name)}</span>`).join("");
+      $("#confirm").disabled = !data.editor_products.length;
+      if (!$("#source-ref").value) $("#source-ref").value = `${data.week_start} 本周价格和库存人工确认`;
+    }
+    function bindAvailability(select) {
+      const row = select.closest("tr");
+      const quantity = row.querySelector(".quantity");
+      const sync = () => { const empty = select.value === "OUT_OF_STOCK"; quantity.disabled = empty; if (empty) quantity.value = "0"; };
+      select.addEventListener("change", sync); sync();
+    }
+    function collect() {
+      const items = [];
+      for (const row of document.querySelectorAll("#products tr[data-template-id]")) {
+        const code = row.dataset.code;
+        const standardPrice = row.querySelector(".price").value.trim();
+        const availability = row.querySelector(".availability").value;
+        const quantity = row.querySelector(".quantity").value.trim();
+        if (!standardPrice || Number(standardPrice) <= 0) throw new Error(`${code}：请输入有效的本周价格`);
+        if (!availability) throw new Error(`${code}：请选择库存状态`);
+        if (availability === "AVAILABLE" && (!quantity || Number(quantity) <= 0)) throw new Error(`${code}：有现货时必须填写大于 0 的库存数量`);
+        items.push({template_policy_id:Number(row.dataset.templateId), product_code:code, currency:row.dataset.currency, standard_price:standardPrice, availability, quantity:availability === "OUT_OF_STOCK" ? "0" : quantity, warehouse:row.querySelector(".warehouse").value.trim() || null});
+      }
+      const sourceRef = $("#source-ref").value.trim();
+      if (!sourceRef) throw new Error("请填写本次更新说明");
+      return {expected_cycle_id:state.cycle_id, expected_price_source_ref:state.price_source_ref, source_ref:sourceRef, items};
+    }
+    async function load() {
+      $("#reload").disabled = true;
+      try { render(await api("/admin/commercial/current/editor")); }
+      catch (error) { notice(`读取失败：${error.message}`, "error"); }
+      finally { $("#reload").disabled = false; }
+    }
+    $("#reload").addEventListener("click", load);
+    $("#confirm").addEventListener("click", async () => {
+      try {
+        const payload = collect();
+        if (!confirm(`确认提交 ${payload.items.length} 个产品的本周价格和库存？\n提交成功后，等待中的自动报价将恢复处理。`)) return;
+        $("#confirm").disabled = true;
+        render(await api("/admin/commercial/current/confirm", {method:"POST", body:JSON.stringify(payload)}));
+        notice("本周价格和库存已确认，AI 自动报价已恢复。请留意发件队列。", "ok");
+      } catch (error) { notice(`提交失败：${error.message}`, "error"); }
+      finally { $("#confirm").disabled = !state?.editor_products?.length; }
+    });
+    load();
+  </script>
+</body>
+</html>

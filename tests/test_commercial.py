@@ -313,5 +313,5 @@ def test_commercial_update_link_supports_cycle_placeholders() -> None:
         "?scope=india&from=2026-07-20&to=2026-07-24"
     )
     assert commercial_update_link(_settings(), cycle) == (
-        "https://aiemail.example.com/admin/commercial/current"
+        "https://aiemail.example.com/admin/commercial/current/update"
     )

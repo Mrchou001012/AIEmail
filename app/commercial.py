@@ -373,7 +373,7 @@ def commercial_update_link(
 ) -> str:
     week_start, week_end = business_week_bounds(settings, at)
     template = settings.commercial_update_url or (
-        f"{settings.public_base_url.rstrip('/')}/admin/commercial/current"
+        f"{settings.public_base_url.rstrip('/')}/admin/commercial/current/update"
     )
     return _render_http_url(
         template,

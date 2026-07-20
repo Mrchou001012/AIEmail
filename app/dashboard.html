@@ -86,12 +86,15 @@
     }
 
     .refresh {
+      display: inline-flex;
+      align-items: center;
       border: 1px solid var(--line-strong);
       border-radius: 10px;
       padding: 8px 13px;
       background: var(--surface);
       color: var(--text);
       cursor: pointer;
+      text-decoration: none;
     }
 
     .refresh:hover { border-color: var(--brand); color: var(--brand); }
@@ -323,6 +326,7 @@
       </div>
       <div class="top-actions">
         <span id="updated-at">正在读取状态…</span>
+        <a class="refresh" href="/admin/commercial/current/update">更新价格与库存</a>
         <button class="refresh" id="refresh" type="button">刷新</button>
       </div>
     </header>

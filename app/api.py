@@ -1,3 +1,5 @@
+import hashlib
+import json
 import secrets
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -9,7 +11,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -43,6 +45,7 @@ from app.db import (
     db_health,
     get_session,
 )
+from app.domain import money
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
 from app.products import canonical_product_code
@@ -61,6 +64,7 @@ router = APIRouter()
 security = HTTPBasic()
 DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
+COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 
 
 def require_admin(
@@ -136,6 +140,23 @@ class InventoryConfirmationRequest(BaseModel):
     source_ref: str | None = Field(default=None, max_length=255)
 
 
+class CommercialProductUpdateRequest(BaseModel):
+    template_policy_id: int = Field(gt=0)
+    product_code: str = Field(min_length=1, max_length=64)
+    currency: Literal["INR"] = "INR"
+    standard_price: Decimal = Field(gt=0, le=1_000_000_000)
+    availability: Literal["AVAILABLE", "OUT_OF_STOCK"]
+    quantity: Decimal | None = Field(default=None, ge=0, le=1_000_000_000)
+    warehouse: str | None = Field(default=None, max_length=128)
+
+
+class CommercialUpdateRequest(BaseModel):
+    expected_cycle_id: int = Field(gt=0)
+    expected_price_source_ref: str | None = Field(default=None, max_length=255)
+    source_ref: str = Field(min_length=1, max_length=255)
+    items: list[CommercialProductUpdateRequest] = Field(min_length=1, max_length=10_000)
+
+
 def _dashboard_headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-store",
@@ -162,6 +183,18 @@ async def health() -> JSONResponse:
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard(_: Admin) -> HTMLResponse:
     return HTMLResponse(DASHBOARD_PATH.read_text(encoding="utf-8"), headers=_dashboard_headers())
+
+
+@router.get(
+    "/admin/commercial/current/update",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def commercial_update_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        COMMERCIAL_UPDATE_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
 
 
 @router.get("/admin/dashboard/data")
@@ -798,6 +831,370 @@ async def _commercial_cycle_payload(
         "products": product_payload,
         "update_url": commercial_update_link(settings, cycle),
     }
+
+
+async def _commercial_price_templates(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[int, tuple[Product, PricePolicy]]:
+    """Return one active INR rule template per product for the configured scope."""
+
+    rows = (
+        await session.execute(
+            select(Product, PricePolicy, CommercialDataCycle)
+            .join(PricePolicy, PricePolicy.product_id == Product.id)
+            .outerjoin(
+                CommercialDataCycle,
+                CommercialDataCycle.id == PricePolicy.commercial_cycle_id,
+            )
+            .where(
+                Product.active.is_(True),
+                PricePolicy.active.is_(True),
+                PricePolicy.currency == "INR",
+                or_(
+                    PricePolicy.commercial_cycle_id.is_(None),
+                    CommercialDataCycle.scope == settings.commercial_scope,
+                ),
+            )
+        )
+    ).all()
+    selected: dict[int, tuple[Product, PricePolicy]] = {}
+    priorities: dict[int, tuple[int, int]] = {}
+    for product, policy, _policy_cycle in rows:
+        priority = (int(policy.commercial_cycle_id == cycle.id), policy.id)
+        if priority > priorities.get(product.id, (-1, -1)):
+            selected[product.id] = (product, policy)
+            priorities[product.id] = priority
+    return selected
+
+
+def _commercial_decimal(value: Decimal | int) -> str:
+    return format(Decimal(value), ".4f")
+
+
+async def _commercial_editor_payload(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[str, Any]:
+    status_payload = await _commercial_cycle_payload(session, settings, cycle)
+    templates = await _commercial_price_templates(session, settings, cycle)
+    snapshots = {
+        row.product_id: row
+        for row in (
+            (
+                await session.execute(
+                    select(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    editor_products: list[dict[str, Any]] = []
+    for product, policy in sorted(templates.values(), key=lambda item: item[0].code):
+        current = policy.commercial_cycle_id == cycle.id
+        snapshot = snapshots.get(product.id)
+        editor_products.append(
+            {
+                "product_id": product.id,
+                "product_code": product.code,
+                "product_name": product.name,
+                "unit": product.unit,
+                "margin_class": product.margin_class,
+                "currency": policy.currency,
+                "template_policy_id": policy.id,
+                "current_week_price": _commercial_decimal(policy.standard_price) if current else None,
+                "previous_price": _commercial_decimal(policy.standard_price),
+                "min_quantity": policy.min_quantity,
+                "max_quantity": policy.max_quantity,
+                "tier_1_max_multiple": (
+                    _commercial_decimal(policy.tier_1_max_multiple)
+                    if policy.tier_1_max_multiple is not None
+                    else None
+                ),
+                "tier_1_markup_pct": _commercial_decimal(policy.tier_1_markup_pct),
+                "tier_2_max_multiple": (
+                    _commercial_decimal(policy.tier_2_max_multiple)
+                    if policy.tier_2_max_multiple is not None
+                    else None
+                ),
+                "tier_2_markup_pct": _commercial_decimal(policy.tier_2_markup_pct),
+                "inventory": (
+                    {
+                        "availability": snapshot.availability,
+                        "quantity": (
+                            _commercial_decimal(snapshot.quantity)
+                            if snapshot.quantity is not None
+                            else None
+                        ),
+                        "warehouse": snapshot.warehouse,
+                    }
+                    if snapshot is not None
+                    else None
+                ),
+            }
+        )
+    configured_product_ids = set(templates)
+    manual_products = (
+        (
+            await session.execute(
+                select(Product)
+                .where(
+                    Product.active.is_(True),
+                    Product.id.not_in(configured_product_ids) if configured_product_ids else True,
+                )
+                .order_by(Product.code)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        **status_payload,
+        "editor_products": editor_products,
+        "manual_products": [
+            {
+                "product_code": product.code,
+                "product_name": product.name,
+                "reason": "未配置可复用的 INR 报价规则，请继续人工处理或导入完整价格表",
+            }
+            for product in manual_products
+        ],
+    }
+
+
+@router.get("/admin/commercial/current/editor")
+async def current_commercial_editor(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    cycle = await get_or_create_current_cycle(session, settings)
+    await session.commit()
+    return await _commercial_editor_payload(session, settings, cycle)
+
+
+@router.post("/admin/commercial/current/confirm")
+async def confirm_current_commercial_data(
+    request: CommercialUpdateRequest,
+    actor: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Atomically replace this week's prices and stock from the built-in UI."""
+
+    await lock_commercial_scope(session, settings.commercial_scope)
+    cycle = await get_or_create_current_cycle(session, settings)
+    cycle = await session.scalar(
+        select(CommercialDataCycle)
+        .where(CommercialDataCycle.id == cycle.id)
+        .with_for_update()
+    )
+    if cycle is None:
+        raise HTTPException(409, "The current commercial-data cycle no longer exists")
+    if request.expected_cycle_id != cycle.id:
+        raise HTTPException(409, "A new business week has started; reload the page")
+    if request.expected_price_source_ref != cycle.price_source_ref:
+        raise HTTPException(409, "Commercial data changed; reload before submitting again")
+
+    in_flight_quote_id = await session.scalar(
+        select(Outbox.id)
+        .join(Quote, Quote.id == Outbox.quote_id)
+        .join(CommercialDataCycle, CommercialDataCycle.id == Quote.commercial_cycle_id)
+        .where(
+            CommercialDataCycle.scope == cycle.scope,
+            Outbox.message_kind == "AUTO_QUOTE",
+            Outbox.status.in_([DeliveryStatus.CLAIMED, DeliveryStatus.UNKNOWN]),
+        )
+        .limit(1)
+    )
+    if in_flight_quote_id is not None:
+        raise HTTPException(
+            409,
+            "An automatic quotation is currently being delivered; wait briefly and try again",
+        )
+
+    templates = await _commercial_price_templates(session, settings, cycle)
+    templates_by_id = {policy.id: (product, policy) for product, policy in templates.values()}
+    requested_template_ids = [item.template_policy_id for item in request.items]
+    if len(set(requested_template_ids)) != len(requested_template_ids):
+        raise HTTPException(422, "Each product may appear only once")
+    if set(requested_template_ids) != set(templates_by_id):
+        raise HTTPException(409, "The product or pricing-rule list changed; reload the page")
+
+    prepared: list[tuple[CommercialProductUpdateRequest, Product, PricePolicy, Decimal]] = []
+    seen_products: set[int] = set()
+    for item in request.items:
+        product, template = templates_by_id[item.template_policy_id]
+        if canonical_product_code(item.product_code) != product.code or item.currency != template.currency:
+            raise HTTPException(409, "A product or currency no longer matches its pricing rule")
+        if product.id in seen_products:
+            raise HTTPException(422, "Each product may appear only once")
+        seen_products.add(product.id)
+        price = money(item.standard_price)
+        if item.availability == "AVAILABLE" and (item.quantity is None or item.quantity <= 0):
+            raise HTTPException(422, f"{product.code}: available stock requires a positive quantity")
+        prepared.append((item, product, template, price))
+
+    canonical_batch = [
+        {
+            "product_id": product.id,
+            "currency": item.currency,
+            "standard_price": str(price),
+            "availability": item.availability,
+            "quantity": str(item.quantity or 0),
+            "warehouse": (item.warehouse or "").strip(),
+        }
+        for item, product, _template, price in sorted(prepared, key=lambda row: row[1].id)
+    ]
+    source_hash = hashlib.sha256(
+        json.dumps(canonical_batch, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if (
+        cycle.price_source_ref == source_hash
+        and cycle.price_status == "CONFIRMED"
+        and cycle.inventory_status == "CONFIRMED"
+    ):
+        # Browser retries and double-clicks are idempotent. The hash covers the
+        # complete price and inventory batch, so no new policy version is needed.
+        await session.commit()
+        return await _commercial_editor_payload(session, settings, cycle)
+
+    active_policy_ids = (
+        (
+            await session.execute(
+                select(PricePolicy.id)
+                .outerjoin(
+                    CommercialDataCycle,
+                    CommercialDataCycle.id == PricePolicy.commercial_cycle_id,
+                )
+                .where(
+                    PricePolicy.active.is_(True),
+                    PricePolicy.currency == "INR",
+                    or_(
+                        PricePolicy.commercial_cycle_id.is_(None),
+                        CommercialDataCycle.scope == cycle.scope,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if active_policy_ids:
+        await session.execute(
+            update(PricePolicy)
+            .where(PricePolicy.id.in_(active_policy_ids))
+            .values(active=False)
+        )
+    await session.execute(delete(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id))
+
+    for item, product, template, price in prepared:
+        session.add(
+            PricePolicy(
+                commercial_cycle_id=cycle.id,
+                product_id=product.id,
+                currency=item.currency,
+                standard_price=price,
+                # Counteroffers remain human-only. Matching the floor to the new
+                # base price prevents a future accidental automatic discount.
+                absolute_floor=price,
+                max_discount_pct=Decimal("0"),
+                max_negotiation_rounds=template.max_negotiation_rounds,
+                concession_step_pct=template.concession_step_pct,
+                min_quantity=template.min_quantity,
+                max_quantity=template.max_quantity,
+                tier_1_max_multiple=template.tier_1_max_multiple,
+                tier_1_markup_pct=template.tier_1_markup_pct,
+                tier_2_max_multiple=template.tier_2_max_multiple,
+                tier_2_markup_pct=template.tier_2_markup_pct,
+                quote_valid_days=template.quote_valid_days,
+                quote_valid_weekday=4,
+                standard_incoterm=template.standard_incoterm,
+                allowed_incoterms=list(template.allowed_incoterms or []),
+                standard_payment_term=template.standard_payment_term,
+                allowed_payment_terms=list(template.allowed_payment_terms or []),
+                taxes_included=template.taxes_included,
+                freight_included=template.freight_included,
+                valid_from=cycle.week_start,
+                valid_to=cycle.week_end,
+                source_hash=source_hash,
+                active=True,
+            )
+        )
+        session.add(
+            InventorySnapshot(
+                cycle_id=cycle.id,
+                product_id=product.id,
+                availability=item.availability,
+                quantity=item.quantity if item.availability == "AVAILABLE" else Decimal("0"),
+                warehouse=(item.warehouse or "").strip() or None,
+                source_system="manual_web",
+                metadata_json={"confirmed_by": actor},
+            )
+        )
+
+    now = datetime.now(UTC)
+    cycle.price_status = "CONFIRMED"
+    cycle.inventory_status = "CONFIRMED"
+    cycle.price_confirmed_at = now
+    cycle.inventory_confirmed_at = now
+    cycle.price_source_system = "manual_web"
+    cycle.inventory_source_system = "manual_web"
+    cycle.price_source_ref = source_hash
+    cycle.inventory_source_ref = request.source_ref.strip()
+    if cycle.reminder_status == "PENDING":
+        cycle.reminder_status = "NOT_REQUIRED"
+    cycle.metadata_json = {
+        **(cycle.metadata_json or {}),
+        "manual_web_source_ref": request.source_ref.strip(),
+        "manual_web_confirmed_by": actor,
+        "price_rows": len(prepared),
+        "inventory_confirmed_products": len(prepared),
+    }
+    session.add_all(
+        [
+            AuditEvent(
+                actor=actor,
+                event_type="commercial.price_replaced",
+                data={
+                    "cycle_id": cycle.id,
+                    "scope": cycle.scope,
+                    "source_hash": source_hash,
+                    "source_system": "manual_web",
+                    "source_ref": request.source_ref.strip(),
+                    "deactivated_policies": len(active_policy_ids),
+                    "new_policies": len(prepared),
+                },
+            ),
+            AuditEvent(
+                actor=actor,
+                event_type="commercial.inventory_updated",
+                data={
+                    "cycle_id": cycle.id,
+                    "complete": True,
+                    "confirmed_products": len(prepared),
+                    "expected_products": len(prepared),
+                    "source_system": "manual_web",
+                    "price_source_ref": source_hash,
+                },
+            ),
+        ]
+    )
+    await session.execute(
+        update(Job)
+        .where(
+            Job.status == JobStatus.PENDING,
+            Job.last_error.like("DEFERRED: commercial%"),
+        )
+        .values(available_at=now, updated_at=now)
+    )
+    await session.commit()
+    return await _commercial_editor_payload(session, settings, cycle)
 
 
 @router.get("/admin/commercial/current")
