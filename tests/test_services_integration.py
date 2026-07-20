@@ -33,6 +33,8 @@ from app.db import (
     Outbox,
     Product,
     Quote,
+    ReactivationCampaign,
+    ReactivationRecipient,
     SalesCase,
 )
 from app.deliverability import MXResult, MXStatus
@@ -820,6 +822,185 @@ async def test_unmatched_reply_headers_do_not_fall_back_to_subject(db_session: A
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
     assert handoff.extracted_facts["in_reply_to"] == "<unknown-message@example.com>"
+
+
+async def test_reply_to_case_less_reactivation_can_create_product_case(
+    db_session: AsyncSession,
+) -> None:
+    ids = await seed_demo_data(db_session)
+    parent = Outbox(
+        case_id=None,
+        quote_id=None,
+        message_kind="REACTIVATION",
+        business_key="reactivation:test:case-less",
+        message_id="<case-less-reactivation@example.com>",
+        recipient="internal@example.com",
+        raw_message="From: sales-agent@example.com\nTo: internal@example.com\n\nChecking in",
+        status=DeliveryStatus.SENT,
+        sent_at=datetime.now(UTC) - timedelta(minutes=5),
+        sent_via="smtp",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    campaign = ReactivationCampaign(
+        name="Case-less reply test",
+        status="RUNNING",
+        subject_template="Checking in",
+        body_template="Hello",
+        start_date=date.today(),
+        created_by="test",
+    )
+    db_session.add(campaign)
+    await db_session.flush()
+    recipient = ReactivationRecipient(
+        campaign_id=campaign.id,
+        customer_id=ids["customer_id"],
+        contact_id=ids["contact_id"],
+        outbox_id=parent.id,
+        status="SENT",
+        eligible=True,
+        selected=True,
+        sent_at=parent.sent_at,
+    )
+    outbound_email = EmailMessage(
+        case_id=None,
+        customer_id=ids["customer_id"],
+        contact_id=ids["contact_id"],
+        direction="OUTBOUND",
+        message_id=parent.message_id,
+        from_address="sales-agent@example.com",
+        to_addresses=[parent.recipient],
+        subject="Checking in from Lanya Chem",
+        body_text="Checking in",
+        raw_sha256="c" * 64,
+        received_at=parent.sent_at,
+    )
+    db_session.add_all([recipient, outbound_email])
+    await db_session.commit()
+
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Checking in from Lanya Chem"
+    message["Message-ID"] = "<case-less-reactivation-reply@example.com>"
+    message["In-Reply-To"] = parent.message_id
+    message["References"] = parent.message_id
+    message.set_content(
+        "Please quote PRODUCT WIDGET-100 quantity 100 kg.\n\n"
+        "On Monday, sales-agent@example.com wrote:\nChecking in about our products."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is not None
+    sales_case = await db_session.get(SalesCase, email_row.case_id)
+    assert sales_case is not None
+    assert sales_case.customer_id == ids["customer_id"]
+    assert sales_case.contact_id == ids["contact_id"]
+    assert sales_case.product_id == ids["product_id"]
+    await db_session.refresh(parent)
+    await db_session.refresh(recipient)
+    await db_session.refresh(outbound_email)
+    assert parent.case_id == sales_case.id
+    assert recipient.case_id == sales_case.id
+    assert recipient.status == "REPLIED"
+    assert outbound_email.case_id == sales_case.id
+    assert await db_session.scalar(
+        select(func.count()).select_from(Handoff).where(Handoff.source_email_id == email_row.id)
+    ) == 0
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.case_id == sales_case.id,
+            AuditEvent.event_type == "case.created_from_new_inquiry",
+        )
+    )
+    assert audit_event is not None
+    assert audit_event.data["new_thread"] is False
+    assert audit_event.data["reactivation_outbox_id"] == parent.id
+
+    second = MIMEMessage()
+    second["From"] = "internal@example.com"
+    second["To"] = "sales-agent@example.com"
+    second["Subject"] = "Re: Checking in from Lanya Chem"
+    second["Message-ID"] = "<case-less-reactivation-second-reply@example.com>"
+    second["In-Reply-To"] = parent.message_id
+    second["References"] = parent.message_id
+    second.set_content("Please quote PRODUCT WIDGET-100 quantity 200 kg.")
+    second_row = await ingest_raw_email(
+        db_session,
+        second.as_bytes(),
+        mailbox="integration-test",
+    )
+    assert second_row is not None and second_row.case_id == sales_case.id
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 1
+
+
+async def test_case_less_reactivation_reply_with_prior_terms_requires_human_review(
+    db_session: AsyncSession,
+) -> None:
+    ids = await seed_demo_data(db_session)
+    sent_at = datetime.now(UTC) - timedelta(minutes=5)
+    parent = Outbox(
+        case_id=None,
+        quote_id=None,
+        message_kind="REACTIVATION",
+        business_key="reactivation:test:prior-terms",
+        message_id="<case-less-prior-terms@example.com>",
+        recipient="internal@example.com",
+        raw_message="From: sales-agent@example.com\nTo: internal@example.com\n\nChecking in",
+        status=DeliveryStatus.SENT,
+        sent_at=sent_at,
+        sent_via="smtp",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    campaign = ReactivationCampaign(
+        name="Prior terms safety test",
+        status="RUNNING",
+        subject_template="Checking in",
+        body_template="Hello",
+        start_date=date.today(),
+        created_by="test",
+    )
+    db_session.add(campaign)
+    await db_session.flush()
+    recipient = ReactivationRecipient(
+        campaign_id=campaign.id,
+        customer_id=ids["customer_id"],
+        contact_id=ids["contact_id"],
+        outbox_id=parent.id,
+        status="SENT",
+        eligible=True,
+        selected=True,
+        sent_at=sent_at,
+    )
+    db_session.add(recipient)
+    await db_session.commit()
+
+    message = MIMEMessage()
+    message["From"] = "internal@example.com"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Checking in"
+    message["Message-ID"] = "<case-less-prior-terms-reply@example.com>"
+    message["In-Reply-To"] = parent.message_id
+    message["References"] = parent.message_id
+    message.set_content(
+        "Please quote PRODUCT WIDGET-100 quantity 100 kg, same as before."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert handoff.extracted_facts["prior_context_marker"] == "same as before"
+    assert handoff.extracted_facts["reactivation_outbox_id"] == parent.id
+    await db_session.refresh(recipient)
+    assert recipient.status == "REPLIED"
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 0
 
 
 async def test_counteroffer_hands_off_without_changing_quote(

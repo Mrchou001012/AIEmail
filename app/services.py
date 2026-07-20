@@ -11,7 +11,7 @@ from email.utils import parseaddr
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy import case as sa_case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +50,7 @@ from app.db import (
     PricePolicy,
     Product,
     Quote,
+    ReactivationRecipient,
     SalesCase,
 )
 from app.deliverability import MXResult, MXStatus, lookup_mx, validate_address_format
@@ -113,6 +114,12 @@ class NewInquiryResolution:
     reason: HandoffReason | None = None
     summary: str | None = None
     facts: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class CaseLessReactivationParent:
+    outbox: Outbox
+    recipient: ReactivationRecipient
 
 
 class JobDeferred(RuntimeError):
@@ -1298,13 +1305,23 @@ def _prior_thread_marker(text: str) -> str | None:
 async def _resolve_new_inquiry_case(
     session: AsyncSession,
     parsed: ParsedEmail,
+    *,
+    trusted_reactivation_parent: CaseLessReactivationParent | None = None,
 ) -> NewInquiryResolution:
     sender = parsed.from_address.strip().lower()
     facts: dict[str, Any] = {
-        "new_thread": True,
+        "new_thread": trusted_reactivation_parent is None,
         "sender": sender,
         "subject": parsed.subject,
     }
+    if trusted_reactivation_parent is not None:
+        facts.update(
+            {
+                "reactivation_outbox_id": trusted_reactivation_parent.outbox.id,
+                "reactivation_recipient_id": trusted_reactivation_parent.recipient.id,
+                "match_basis": "exact_case_less_reactivation_thread",
+            }
+        )
     if not sender:
         return NewInquiryResolution(
             None,
@@ -1515,6 +1532,50 @@ async def _resolve_new_inquiry_case(
     )
 
 
+async def _case_less_reactivation_parent(
+    session: AsyncSession,
+    parsed: ParsedEmail,
+) -> CaseLessReactivationParent | None:
+    """Find a verified case-less reactivation message referenced by this reply."""
+
+    sender = parsed.from_address.strip().casefold()
+    ordered_ids = list(dict.fromkeys(item for item in parsed.references if item))
+    if parsed.in_reply_to:
+        ordered_ids = [parsed.in_reply_to]
+    else:
+        ordered_ids.reverse()
+    if not sender or not ordered_ids:
+        return None
+    occurred_at = parsed.occurred_at or datetime.now(UTC)
+    rows = (
+        await session.execute(
+            select(Outbox, ReactivationRecipient, Contact)
+                .join(ReactivationRecipient, ReactivationRecipient.outbox_id == Outbox.id)
+                .join(Contact, Contact.id == ReactivationRecipient.contact_id)
+                .where(
+                    Outbox.message_id.in_(ordered_ids),
+                    Outbox.case_id.is_(None),
+                    Outbox.message_kind == "REACTIVATION",
+                    Outbox.status == DeliveryStatus.SENT,
+                    Outbox.sent_at.is_not(None),
+                    Outbox.sent_at <= occurred_at,
+                    ReactivationRecipient.status.in_(["QUEUED", "SENT"]),
+                    ReactivationRecipient.customer_id == Contact.customer_id,
+                )
+                .with_for_update()
+        )
+    ).all()
+    matches = [
+        CaseLessReactivationParent(outbox=outbox, recipient=recipient)
+        for outbox, recipient, contact in rows
+        if outbox.recipient.strip().casefold() == sender
+        and contact.email.strip().casefold() == sender
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 async def ingest_raw_email(
     session: AsyncSession,
     raw: bytes,
@@ -1571,24 +1632,69 @@ async def ingest_raw_email(
         allow_subject_fallback=not live_human_inbound,
     )
     new_inquiry = NewInquiryResolution(case)
+    reactivation_parent: CaseLessReactivationParent | None = None
     if live_human_inbound and case is None and not ambiguous:
         has_thread_headers = bool(parsed.in_reply_to or parsed.references)
         if has_thread_headers:
-            new_inquiry = NewInquiryResolution(
-                None,
-                HandoffReason.THREAD_AMBIGUOUS,
-                "Inbound reply contains thread references that do not match a known case",
-                {
-                    "new_thread": False,
-                    "sender": parsed.from_address,
-                    "subject": parsed.subject,
-                    "in_reply_to": parsed.in_reply_to,
-                    "references": parsed.references,
-                },
-            )
+            reactivation_parent = await _case_less_reactivation_parent(session, parsed)
+            if reactivation_parent is not None:
+                new_inquiry = await _resolve_new_inquiry_case(
+                    session,
+                    parsed,
+                    trusted_reactivation_parent=reactivation_parent,
+                )
+                case = new_inquiry.case
+            else:
+                # A concurrent first reply can promote a case-less reactivation
+                # while this transaction waits for the parent row lock. Re-run
+                # the authoritative header match once before escalating.
+                case, ambiguous = await match_case(
+                    session,
+                    parsed,
+                    direction=direction,
+                    allow_subject_fallback=False,
+                )
+                if case is not None:
+                    new_inquiry = NewInquiryResolution(case)
+                else:
+                    new_inquiry = NewInquiryResolution(
+                        None,
+                        HandoffReason.THREAD_AMBIGUOUS,
+                        "Inbound reply contains thread references that do not match a known case",
+                        {
+                            "new_thread": False,
+                            "sender": parsed.from_address,
+                            "subject": parsed.subject,
+                            "in_reply_to": parsed.in_reply_to,
+                            "references": parsed.references,
+                        },
+                    )
         else:
             new_inquiry = await _resolve_new_inquiry_case(session, parsed)
             case = new_inquiry.case
+    if reactivation_parent is not None and case is not None:
+        reactivation_parent.outbox.case_id = case.id
+        reactivation_parent.recipient.case_id = case.id
+        await session.execute(
+            update(EmailMessage)
+            .where(
+                EmailMessage.message_id == reactivation_parent.outbox.message_id,
+                EmailMessage.direction == "OUTBOUND",
+                EmailMessage.case_id.is_(None),
+            )
+            .values(case_id=case.id)
+        )
+        session.add(
+            AuditEvent(
+                case_id=case.id,
+                actor="thread_resolver",
+                event_type="reactivation.thread_promoted",
+                data={
+                    "outbox_id": reactivation_parent.outbox.id,
+                    "recipient_id": reactivation_parent.recipient.id,
+                },
+            )
+        )
     matched_outbox = None
     if bounce and bounce.is_bounce and bounce.original_message_id:
         matched_outbox = await session.scalar(
@@ -1700,6 +1806,13 @@ async def ingest_raw_email(
             case_id=new_inquiry.case.id,
             actor="thread_resolver",
             data=new_inquiry.facts,
+        )
+    if direction == "INBOUND" and not is_history and reactivation_parent is not None:
+        await record_reactivation_reply(
+            session,
+            row,
+            recipient_id=reactivation_parent.recipient.id,
+            commit=False,
         )
     await session.commit()
     if direction == "INBOUND" and not is_history:
