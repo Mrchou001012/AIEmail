@@ -50,6 +50,35 @@ def test_generic_auto_submitted_message_is_recorded() -> None:
     assert result.reply_type == AutomatedReplyType.GENERIC_AUTOREPLY
 
 
+def test_google_account_security_alert_is_a_system_notification() -> None:
+    result = classify_automated_reply(
+        subject="Security alert",
+        body="We noticed a new sign-in to your Google Account on an Apple iPhone 17 device.",
+        sender="no-reply@accounts.google.com",
+    )
+
+    assert result.reply_type == AutomatedReplyType.SYSTEM_NOTIFICATION
+    assert result.confidence == 1.0
+    assert result.detected_by == (
+        "sender:system-notification:no-reply@accounts.google.com",
+    )
+
+
+def test_google_account_rule_does_not_blanket_filter_other_senders() -> None:
+    for sender in (
+        "buyer@google.com",
+        "no-reply@accounts.google.com.evil.example",
+        "buyer@example.com",
+    ):
+        result = classify_automated_reply(
+            subject="Security alert",
+            body="Please quote YAC-TES 600 kg. This order is security critical.",
+            sender=sender,
+        )
+
+        assert result.reply_type is None
+
+
 def test_normal_customer_message_is_not_treated_as_automatic() -> None:
     result = classify_automated_reply(
         subject="Re: quotation",

@@ -1268,6 +1268,23 @@ async def _ensure_inbound_follow_up(
             f"process-inbound:{row.id}",
         )
         return
+    if row.automated_reply_type == AutomatedReplyType.SYSTEM_NOTIFICATION.value:
+        if row.automated_reply_handled_at is None:
+            row.automated_reply_handled_at = datetime.now(UTC)
+            await audit(
+                session,
+                "inbound.system_notification_ignored",
+                case_id=row.case_id,
+                actor="system",
+                data={
+                    "email_id": row.id,
+                    "sender": row.from_address,
+                    "subject": row.subject,
+                    **(row.automated_reply_metadata or {}),
+                },
+            )
+            await session.commit()
+        return
     if row.case_id is not None:
         await enqueue_job(
             session,
@@ -1622,15 +1639,24 @@ async def ingest_raw_email(
         and not (bounce and bounce.is_bounce)
         and not (automated_reply and automated_reply.is_automated)
     )
-    case, ambiguous = await match_case(
-        session,
-        parsed,
-        direction=direction,
-        # A live human-authored message may inherit commercial history only
-        # through Message-ID/References. Subject-only matching is retained for
-        # history reconciliation, outbound mail, and non-sending auto replies.
-        allow_subject_fallback=not live_human_inbound,
+    is_system_notification = bool(
+        automated_reply
+        and automated_reply.reply_type is AutomatedReplyType.SYSTEM_NOTIFICATION
     )
+    if is_system_notification:
+        # Trusted infrastructure notifications are mailbox records, not sales
+        # participants. Never attach them to a coincidentally similar thread.
+        case, ambiguous = None, False
+    else:
+        case, ambiguous = await match_case(
+            session,
+            parsed,
+            direction=direction,
+            # A live human-authored message may inherit commercial history only
+            # through Message-ID/References. Subject-only matching is retained for
+            # history reconciliation, outbound mail, and non-sending auto replies.
+            allow_subject_fallback=not live_human_inbound,
+        )
     new_inquiry = NewInquiryResolution(case)
     reactivation_parent: CaseLessReactivationParent | None = None
     if live_human_inbound and case is None and not ambiguous:
@@ -1710,7 +1736,7 @@ async def ingest_raw_email(
     if matched_outbox is not None:
         bounce_metadata["matched_outbox_id"] = matched_outbox.id
     identity_contact = None
-    if case is None:
+    if case is None and not is_system_notification:
         identity_addresses = (
             [parsed.from_address] if direction == "INBOUND" else parsed.to_addresses
         )
@@ -1946,6 +1972,7 @@ async def _handle_automated_reply(
     if reply_type in {
         AutomatedReplyType.OUT_OF_OFFICE.value,
         AutomatedReplyType.GENERIC_AUTOREPLY.value,
+        AutomatedReplyType.SYSTEM_NOTIFICATION.value,
     }:
         await audit(
             session,

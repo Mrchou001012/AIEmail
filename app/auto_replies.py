@@ -8,6 +8,7 @@ class AutomatedReplyType(StrEnum):
     DEPARTED = "DEPARTED"
     CONTACT_CHANGE = "CONTACT_CHANGE"
     GENERIC_AUTOREPLY = "GENERIC_AUTOREPLY"
+    SYSTEM_NOTIFICATION = "SYSTEM_NOTIFICATION"
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,15 @@ RETURN_HINT_PATTERNS = (
 
 EMAIL_PATTERN = re.compile(r"(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63})(?![\w-])", re.I)
 
+# Exact infrastructure senders that can never represent a human sales contact.
+# Keep this deliberately narrow: blocking an entire provider domain such as
+# google.com could hide a legitimate inquiry from an employee of that company.
+SYSTEM_NOTIFICATION_SENDERS = frozenset(
+    {
+        "no-reply@accounts.google.com",
+    }
+)
+
 
 def _matches(patterns: tuple[str, ...], value: str) -> bool:
     return any(re.search(pattern, value, re.I | re.S) for pattern in patterns)
@@ -136,6 +146,13 @@ def classify_automated_reply(
     sender: str | None = None,
 ) -> AutomatedReplyClassification:
     normalized_headers = {str(key).casefold(): str(value) for key, value in (headers or {}).items()}
+    normalized_sender = (sender or "").strip().casefold()
+    if normalized_sender in SYSTEM_NOTIFICATION_SENDERS:
+        return AutomatedReplyClassification(
+            AutomatedReplyType.SYSTEM_NOTIFICATION,
+            1.0,
+            (f"sender:system-notification:{normalized_sender}",),
+        )
     auto_header, detected_by = _auto_header_signal(normalized_headers)
     subject_signal = _matches(AUTO_SUBJECT_PATTERNS, subject)
     if subject_signal:

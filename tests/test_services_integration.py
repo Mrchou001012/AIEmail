@@ -1652,6 +1652,40 @@ async def test_out_of_office_reply_is_recorded_and_silently_handled(db_session: 
     ) == 1
 
 
+async def test_google_security_notification_is_archived_without_sales_workflow(
+    db_session: AsyncSession,
+) -> None:
+    message = MIMEMessage()
+    message["From"] = "Google <no-reply@accounts.google.com>"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Security alert"
+    message["Message-ID"] = "<google-security-alert@accounts.google.com>"
+    message.set_content(
+        "We noticed a new sign-in to your Google Account on an Apple iPhone 17 device."
+    )
+
+    email_row = await ingest_raw_email(db_session, message.as_bytes(), mailbox="integration-test")
+
+    assert email_row is not None
+    assert email_row.case_id is None
+    assert email_row.customer_id is None
+    assert email_row.contact_id is None
+    assert email_row.is_automated_reply is True
+    assert email_row.automated_reply_type == AutomatedReplyType.SYSTEM_NOTIFICATION.value
+    assert email_row.automated_reply_handled_at is not None
+    assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 0
+    assert await db_session.scalar(
+        select(func.count()).select_from(Handoff).where(Handoff.source_email_id == email_row.id)
+    ) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Job)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(AuditEvent.event_type == "inbound.system_notification_ignored")
+    ) == 1
+
+
 async def test_departed_contact_is_suppressed_and_handed_off(db_session: AsyncSession) -> None:
     case = await _seed_case(db_session, with_quote=True)
     message = MIMEMessage()
