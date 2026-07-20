@@ -8,7 +8,7 @@ from email.utils import parseaddr
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -26,6 +26,7 @@ from app.db import (
     JobStatus,
     Outbox,
     Product,
+    Quote,
     ReactivationCampaign,
     ReactivationRecipient,
     SalesCase,
@@ -48,9 +49,18 @@ CAMPAIGN_STATUSES = frozenset({"DRAFT", "RUNNING", "PAUSED", "COMPLETED", "CANCE
 REPLY_FILTERS = frozenset({"ANY", "NEVER_REPLIED", "PREVIOUSLY_REPLIED"})
 SELECTABLE_STATUSES = frozenset({"CANDIDATE", "SELECTED"})
 TERMINAL_RECIPIENT_STATUSES = frozenset({"SENT", "REPLIED", "SKIPPED", "FAILED", "EXCLUDED"})
-BLOCKING_CASE_STATUSES = frozenset(
-    {CaseStatus.ACTIVE, CaseStatus.WAITING_HUMAN, CaseStatus.HUMAN_TAKEOVER}
+HUMAN_CONTROLLED_CASE_STATUSES = frozenset(
+    {CaseStatus.WAITING_HUMAN, CaseStatus.HUMAN_TAKEOVER}
 )
+OPEN_DELIVERY_STATUSES = frozenset(
+    {
+        DeliveryStatus.PENDING,
+        DeliveryStatus.CLAIMED,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.UNKNOWN,
+    }
+)
+CLOSED_CASE_STATUSES = frozenset({CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST})
 INVALID_MX_STATUSES = frozenset(
     {MXStatus.NO_DOMAIN.value, MXStatus.NO_MX.value, MXStatus.NULL_MX.value}
 )
@@ -118,6 +128,79 @@ def _body_html(value: str) -> str:
 def _latest(first: datetime | None, second: datetime | None) -> datetime | None:
     values = [item for item in (first, second) if item is not None]
     return max(values) if values else None
+
+
+async def _contact_workflow_block_reason(
+    session: AsyncSession,
+    contact_id: int,
+    *,
+    at: datetime,
+    exclude_outbox_id: int | None = None,
+) -> str | None:
+    case_rows = (
+        (
+            await session.execute(
+                select(SalesCase).where(
+                    SalesCase.contact_id == contact_id,
+                    SalesCase.status.not_in(CLOSED_CASE_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(row.status in HUMAN_CONTROLLED_CASE_STATUSES for row in case_rows):
+        return "HUMAN_CONTROLLED_CASE"
+    case_ids = [row.id for row in case_rows]
+    open_handoff = await session.scalar(
+        select(Handoff.id)
+        .outerjoin(SalesCase, Handoff.case_id == SalesCase.id)
+        .outerjoin(EmailMessage, Handoff.source_email_id == EmailMessage.id)
+        .where(
+            Handoff.status == "OPEN",
+            or_(SalesCase.contact_id == contact_id, EmailMessage.contact_id == contact_id),
+        )
+        .limit(1)
+    )
+    if open_handoff is not None:
+        return "OPEN_HUMAN_HANDOFF"
+    if not case_ids:
+        return None
+    pending_outbox_query = select(Outbox.id).where(
+        Outbox.case_id.in_(case_ids),
+        Outbox.status.in_(OPEN_DELIVERY_STATUSES),
+    )
+    if exclude_outbox_id is not None:
+        pending_outbox_query = pending_outbox_query.where(Outbox.id != exclude_outbox_id)
+    if await session.scalar(pending_outbox_query.limit(1)) is not None:
+        return "IN_FLIGHT_OUTBOX"
+    valid_quote = await session.scalar(
+        select(Quote.id)
+        .where(Quote.case_id.in_(case_ids), Quote.valid_until >= at.date())
+        .limit(1)
+    )
+    if valid_quote is not None:
+        return "ACTIVE_QUOTE"
+    active_jobs = (
+        (
+            await session.execute(
+                select(Job).where(
+                    Job.kind == "case_outreach",
+                    Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for job in active_jobs:
+        try:
+            job_case_id = int((job.payload or {}).get("case_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if job_case_id in case_ids:
+            return "PENDING_CASE_JOB"
+    return None
 
 
 def _next_weekday(value: date) -> date:
@@ -242,11 +325,8 @@ async def scan_campaign_candidates(
         cases_by_contact[sales_case.contact_id].append((sales_case, product))
 
     previous_by_contact: dict[int, list[ReactivationRecipient]] = defaultdict(list)
-    campaign_case_status: dict[int, str] = {}
     for row in previous_rows:
         previous_by_contact[row.contact_id].append(row)
-        if row.case_id is not None:
-            campaign_case_status[row.case_id] = row.status
 
     open_handoff_contacts = set(
         (
@@ -267,6 +347,77 @@ async def scan_campaign_candidates(
         ).scalars()
     )
     address_by_email = {row.email.strip().casefold(): row for row in address_rows}
+    contact_ids_by_email: dict[str, list[int]] = defaultdict(list)
+    for contact in contacts:
+        contact_ids_by_email[contact.email.strip().casefold()].append(contact.id)
+    duplicate_contact_emails = {
+        email for email, contact_ids in contact_ids_by_email.items() if len(contact_ids) > 1
+    }
+    case_contact_by_id = {
+        sales_case.id: sales_case.contact_id
+        for sales_case, _ in case_rows
+        if sales_case.status not in CLOSED_CASE_STATUSES
+    }
+    human_controlled_contacts = {
+        sales_case.contact_id
+        for sales_case, _ in case_rows
+        if sales_case.status in HUMAN_CONTROLLED_CASE_STATUSES
+    }
+    recent_delivery_cutoff = observed_at - timedelta(days=campaign.min_inactive_days)
+    operationally_active_contacts: set[int] = set()
+    if case_contact_by_id:
+        delivery_rows = (
+            await session.execute(
+                select(
+                    Outbox.case_id,
+                    Outbox.status,
+                    Outbox.sent_at,
+                    Outbox.message_kind,
+                ).where(Outbox.case_id.in_(case_contact_by_id))
+            )
+        ).all()
+        for case_id, status, sent_at, message_kind in delivery_rows:
+            if status in OPEN_DELIVERY_STATUSES or (
+                status == DeliveryStatus.SENT
+                and message_kind != "REACTIVATION"
+                and sent_at is not None
+                and sent_at >= recent_delivery_cutoff
+            ):
+                operationally_active_contacts.add(case_contact_by_id[case_id])
+        valid_quote_case_ids = (
+            (
+                await session.execute(
+                    select(Quote.case_id).where(
+                        Quote.case_id.in_(case_contact_by_id),
+                        Quote.valid_until >= observed_at.date(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        operationally_active_contacts.update(
+            case_contact_by_id[case_id] for case_id in valid_quote_case_ids
+        )
+        active_jobs = (
+            (
+                await session.execute(
+                    select(Job).where(
+                        Job.kind == "case_outreach",
+                        Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for job in active_jobs:
+            try:
+                case_id = int((job.payload or {}).get("case_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if case_id in case_contact_by_id:
+                operationally_active_contacts.add(case_contact_by_id[case_id])
 
     await session.execute(
         delete(ReactivationRecipient).where(ReactivationRecipient.campaign_id == campaign.id)
@@ -278,9 +429,14 @@ async def scan_campaign_candidates(
         activity = activities[contact.id]
         last_inbound = activity["last_inbound"]
         last_outbound = activity["last_outbound"]
-        last_contact = _latest(last_inbound, last_outbound)
+        mailbox_last_contact = _latest(last_inbound, last_outbound)
+        last_contact = _latest(mailbox_last_contact, contact.last_contact_at)
         latest_direction = None
-        if last_contact is not None:
+        if contact.last_contact_at is not None and (
+            mailbox_last_contact is None or contact.last_contact_at > mailbox_last_contact
+        ):
+            latest_direction = "IMPORTED"
+        elif last_contact is not None:
             latest_direction = "OUTBOUND" if last_outbound == last_contact else "INBOUND"
         contact_cases = cases_by_contact.get(contact.id, [])
         unique_products = {product.id: product for _, product in contact_cases}
@@ -290,13 +446,6 @@ async def scan_campaign_candidates(
         prior_sent_at = max((row.sent_at for row in prior if row.sent_at), default=None)
         address_status = address_by_email.get(contact.email.strip().casefold())
         formatted = validate_address_format(contact.email)
-        blocking_cases = [
-            sales_case
-            for sales_case, _ in contact_cases
-            if sales_case.status in BLOCKING_CASE_STATUSES
-            and campaign_case_status.get(sales_case.id) != "SENT"
-        ]
-
         reason: str | None = None
         if customer.do_not_contact:
             reason = "DO_NOT_CONTACT"
@@ -304,6 +453,8 @@ async def scan_campaign_candidates(
             reason = "CONTACT_SUPPRESSED"
         elif not formatted.valid:
             reason = "INVALID_EMAIL_FORMAT"
+        elif contact.email.strip().casefold() in duplicate_contact_emails:
+            reason = "DUPLICATE_EMAIL_CONTACT"
         elif address_status and address_status.suppressed:
             reason = "ADDRESS_SUPPRESSED"
         elif address_status and address_status.last_bounce_type == "HARD":
@@ -318,17 +469,17 @@ async def scan_campaign_candidates(
             reason = "NEVER_CONTACTED"
         elif contact.id in open_handoff_contacts:
             reason = "OPEN_HUMAN_HANDOFF"
-        elif blocking_cases:
+        elif contact.id in human_controlled_contacts:
+            reason = "HUMAN_CONTROLLED_CASE"
+        elif contact.id in operationally_active_contacts:
             reason = "ACTIVE_CONVERSATION"
-        elif not unique_products:
-            reason = "NO_PRODUCT_CONTEXT"
-        elif len(unique_products) > 1:
-            reason = "MULTIPLE_PRODUCT_CONTEXTS"
         elif len(prior) >= campaign.max_reactivations:
             reason = "MAX_REACTIVATIONS_REACHED"
         elif prior_sent_at and last_inbound and last_inbound > prior_sent_at:
             reason = "REPLIED_AFTER_REACTIVATION"
         elif prior_sent_at and last_outbound and last_outbound > prior_sent_at + timedelta(minutes=1):
+            reason = "CONTACTED_AFTER_REACTIVATION"
+        elif prior_sent_at and contact.last_contact_at and contact.last_contact_at > prior_sent_at:
             reason = "CONTACTED_AFTER_REACTIVATION"
         elif prior_sent_at and observed_at < prior_sent_at + timedelta(days=campaign.second_reactivation_days):
             reason = "SECOND_REACTIVATION_WAIT"
@@ -368,6 +519,13 @@ async def scan_campaign_candidates(
                     "source_case_id": source_case.id if source_case else None,
                     "product_code": source_product.code if source_product else None,
                     "product_name": source_product.name if source_product else None,
+                    "product_context_count": len(unique_products),
+                    "contact_first_contact_at": (
+                        contact.first_contact_at.isoformat() if contact.first_contact_at else None
+                    ),
+                    "contact_last_contact_at": (
+                        contact.last_contact_at.isoformat() if contact.last_contact_at else None
+                    ),
                     "address_preflight_status": (
                         address_status.preflight_status if address_status else None
                     ),
@@ -549,6 +707,11 @@ async def _queue_recipient(
         return True
     customer = contact.customer
     address_status = await session.get(EmailAddressStatus, contact.email.strip().casefold())
+    workflow_reason = await _contact_workflow_block_reason(
+        session,
+        contact.id,
+        at=at,
+    )
     activity_after_selection = await session.scalar(
         select(EmailMessage.id)
         .where(
@@ -557,6 +720,13 @@ async def _queue_recipient(
         )
         .limit(1)
     )
+    imported_activity_after_selection = bool(
+        contact.last_contact_at is not None
+        and (
+            recipient.last_contact_at is None
+            or contact.last_contact_at > recipient.last_contact_at
+        )
+    )
     reason = None
     if customer.do_not_contact:
         reason = "DO_NOT_CONTACT"
@@ -564,7 +734,9 @@ async def _queue_recipient(
         reason = "CONTACT_SUPPRESSED"
     elif not customer.auto_send_allowed:
         reason = "AUTO_SEND_NOT_ALLOWED"
-    elif activity_after_selection is not None:
+    elif workflow_reason is not None:
+        reason = workflow_reason
+    elif activity_after_selection is not None or imported_activity_after_selection:
         reason = "ACTIVITY_AFTER_SELECTION"
     if reason:
         recipient.status = "SKIPPED"
@@ -573,13 +745,8 @@ async def _queue_recipient(
         return True
 
     source_case = await session.get(SalesCase, recipient.case_id) if recipient.case_id else None
-    if source_case is None:
-        recipient.status = "SKIPPED"
-        recipient.exclusion_reason = "NO_PRODUCT_CONTEXT"
-        await session.commit()
-        return True
-    product = await session.get(Product, source_case.product_id)
-    if product is None or not product.active:
+    product = await session.get(Product, source_case.product_id) if source_case else None
+    if source_case is not None and (product is None or not product.active):
         recipient.status = "SKIPPED"
         recipient.exclusion_reason = "PRODUCT_UNAVAILABLE"
         await session.commit()
@@ -589,8 +756,8 @@ async def _queue_recipient(
     fields = {
         "contact_name": contact.name or "Sir/Madam",
         "company_name": customer.company_name,
-        "product_code": product.code,
-        "product_name": product.name,
+        "product_code": product.code if product else "our products",
+        "product_name": product.name if product else "our product range",
         "last_contact_date": recipient.last_contact_at.date().isoformat() if recipient.last_contact_at else "",
     }
     subject = _render_template(campaign.subject_template, fields).strip()[:998]
@@ -615,7 +782,8 @@ async def _queue_recipient(
             .limit(1)
         )
     ).first()
-    if prior_result is not None and prior_result[0].case_id == source_case.id:
+    source_case_id = source_case.id if source_case else None
+    if prior_result is not None and prior_result[0].case_id == source_case_id:
         # A second wake-up stays in the first wake-up thread. Preserve the
         # complete visible prior message (including inline signature images)
         # instead of creating a lookalike new conversation.
@@ -639,6 +807,10 @@ async def _queue_recipient(
         in_reply_to = prior_outbox.message_id
         references = [prior_outbox.message_id]
         target_case = source_case
+    elif source_case is None or product is None:
+        # Product context is intentionally optional for a general reconnect.
+        # The inbound reply classifier creates a case once the customer names a product.
+        target_case = None
     else:
         target_case = SalesCase(
             customer_id=customer.id,
@@ -665,7 +837,7 @@ async def _queue_recipient(
     )
     parsed = parse_mime(raw.encode("utf-8"))
     outbox = Outbox(
-        case_id=target_case.id,
+        case_id=target_case.id if target_case else None,
         quote_id=None,
         message_kind="REACTIVATION",
         business_key=stable_key,
@@ -679,7 +851,7 @@ async def _queue_recipient(
     await session.flush()
     session.add(
         EmailMessage(
-            case_id=target_case.id,
+            case_id=target_case.id if target_case else None,
             customer_id=customer.id,
             contact_id=contact.id,
             direction="OUTBOUND",
@@ -697,13 +869,16 @@ async def _queue_recipient(
             received_at=at,
         )
     )
-    recipient.case_id = target_case.id
+    recipient.case_id = target_case.id if target_case else None
     recipient.outbox_id = outbox.id
     recipient.status = "QUEUED"
-    recipient.snapshot_json = {**snapshot, "source_case_id": snapshot.get("source_case_id") or source_case.id}
+    recipient.snapshot_json = {
+        **snapshot,
+        "source_case_id": snapshot.get("source_case_id") or source_case_id,
+    }
     session.add(
         AuditEvent(
-            case_id=target_case.id,
+            case_id=target_case.id if target_case else None,
             actor="reactivation_scheduler",
             event_type="reactivation.outbox_frozen",
             data={
@@ -842,6 +1017,22 @@ async def reactivation_send_guard(
         recipient.status = "SKIPPED"
         recipient.exclusion_reason = "CONTACT_SUPPRESSED"
         return SendGuard("BLOCK", "reactivation contact is suppressed")
+    if contact.last_contact_at is not None and (
+        recipient.last_contact_at is None or contact.last_contact_at > recipient.last_contact_at
+    ):
+        recipient.status = "SKIPPED"
+        recipient.exclusion_reason = "ACTIVITY_AFTER_SELECTION"
+        return SendGuard("BLOCK", "contact activity changed after reactivation selection")
+    workflow_reason = await _contact_workflow_block_reason(
+        session,
+        contact.id,
+        at=observed_at,
+        exclude_outbox_id=outbox.id,
+    )
+    if workflow_reason is not None:
+        recipient.status = "SKIPPED"
+        recipient.exclusion_reason = workflow_reason
+        return SendGuard("BLOCK", f"contact workflow changed: {workflow_reason}")
     newer_inbound = await session.scalar(
         select(EmailMessage.id)
         .where(
@@ -894,7 +1085,13 @@ async def reactivation_send_guard(
     return SendGuard("ALLOW")
 
 
-async def record_reactivation_reply(session: AsyncSession, email_row: EmailMessage) -> bool:
+async def record_reactivation_reply(
+    session: AsyncSession,
+    email_row: EmailMessage,
+    *,
+    recipient_id: int | None = None,
+    commit: bool = True,
+) -> bool:
     if email_row.direction != "INBOUND" or email_row.is_bounce or email_row.is_automated_reply:
         return False
     contact_id = email_row.contact_id
@@ -904,17 +1101,31 @@ async def record_reactivation_reply(session: AsyncSession, email_row: EmailMessa
         )
     if contact_id is None:
         return False
-    sent = await session.scalar(
-        select(ReactivationRecipient)
-        .where(
-            ReactivationRecipient.contact_id == contact_id,
-            ReactivationRecipient.status == "SENT",
-            ReactivationRecipient.sent_at.is_not(None),
-            ReactivationRecipient.sent_at <= email_row.received_at,
+    if recipient_id is not None:
+        sent = await session.scalar(
+            select(ReactivationRecipient)
+            .where(
+                ReactivationRecipient.id == recipient_id,
+                ReactivationRecipient.contact_id == contact_id,
+                ReactivationRecipient.status.in_(["QUEUED", "SENT"]),
+            )
+            .with_for_update()
         )
-        .order_by(ReactivationRecipient.sent_at.desc(), ReactivationRecipient.id.desc())
-        .limit(1)
-    )
+        if sent is not None and sent.sent_at is None and sent.outbox_id is not None:
+            sent_outbox = await session.get(Outbox, sent.outbox_id)
+            sent.sent_at = sent_outbox.sent_at if sent_outbox else None
+    else:
+        sent = await session.scalar(
+            select(ReactivationRecipient)
+            .where(
+                ReactivationRecipient.contact_id == contact_id,
+                ReactivationRecipient.status == "SENT",
+                ReactivationRecipient.sent_at.is_not(None),
+                ReactivationRecipient.sent_at <= email_row.received_at,
+            )
+            .order_by(ReactivationRecipient.sent_at.desc(), ReactivationRecipient.id.desc())
+            .limit(1)
+        )
     if sent is None:
         return False
     sent.status = "REPLIED"
@@ -953,5 +1164,6 @@ async def record_reactivation_reply(session: AsyncSession, email_row: EmailMessa
             },
         )
     )
-    await session.commit()
+    if commit:
+        await session.commit()
     return True

@@ -9,6 +9,7 @@ from app.db import (
     CaseStatus,
     Contact,
     Customer,
+    DeliveryStatus,
     EmailMessage,
     Outbox,
     Product,
@@ -20,6 +21,7 @@ from app.reactivation import (
     _schedule_slots,
     ensure_reactivation_dispatch,
     next_campaign_window,
+    reactivation_send_guard,
     scan_campaign_candidates,
     start_campaign,
     validate_template,
@@ -207,3 +209,254 @@ async def test_scan_excludes_suppressed_and_active_contacts(db_session) -> None:
     recipient = await db_session.scalar(select(ReactivationRecipient))
     assert recipient is not None
     assert recipient.exclusion_reason == "CONTACT_SUPPRESSED"
+
+
+@pytest.mark.integration
+async def test_excel_activity_allows_generic_reactivation_without_product(db_session) -> None:
+    india = ZoneInfo("Asia/Kolkata")
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=india).astimezone(UTC)
+    customer = Customer(
+        company_name="Imported Historical Buyer",
+        auto_send_allowed=True,
+        consent_basis="existing business relationship",
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Historical Buyer",
+        email="historical@example.com",
+        first_contact_at=observed_at - timedelta(days=900),
+        last_contact_at=observed_at - timedelta(days=500),
+    )
+    db_session.add(contact)
+    campaign = _campaign()
+    campaign.created_at = observed_at - timedelta(minutes=1)
+    db_session.add(campaign)
+    await db_session.flush()
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, campaign, at=observed_at)
+    assert result == {"eligible": 1, "excluded": 0, "total": 1}
+    recipient = await db_session.scalar(select(ReactivationRecipient))
+    assert recipient is not None
+    assert recipient.latest_direction == "IMPORTED"
+    assert recipient.case_id is None
+    recipient.selected = True
+    recipient.status = "SELECTED"
+    await db_session.commit()
+
+    assert await start_campaign(db_session, campaign, at=observed_at) == 1
+    assert recipient.scheduled_for is not None
+    assert await ensure_reactivation_dispatch(
+        db_session,
+        at=recipient.scheduled_for + timedelta(seconds=1),
+    )
+    await db_session.refresh(recipient)
+    outbox = await db_session.get(Outbox, recipient.outbox_id)
+    assert outbox is not None
+    assert outbox.case_id is None
+    assert "our product range" in outbox.raw_message
+
+    allowed = await reactivation_send_guard(
+        db_session,
+        outbox,
+        at=recipient.scheduled_for + timedelta(seconds=2),
+    )
+    assert allowed.action == "ALLOW"
+
+    contact.last_contact_at = observed_at
+    await db_session.commit()
+    guard = await reactivation_send_guard(db_session, outbox, at=observed_at)
+    assert guard.action == "BLOCK"
+    assert guard.reason == "contact activity changed after reactivation selection"
+    assert recipient.status == "SKIPPED"
+    assert recipient.exclusion_reason == "ACTIVITY_AFTER_SELECTION"
+
+
+@pytest.mark.integration
+async def test_imported_active_placeholder_case_does_not_block_old_contact(
+    db_session,
+) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    product = Product(
+        code="YAC-TES",
+        name="YAC-TES",
+        unit="kg",
+        approved_text_key="yac_tes",
+        active=True,
+    )
+    customer = Customer(
+        company_name="Imported Product Buyer",
+        auto_send_allowed=True,
+        consent_basis="existing business relationship",
+    )
+    db_session.add_all([product, customer])
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Buyer",
+        email="imported-placeholder@example.com",
+        last_contact_at=observed_at - timedelta(days=500),
+    )
+    db_session.add(contact)
+    await db_session.flush()
+    placeholder = SalesCase(
+        customer_id=customer.id,
+        contact_id=contact.id,
+        product_id=product.id,
+        currency="INR",
+        status=CaseStatus.ACTIVE,
+    )
+    db_session.add(placeholder)
+    campaign = _campaign()
+    db_session.add(campaign)
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, campaign, at=observed_at)
+
+    assert result == {"eligible": 1, "excluded": 0, "total": 1}
+    recipient = await db_session.scalar(select(ReactivationRecipient))
+    assert recipient is not None
+    assert recipient.eligible is True
+    assert recipient.case_id == placeholder.id
+
+
+@pytest.mark.integration
+async def test_duplicate_contact_email_is_not_eligible_for_bulk_send(db_session) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    customers = [
+        Customer(
+            company_name=f"Duplicate Buyer {index}",
+            auto_send_allowed=True,
+            consent_basis="existing business relationship",
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all(customers)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Contact(
+                customer_id=customer.id,
+                name=f"Buyer {index}",
+                email="duplicate@example.com",
+                last_contact_at=observed_at - timedelta(days=500),
+            )
+            for index, customer in enumerate(customers, start=1)
+        ]
+    )
+    campaign = _campaign()
+    db_session.add(campaign)
+    await db_session.flush()
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, campaign, at=observed_at)
+    assert result == {"eligible": 0, "excluded": 2, "total": 2}
+    recipients = (await db_session.execute(select(ReactivationRecipient))).scalars().all()
+    assert {row.exclusion_reason for row in recipients} == {"DUPLICATE_EMAIL_CONTACT"}
+
+
+@pytest.mark.integration
+async def test_crm_activity_after_previous_reactivation_blocks_second_wakeup(
+    db_session,
+) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    customer = Customer(
+        company_name="Recently Recontacted Buyer",
+        auto_send_allowed=True,
+        consent_basis="existing business relationship",
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Buyer",
+        email="crm-recontact@example.com",
+        last_contact_at=observed_at - timedelta(days=20),
+    )
+    db_session.add(contact)
+    previous_campaign = _campaign(name="Previous campaign", status="COMPLETED")
+    current_campaign = _campaign(name="Current campaign")
+    db_session.add_all([previous_campaign, current_campaign])
+    await db_session.flush()
+    db_session.add(
+        ReactivationRecipient(
+            campaign_id=previous_campaign.id,
+            customer_id=customer.id,
+            contact_id=contact.id,
+            status="SENT",
+            eligible=True,
+            selected=True,
+            sent_at=observed_at - timedelta(days=100),
+        )
+    )
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, current_campaign, at=observed_at)
+
+    assert result == {"eligible": 0, "excluded": 1, "total": 1}
+    recipient = await db_session.scalar(
+        select(ReactivationRecipient).where(
+            ReactivationRecipient.campaign_id == current_campaign.id
+        )
+    )
+    assert recipient is not None
+    assert recipient.exclusion_reason == "CONTACTED_AFTER_REACTIVATION"
+
+
+@pytest.mark.integration
+async def test_active_case_with_pending_delivery_is_not_reactivated(db_session) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    product = Product(
+        code="YAC-TES",
+        name="YAC-TES",
+        unit="kg",
+        approved_text_key="yac_tes",
+        active=True,
+    )
+    customer = Customer(
+        company_name="Active Buyer",
+        auto_send_allowed=True,
+        consent_basis="existing business relationship",
+    )
+    db_session.add_all([product, customer])
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Buyer",
+        email="active-delivery@example.com",
+        last_contact_at=observed_at - timedelta(days=500),
+    )
+    db_session.add(contact)
+    await db_session.flush()
+    sales_case = SalesCase(
+        customer_id=customer.id,
+        contact_id=contact.id,
+        product_id=product.id,
+        currency="INR",
+        status=CaseStatus.ACTIVE,
+    )
+    db_session.add(sales_case)
+    await db_session.flush()
+    db_session.add(
+        Outbox(
+            case_id=sales_case.id,
+            quote_id=None,
+            business_key="active-case-pending-delivery",
+            message_id="<active-case-pending-delivery@example.com>",
+            recipient=contact.email,
+            raw_message="pending",
+            status=DeliveryStatus.PENDING,
+        )
+    )
+    campaign = _campaign()
+    db_session.add(campaign)
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, campaign, at=observed_at)
+
+    assert result == {"eligible": 0, "excluded": 1, "total": 1}
+    recipient = await db_session.scalar(select(ReactivationRecipient))
+    assert recipient is not None
+    assert recipient.exclusion_reason == "ACTIVE_CONVERSATION"

@@ -260,12 +260,21 @@ it never sends mail. An administrator must explicitly select eligible contacts
 and start the batch before any outbox records are created.
 
 Candidate screening excludes do-not-contact customers, suppressed addresses,
-hard bounces, known invalid domains, incomplete contact authorization, contacts
-without historical correspondence, open human handoffs, active conversations,
-and ambiguous or missing product context. The page records the exact exclusion
-reason for every contact. It can filter contacts by whether they have ever sent
-a human reply and by the number of days since the latest genuine inbound or
-outbound message.
+hard bounces, known invalid domains, incomplete contact authorization, duplicate
+contact addresses, contacts without historical correspondence, and open human
+handoffs. The page records and summarizes the exact exclusion reason for every
+contact. It can filter contacts by whether they have ever sent a human reply and
+by the number of days since the latest activity.
+
+Activity is the newer of synchronized Gmail activity and the structured
+`Contact.last_contact_at` imported from CRM/customer spreadsheets. The customer
+template accepts `first_contact_at` and `last_contact_at` as ISO dates or
+datetimes and merges repeated imports conservatively (earliest first contact,
+latest last contact). Imported product cases by themselves are not treated as
+live conversations. Contacts without a unique product remain eligible for a
+general reconnect; `{product_code}` and `{product_name}` render as
+`our products` and `our product range`, and an actual case is created only after
+the customer replies with an identifiable product.
 
 The first reactivation defaults to 365 inactive days. A contact who did not
 reply may be considered for a second campaign after 90 days, up to two total
@@ -297,6 +306,20 @@ Each campaign stores an immutable copy, so later template changes cannot alter
 mail already reviewed and scheduled. Supported placeholders are
 `{contact_name}`, `{company_name}`, `{product_code}`, `{product_name}`, and
 `{last_contact_date}`.
+
+For databases created from the older nine-column India import workbook, deploy
+migration `0012` and backfill the structured dates from the original CRM file:
+
+```bash
+/opt/aiemail-env/bin/python scripts/import_contact_activity.py \
+  /path/to/印度客户_一年以上未联系_已过滤.xlsx
+
+/opt/aiemail-env/bin/python scripts/import_contact_activity.py \
+  /path/to/印度客户_一年以上未联系_已过滤.xlsx --apply
+```
+
+The first command is a read-only preview. After the apply run, use “重新筛选”
+on a draft campaign so its frozen candidate snapshot uses the restored dates.
 
 The history status endpoint reports customer-unmatched messages separately from case-unmatched messages. Importing customer data automatically retries reconciliation; rows whose products are not in the active catalog still create customers and contacts but do not create a case. Keep file mail, safe mode, and disabled auto-send throughout history migration.
 

@@ -290,6 +290,20 @@ async def _reactivation_campaign_summary(
             ReactivationRecipient.selected.is_(True),
         )
     )
+    exclusion_counts = {
+        reason: count
+        for reason, count in (
+            await session.execute(
+                select(ReactivationRecipient.exclusion_reason, func.count())
+                .where(
+                    ReactivationRecipient.campaign_id == campaign.id,
+                    ReactivationRecipient.exclusion_reason.is_not(None),
+                )
+                .group_by(ReactivationRecipient.exclusion_reason)
+                .order_by(func.count().desc(), ReactivationRecipient.exclusion_reason)
+            )
+        ).all()
+    }
     return {
         "id": campaign.id,
         "name": campaign.name,
@@ -309,6 +323,7 @@ async def _reactivation_campaign_summary(
             (campaign.metadata_json or {}).get("require_consent_basis", True)
         ),
         "counts": counts,
+        "exclusion_counts": exclusion_counts,
         "selected_count": int(selected or 0),
         "created_at": campaign.created_at.isoformat(),
         "started_at": campaign.started_at.isoformat() if campaign.started_at else None,

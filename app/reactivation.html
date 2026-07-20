@@ -43,6 +43,9 @@
     .metrics { display:grid; grid-template-columns:repeat(6,minmax(90px,1fr)); gap:8px; padding:14px 15px; border-bottom:1px solid var(--line); }
     .metric { padding:10px; border-radius:10px; background:#f8fafc; }
     .metric strong { display:block; font-size:21px; margin-top:5px; }
+    .reason-summary { display:flex; flex-wrap:wrap; gap:7px; padding:0 15px 14px; border-bottom:1px solid var(--line); }
+    .reason-summary:empty { display:none; }
+    .reason-item { padding:5px 9px; border-radius:999px; background:var(--red-soft); color:#8c2118; font-size:11px; }
     .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 15px; border-bottom:1px solid var(--line); }
     .toolbar input,.toolbar select { width:auto; min-width:150px; }
     .table-wrap { overflow:auto; max-height:650px; }
@@ -92,9 +95,9 @@
           <div class="field"><label>发送结束小时</label><input id="end-hour" type="number" min="1" max="23"></div>
           <div class="field"><label>二次唤醒间隔（天）</label><input id="second-days" type="number" min="30" max="3650"></div>
           <div class="field"><label>最多唤醒次数</label><input id="max-reactivations" type="number" min="1" max="10" value="2"></div>
-          <div class="field full"><label><input class="checkbox" id="require-consent" type="checkbox" checked> 仅包含已记录联系依据的客户</label><span class="hint">退订、永久抑制、硬退信和活动中的客户始终不能选择。</span></div>
+          <div class="field full"><label><input class="checkbox" id="require-consent" type="checkbox" checked> 仅包含已记录联系依据的客户</label><span class="hint">退订、永久抑制、硬退信及存在待人工事项的客户始终不能选择。</span></div>
           <div class="field full"><label>邮件主题模板</label><input id="subject" required maxlength="998"><span class="hint">支持：{contact_name} {company_name} {product_code} {product_name} {last_contact_date}</span></div>
-          <div class="field full"><label>唤醒邮件正文</label><textarea id="body" required maxlength="20000"></textarea><span class="hint">系统会自动追加正式邮件签名；模板在创建批次时冻结。</span></div>
+          <div class="field full"><label>唤醒邮件正文</label><textarea id="body" required maxlength="20000"></textarea><span class="hint">没有唯一产品信息时，{product_code} 自动替换为 our products。系统会追加正式签名；模板在创建批次时冻结。</span></div>
           <div class="field full"><button class="btn primary" id="create" type="submit">分析历史并创建候选名单</button></div>
         </form>
       </section>
@@ -107,6 +110,7 @@
     <section class="card">
       <div class="card-head"><div><h2 id="detail-title">选择一个批次</h2><span class="muted" id="detail-sub"></span></div><div class="actions" id="campaign-actions"></div></div>
       <div class="metrics" id="metrics"></div>
+      <div class="reason-summary" id="reason-summary"></div>
       <div class="toolbar">
         <select id="eligibility"><option value="all">全部</option><option value="eligible">仅可选</option><option value="excluded">仅排除</option></select>
         <input id="search" placeholder="公司、姓名或邮箱">
@@ -130,7 +134,7 @@
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
   const fmt = (v) => { if(!v) return "—"; const d=new Date(v); return Number.isNaN(d.getTime())?String(v):new Intl.DateTimeFormat("zh-CN",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).format(d); };
   const reasonText = {
-    DO_NOT_CONTACT:"客户禁止联系", CONTACT_SUPPRESSED:"联系人已抑制", INVALID_EMAIL_FORMAT:"邮箱格式无效", ADDRESS_SUPPRESSED:"邮箱已永久抑制", HARD_BOUNCE:"历史硬退信", KNOWN_UNDELIVERABLE_DOMAIN:"域名已知不可达", AUTO_SEND_NOT_ALLOWED:"客户未授权自动发送", CONSENT_BASIS_MISSING:"缺少联系依据", NEVER_CONTACTED:"没有历史联系记录", OPEN_HUMAN_HANDOFF:"存在待人工事项", ACTIVE_CONVERSATION:"正在沟通中", NO_PRODUCT_CONTEXT:"缺少唯一产品上下文", MULTIPLE_PRODUCT_CONTEXTS:"涉及多个产品，需人工选择", MAX_REACTIVATIONS_REACHED:"已达到最大唤醒次数", REPLIED_AFTER_REACTIVATION:"上次唤醒后已回复", CONTACTED_AFTER_REACTIVATION:"上次唤醒后已有人工联系", SECOND_REACTIVATION_WAIT:"尚未达到二次唤醒间隔", RECENT_CONTACT:"距离上次联系时间不足", PREVIOUSLY_REPLIED:"客户历史上回复过", NEVER_REPLIED:"客户历史上未回复", ACTIVITY_AFTER_SELECTION:"创建名单后出现新邮件", REPLIED_BEFORE_SEND:"发出前客户已经回复", OUTBOX_CANCELLED:"发件被安全策略取消", CAMPAIGN_CANCELLED:"批次已取消"
+    DO_NOT_CONTACT:"客户禁止联系", CONTACT_SUPPRESSED:"联系人已抑制", INVALID_EMAIL_FORMAT:"邮箱格式无效", DUPLICATE_EMAIL_CONTACT:"同一邮箱对应多个联系人", ADDRESS_SUPPRESSED:"邮箱已永久抑制", HARD_BOUNCE:"历史硬退信", KNOWN_UNDELIVERABLE_DOMAIN:"域名已知不可达", AUTO_SEND_NOT_ALLOWED:"客户未授权自动发送", CONSENT_BASIS_MISSING:"缺少联系依据", NEVER_CONTACTED:"Excel 和 Gmail 均无联系日期", OPEN_HUMAN_HANDOFF:"存在待人工事项", HUMAN_CONTROLLED_CASE:"业务已人工接管", ACTIVE_CONVERSATION:"存在待发邮件或有效报价", IN_FLIGHT_OUTBOX:"存在待发邮件", ACTIVE_QUOTE:"存在有效报价", PENDING_CASE_JOB:"存在待处理业务任务", NO_PRODUCT_CONTEXT:"缺少唯一产品上下文", MULTIPLE_PRODUCT_CONTEXTS:"涉及多个产品，需人工选择", MAX_REACTIVATIONS_REACHED:"已达到最大唤醒次数", REPLIED_AFTER_REACTIVATION:"上次唤醒后已回复", CONTACTED_AFTER_REACTIVATION:"上次唤醒后已有人工联系", SECOND_REACTIVATION_WAIT:"尚未达到二次唤醒间隔", RECENT_CONTACT:"距离上次联系时间不足", PREVIOUSLY_REPLIED:"客户历史上回复过", NEVER_REPLIED:"客户历史上未回复", ACTIVITY_AFTER_SELECTION:"创建名单后联系记录已更新", REPLIED_BEFORE_SEND:"发出前客户已经回复", OUTBOX_CANCELLED:"发件被安全策略取消", CAMPAIGN_CANCELLED:"批次已取消"
   };
   const statusKind = (v) => ["SENT","REPLIED","COMPLETED"].includes(v)?"good":["FAILED","CANCELLED","EXCLUDED","SKIPPED"].includes(v)?"bad":["RUNNING","SCHEDULED","QUEUED","SELECTED"].includes(v)?"info":"warn";
   const pill = (v) => `<span class="pill ${statusKind(String(v||""))}">${esc(v||"—")}</span>`;
@@ -158,6 +162,8 @@
   function renderMetrics(c) {
     const counts=c?.counts||{}; const items=[["已选择",c?.selected_count||0],["待计划",(counts.CANDIDATE||0)+(counts.SELECTED||0)],["已排除",counts.EXCLUDED||0],["计划/队列",(counts.SCHEDULED||0)+(counts.QUEUED||0)],["已发送",counts.SENT||0],["已回复",counts.REPLIED||0]];
     $("#metrics").innerHTML=items.map(([k,v])=>`<div class="metric"><span class="muted">${k}</span><strong>${v}</strong></div>`).join("");
+    const reasons=Object.entries(c?.exclusion_counts||{});
+    $("#reason-summary").innerHTML=reasons.map(([reason,count])=>`<span class="reason-item">${esc(reasonText[reason]||reason)}：${count}</span>`).join("");
   }
   function renderActions(c) {
     if(!c){$("#campaign-actions").innerHTML="";return} const parts=[];
