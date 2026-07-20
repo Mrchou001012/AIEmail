@@ -2,10 +2,11 @@ import hashlib
 import json
 import secrets
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -41,6 +42,8 @@ from app.db import (
     PricePolicy,
     Product,
     Quote,
+    ReactivationCampaign,
+    ReactivationRecipient,
     SalesCase,
     db_health,
     get_session,
@@ -49,6 +52,17 @@ from app.domain import money
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
 from app.products import canonical_product_code
+from app.reactivation import (
+    ALLOWED_TEMPLATE_FIELDS,
+    REPLY_FILTERS,
+    cancel_campaign,
+    default_templates,
+    pause_campaign,
+    resume_campaign,
+    scan_campaign_candidates,
+    start_campaign,
+    validate_template,
+)
 from app.services import (
     active_policy,
     assign_handoff_case,
@@ -65,6 +79,7 @@ security = HTTPBasic()
 DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
 HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
+REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
 
 
 def require_admin(
@@ -157,6 +172,27 @@ class CommercialUpdateRequest(BaseModel):
     items: list[CommercialProductUpdateRequest] = Field(min_length=1, max_length=10_000)
 
 
+class ReactivationCampaignCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    subject_template: str = Field(min_length=1, max_length=998)
+    body_template: str = Field(min_length=1, max_length=20_000)
+    min_inactive_days: int = Field(default=365, ge=30, le=3650)
+    reply_filter: Literal["ANY", "NEVER_REPLIED", "PREVIOUSLY_REPLIED"] = "ANY"
+    daily_limit: int = Field(default=5, ge=1, le=100)
+    timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=64)
+    send_window_start_hour: int = Field(default=9, ge=0, le=22)
+    send_window_end_hour: int = Field(default=17, ge=1, le=23)
+    start_date: date | None = None
+    max_reactivations: int = Field(default=2, ge=1, le=10)
+    second_reactivation_days: int = Field(default=90, ge=30, le=3650)
+    require_consent_basis: bool = True
+
+
+class ReactivationSelectionRequest(BaseModel):
+    recipient_ids: list[int] = Field(min_length=1, max_length=5000)
+    selected: bool
+
+
 def _dashboard_headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-store",
@@ -195,6 +231,401 @@ async def commercial_update_page(_: Admin) -> HTMLResponse:
         COMMERCIAL_UPDATE_PATH.read_text(encoding="utf-8"),
         headers=_dashboard_headers(),
     )
+
+
+@router.get("/admin/reactivation", response_class=HTMLResponse, include_in_schema=False)
+async def reactivation_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        REACTIVATION_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+async def _reactivation_history_ready(
+    session: AsyncSession,
+    settings: Settings,
+) -> tuple[bool, list[dict[str, Any]]]:
+    folders = {settings.imap_folder, settings.imap_sent_folder}
+    rows = (
+        (
+            await session.execute(
+                select(MailboxCursor).where(MailboxCursor.folder.in_(folders))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_folder = {row.folder: row for row in rows}
+    details = [
+        {
+            "folder": folder,
+            "present": folder in by_folder,
+            "history_complete": bool(by_folder.get(folder) and by_folder[folder].history_complete),
+            "last_uid": by_folder[folder].last_uid if folder in by_folder else None,
+        }
+        for folder in sorted(folders)
+    ]
+    return all(item["history_complete"] for item in details), details
+
+
+async def _reactivation_campaign_summary(
+    session: AsyncSession,
+    campaign: ReactivationCampaign,
+) -> dict[str, Any]:
+    counts = {
+        status_value: count
+        for status_value, count in (
+            await session.execute(
+                select(ReactivationRecipient.status, func.count())
+                .where(ReactivationRecipient.campaign_id == campaign.id)
+                .group_by(ReactivationRecipient.status)
+            )
+        ).all()
+    }
+    selected = await session.scalar(
+        select(func.count())
+        .select_from(ReactivationRecipient)
+        .where(
+            ReactivationRecipient.campaign_id == campaign.id,
+            ReactivationRecipient.selected.is_(True),
+        )
+    )
+    return {
+        "id": campaign.id,
+        "name": campaign.name,
+        "status": campaign.status,
+        "subject_template": campaign.subject_template,
+        "body_template": campaign.body_template,
+        "min_inactive_days": campaign.min_inactive_days,
+        "reply_filter": campaign.reply_filter,
+        "daily_limit": campaign.daily_limit,
+        "timezone": campaign.timezone,
+        "send_window_start_hour": campaign.send_window_start_hour,
+        "send_window_end_hour": campaign.send_window_end_hour,
+        "start_date": campaign.start_date.isoformat(),
+        "max_reactivations": campaign.max_reactivations,
+        "second_reactivation_days": campaign.second_reactivation_days,
+        "require_consent_basis": bool(
+            (campaign.metadata_json or {}).get("require_consent_basis", True)
+        ),
+        "counts": counts,
+        "selected_count": int(selected or 0),
+        "created_at": campaign.created_at.isoformat(),
+        "started_at": campaign.started_at.isoformat() if campaign.started_at else None,
+        "paused_at": campaign.paused_at.isoformat() if campaign.paused_at else None,
+        "completed_at": campaign.completed_at.isoformat() if campaign.completed_at else None,
+        "metadata": campaign.metadata_json or {},
+    }
+
+
+@router.get("/admin/reactivation/defaults")
+async def reactivation_defaults(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    subject, body = default_templates(settings)
+    history_ready, history_folders = await _reactivation_history_ready(session, settings)
+    pending_inbound = await session.scalar(
+        select(func.count())
+        .select_from(Job)
+        .where(
+            Job.kind == "process_inbound",
+            Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+        )
+    )
+    return {
+        "subject_template": subject,
+        "body_template": body,
+        "min_inactive_days": settings.reactivation_default_inactive_days,
+        "second_reactivation_days": settings.reactivation_default_second_days,
+        "daily_limit": settings.reactivation_max_sends_per_day,
+        "timezone": settings.business_timezone,
+        "start_date": datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date().isoformat(),
+        "send_window_start_hour": settings.business_open_hour,
+        "send_window_end_hour": min(23, settings.business_open_hour + 8),
+        "allowed_template_fields": sorted(ALLOWED_TEMPLATE_FIELDS),
+        "reply_filters": sorted(REPLY_FILTERS),
+        "history_ready": history_ready,
+        "history_folders": history_folders,
+        "pending_inbound_jobs": int(pending_inbound or 0),
+        "runtime": {
+            "reactivation_enabled": settings.reactivation_enabled,
+            "auto_send_enabled": settings.auto_send_enabled,
+            "mail_transport": settings.mail_transport,
+            "safe_mode": settings.safe_mode,
+            "max_reactivation_sends_per_day": settings.reactivation_max_sends_per_day,
+        },
+    }
+
+
+@router.get("/admin/reactivation/campaigns")
+async def reactivation_campaigns(_: Admin, session: Session) -> dict[str, Any]:
+    rows = (
+        (
+            await session.execute(
+                select(ReactivationCampaign)
+                .order_by(ReactivationCampaign.id.desc())
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {"campaigns": [await _reactivation_campaign_summary(session, row) for row in rows]}
+
+
+@router.post("/admin/reactivation/campaigns", status_code=201)
+async def create_reactivation_campaign(
+    request: ReactivationCampaignCreate,
+    admin: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    history_ready, _ = await _reactivation_history_ready(session, settings)
+    if not history_ready:
+        raise HTTPException(409, "Gmail Inbox and Sent history must finish syncing before candidate selection")
+    if not settings.reactivation_enabled:
+        raise HTTPException(409, "Historical-customer reactivation is disabled")
+    if request.daily_limit > settings.reactivation_max_sends_per_day:
+        raise HTTPException(
+            400,
+            f"daily_limit cannot exceed REACTIVATION_MAX_SENDS_PER_DAY={settings.reactivation_max_sends_per_day}",
+        )
+    if request.send_window_end_hour <= request.send_window_start_hour:
+        raise HTTPException(400, "send window end hour must be later than its start hour")
+    try:
+        ZoneInfo(request.timezone)
+        validate_template(request.subject_template)
+        validate_template(request.body_template)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    start_on = request.start_date or datetime.now(UTC).astimezone(ZoneInfo(request.timezone)).date()
+    campaign = ReactivationCampaign(
+        name=request.name.strip(),
+        status="DRAFT",
+        subject_template=request.subject_template.strip(),
+        body_template=request.body_template.strip(),
+        min_inactive_days=request.min_inactive_days,
+        reply_filter=request.reply_filter,
+        daily_limit=request.daily_limit,
+        timezone=request.timezone,
+        send_window_start_hour=request.send_window_start_hour,
+        send_window_end_hour=request.send_window_end_hour,
+        start_date=start_on,
+        max_reactivations=request.max_reactivations,
+        second_reactivation_days=request.second_reactivation_days,
+        created_by=admin,
+        metadata_json={"require_consent_basis": request.require_consent_basis},
+    )
+    session.add(campaign)
+    await session.flush()
+    scan = await scan_campaign_candidates(session, campaign)
+    return {"campaign": await _reactivation_campaign_summary(session, campaign), "scan": scan}
+
+
+@router.get("/admin/reactivation/campaigns/{campaign_id}")
+async def reactivation_campaign_detail(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+    limit: int = Query(default=250, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    eligibility: Literal["all", "eligible", "excluded"] = Query(default="all"),
+    recipient_status: str | None = Query(default=None, max_length=32),
+    search: str | None = Query(default=None, max_length=200),
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    filters = [ReactivationRecipient.campaign_id == campaign.id]
+    if eligibility == "eligible":
+        filters.append(ReactivationRecipient.eligible.is_(True))
+    elif eligibility == "excluded":
+        filters.append(ReactivationRecipient.eligible.is_(False))
+    if recipient_status:
+        filters.append(ReactivationRecipient.status == recipient_status.strip().upper())
+    if search and search.strip():
+        term = f"%{search.strip().casefold()}%"
+        filters.append(
+            or_(
+                func.lower(Customer.company_name).like(term),
+                func.lower(Contact.name).like(term),
+                func.lower(Contact.email).like(term),
+            )
+        )
+    total = await session.scalar(
+        select(func.count())
+        .select_from(ReactivationRecipient)
+        .join(Contact, ReactivationRecipient.contact_id == Contact.id)
+        .join(Customer, ReactivationRecipient.customer_id == Customer.id)
+        .where(*filters)
+    )
+    rows = (
+        await session.execute(
+            select(ReactivationRecipient, Contact, Customer, Outbox)
+            .join(Contact, ReactivationRecipient.contact_id == Contact.id)
+            .join(Customer, ReactivationRecipient.customer_id == Customer.id)
+            .outerjoin(Outbox, ReactivationRecipient.outbox_id == Outbox.id)
+            .where(*filters)
+            .order_by(
+                ReactivationRecipient.eligible.desc(),
+                ReactivationRecipient.last_contact_at,
+                ReactivationRecipient.id,
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    recipients = []
+    for recipient, contact, customer, outbox in rows:
+        recipients.append(
+            {
+                "id": recipient.id,
+                "customer_id": customer.id,
+                "company_name": customer.company_name,
+                "contact_id": contact.id,
+                "contact_name": contact.name,
+                "email": contact.email,
+                "case_id": recipient.case_id,
+                "outbox_id": recipient.outbox_id,
+                "outbox_status": outbox.status.value if outbox else None,
+                "status": recipient.status,
+                "eligible": recipient.eligible,
+                "selected": recipient.selected,
+                "exclusion_reason": recipient.exclusion_reason,
+                "has_ever_replied": recipient.has_ever_replied,
+                "latest_direction": recipient.latest_direction,
+                "last_contact_at": recipient.last_contact_at.isoformat() if recipient.last_contact_at else None,
+                "last_inbound_at": recipient.last_inbound_at.isoformat() if recipient.last_inbound_at else None,
+                "last_outbound_at": recipient.last_outbound_at.isoformat() if recipient.last_outbound_at else None,
+                "previous_reactivation_count": recipient.previous_reactivation_count,
+                "scheduled_for": recipient.scheduled_for.isoformat() if recipient.scheduled_for else None,
+                "sent_at": recipient.sent_at.isoformat() if recipient.sent_at else None,
+                "replied_at": recipient.replied_at.isoformat() if recipient.replied_at else None,
+                "snapshot": recipient.snapshot_json or {},
+            }
+        )
+    return {
+        "campaign": await _reactivation_campaign_summary(session, campaign),
+        "recipients": recipients,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/selection")
+async def update_reactivation_selection(
+    campaign_id: int,
+    request: ReactivationSelectionRequest,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    if campaign.status != "DRAFT":
+        raise HTTPException(409, "Recipient selection is locked after a campaign starts")
+    rows = (
+        (
+            await session.execute(
+                select(ReactivationRecipient).where(
+                    ReactivationRecipient.campaign_id == campaign.id,
+                    ReactivationRecipient.id.in_(request.recipient_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(rows) != len(set(request.recipient_ids)):
+        raise HTTPException(400, "One or more recipients do not belong to this campaign")
+    if request.selected and any(not row.eligible for row in rows):
+        raise HTTPException(409, "Excluded recipients cannot be selected")
+    for row in rows:
+        row.selected = request.selected
+        row.status = "SELECTED" if request.selected else "CANDIDATE"
+    await session.commit()
+    return {"updated": len(rows), "selected": request.selected}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/refresh")
+async def refresh_reactivation_candidates(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        result = await scan_campaign_candidates(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"scan": result, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/start")
+async def start_reactivation_campaign(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    pending_inbound = await session.scalar(
+        select(func.count())
+        .select_from(Job)
+        .where(
+            Job.kind == "process_inbound",
+            Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+        )
+    )
+    if pending_inbound:
+        raise HTTPException(
+            409,
+            f"There are {pending_inbound} inbound emails waiting; let AI/handoff processing finish before starting bulk outreach",
+        )
+    try:
+        scheduled = await start_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"scheduled": scheduled, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/pause")
+async def pause_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        stopped = await pause_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"stopped_pending": stopped, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/resume")
+async def resume_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        restored = await resume_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"restored_pending": restored, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/cancel")
+async def cancel_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    cancelled = await cancel_campaign(session, campaign)
+    return {"cancelled": cancelled, "campaign": await _reactivation_campaign_summary(session, campaign)}
 
 
 @router.get("/admin/dashboard/data")

@@ -252,6 +252,52 @@ Monitor and rerun reconciliation through:
 - `GET /admin/history/status`
 - `POST /admin/history/reconcile`
 
+### Historical-customer reactivation campaigns
+
+The protected page at `/admin/reactivation` turns synchronized Gmail history
+into reviewable, pausable outreach batches. Creating a batch only analyzes data;
+it never sends mail. An administrator must explicitly select eligible contacts
+and start the batch before any outbox records are created.
+
+Candidate screening excludes do-not-contact customers, suppressed addresses,
+hard bounces, known invalid domains, incomplete contact authorization, contacts
+without historical correspondence, open human handoffs, active conversations,
+and ambiguous or missing product context. The page records the exact exclusion
+reason for every contact. It can filter contacts by whether they have ever sent
+a human reply and by the number of days since the latest genuine inbound or
+outbound message.
+
+The first reactivation defaults to 365 inactive days. A contact who did not
+reply may be considered for a second campaign after 90 days, up to two total
+reactivations by default. Any customer reply marks the prior recipient as
+replied and cancels later scheduled reactivations. A reply, newer manual email,
+unsubscribe, suppression, bounce, or human handoff is checked again immediately
+before SMTP delivery, so an old candidate snapshot cannot override newer facts.
+
+Starting a campaign assigns selected recipients across Monday-Friday business
+windows and freezes the approved dedicated template plus the normal company
+signature. Campaigns can be paused, resumed, or cancelled from the page. Pausing
+stops pending campaign outbox records; resuming restores only those records.
+The worker does not materialize campaign mail while any `process_inbound` job is
+pending or running, and the outbox always prioritizes live replies, quotations,
+and human-approved messages ahead of reactivation mail.
+
+`REACTIVATION_MAX_SENDS_PER_DAY` is a separate conservative cap (default 5)
+inside the existing mailbox-wide hourly and rolling 24-hour limits. SAFE_MODE,
+the recipient allowlist, MX checks, suppression, Gmail spacing, cooldowns, and
+`AUTO_SEND_ENABLED` continue to apply. The feature is inert when no campaign is
+running and can be globally disabled with `REACTIVATION_ENABLED=false`.
+
+The default dedicated subject/body live in:
+
+- `config/content/reactivation_subject.txt`
+- `config/content/reactivation_body.txt`
+
+Each campaign stores an immutable copy, so later template changes cannot alter
+mail already reviewed and scheduled. Supported placeholders are
+`{contact_name}`, `{company_name}`, `{product_code}`, `{product_name}`, and
+`{last_contact_date}`.
+
 The history status endpoint reports customer-unmatched messages separately from case-unmatched messages. Importing customer data automatically retries reconciliation; rows whose products are not in the active catalog still create customers and contacts but do not create a case. Keep file mail, safe mode, and disabled auto-send throughout history migration.
 
 ### Live new-thread safety

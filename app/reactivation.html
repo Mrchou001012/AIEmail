@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>历史客户唤醒</title>
+  <style>
+    :root { --bg:#f4f6fa; --card:#fff; --line:#dde3ec; --text:#172033; --muted:#667085; --blue:#3157d5; --blue-soft:#eef2ff; --green:#147a4b; --green-soft:#eaf8f0; --amber:#99600a; --amber-soft:#fff6df; --red:#b42318; --red-soft:#fff0ee; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button,input,select,textarea { font:inherit; }
+    .shell { width:min(1540px,calc(100% - 32px)); margin:auto; padding:22px 0 50px; }
+    .top { display:flex; justify-content:space-between; gap:18px; align-items:center; margin-bottom:16px; }
+    h1,h2,h3,p { margin:0; } h1{font-size:22px} h2{font-size:16px} h3{font-size:14px}
+    .sub,.muted { color:var(--muted); }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .btn { border:1px solid #cbd3df; border-radius:9px; padding:8px 13px; background:#fff; color:var(--text); cursor:pointer; text-decoration:none; }
+    .btn:hover { border-color:var(--blue); color:var(--blue); } .btn:disabled{opacity:.45;cursor:not-allowed}
+    .btn.primary { color:#fff; border-color:var(--blue); background:var(--blue); }
+    .btn.danger { color:var(--red); border-color:#f0b8b2; background:var(--red-soft); }
+    .notice { margin-bottom:16px; padding:12px 15px; border:1px solid var(--line); border-radius:12px; background:var(--card); }
+    .notice.good{background:var(--green-soft);border-color:#b6e2c9;color:#135b3b}.notice.warn{background:var(--amber-soft);border-color:#efd093;color:#754809}.notice.bad{background:var(--red-soft);border-color:#ffc7c0;color:#8c2118}
+    .grid { display:grid; grid-template-columns:minmax(360px,.8fr) minmax(600px,1.5fr); gap:16px; align-items:start; }
+    .grid > * { min-width:0; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:15px; box-shadow:0 9px 25px rgba(28,39,62,.06); overflow:hidden; }
+    .card + .card { margin-top:16px; }
+    .card-head { min-height:54px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 15px; border-bottom:1px solid var(--line); }
+    .card-body { padding:15px; }
+    .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .field { display:flex; flex-direction:column; gap:5px; }
+    .field.full { grid-column:1/-1; }
+    label { color:#475467; font-size:12px; font-weight:650; }
+    input,select,textarea { width:100%; border:1px solid #cfd6e1; border-radius:9px; padding:8px 10px; color:var(--text); background:#fff; }
+    textarea { min-height:180px; resize:vertical; font-family:inherit; }
+    input:focus,select:focus,textarea:focus{outline:2px solid #dce4ff;border-color:var(--blue)}
+    .hint { font-size:11px; color:var(--muted); }
+    .campaign-list { display:grid; gap:8px; }
+    .campaign { width:100%; text-align:left; border:1px solid var(--line); border-radius:10px; padding:10px 11px; background:#fff; cursor:pointer; }
+    .campaign.active { border-color:var(--blue); background:var(--blue-soft); }
+    .campaign-line { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .pill { display:inline-flex; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:700; background:#eef2f6; color:#526074; }
+    .pill.good{background:var(--green-soft);color:var(--green)}.pill.warn{background:var(--amber-soft);color:var(--amber)}.pill.bad{background:var(--red-soft);color:var(--red)}.pill.info{background:var(--blue-soft);color:var(--blue)}
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(90px,1fr)); gap:8px; padding:14px 15px; border-bottom:1px solid var(--line); }
+    .metric { padding:10px; border-radius:10px; background:#f8fafc; }
+    .metric strong { display:block; font-size:21px; margin-top:5px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 15px; border-bottom:1px solid var(--line); }
+    .toolbar input,.toolbar select { width:auto; min-width:150px; }
+    .table-wrap { overflow:auto; max-height:650px; }
+    table { width:100%; border-collapse:collapse; min-width:1050px; }
+    th,td { padding:10px 11px; text-align:left; border-bottom:1px solid #edf0f4; vertical-align:top; }
+    th { position:sticky; top:0; z-index:2; background:#fbfcfe; color:var(--muted); font-size:11px; }
+    td { font-size:12px; }
+    .main { max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .small { display:block; margin-top:2px; color:var(--muted); font-size:10px; }
+    .empty { padding:34px; text-align:center; color:var(--muted); }
+    .checkbox { width:16px; height:16px; }
+    .preview { white-space:pre-wrap; padding:12px; border:1px solid var(--line); background:#fafbfc; border-radius:10px; max-height:260px; overflow:auto; }
+    @media(max-width:980px){.grid{grid-template-columns:minmax(0,1fr)}.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media(max-width:620px){
+      .shell{width:calc(100% - 20px);padding-top:14px}
+      .top{align-items:stretch;flex-direction:column;gap:10px}
+      .top .actions{justify-content:flex-start}
+      .form-grid{grid-template-columns:minmax(0,1fr)}
+      .field.full{grid-column:auto}
+      .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .toolbar{align-items:stretch}
+      .toolbar input,.toolbar select,.toolbar .btn{width:100%;min-width:0}
+      .card-head{align-items:flex-start;flex-direction:column}
+      .table-wrap{max-width:100%}
+    }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="top">
+    <div><h1>历史客户唤醒</h1><p class="sub">筛选、人工选择、分日发送和二次唤醒进度</p></div>
+    <div class="actions"><span class="muted" id="updated">正在读取…</span><a class="btn" href="/dashboard">返回运行台</a><button class="btn" id="reload">刷新</button></div>
+  </header>
+  <div class="notice" id="notice">正在检查 Gmail 历史和实时收件任务…</div>
+
+  <div class="grid">
+    <aside>
+      <section class="card">
+        <div class="card-head"><h2>创建筛选批次</h2><span class="pill info">不会立即发信</span></div>
+        <form class="card-body form-grid" id="create-form">
+          <div class="field full"><label>批次名称</label><input id="name" required maxlength="255"></div>
+          <div class="field"><label>至少多久未联系（天）</label><input id="inactive-days" type="number" min="30" max="3650"></div>
+          <div class="field"><label>历史回复情况</label><select id="reply-filter"><option value="ANY">不限</option><option value="NEVER_REPLIED">从未回复</option><option value="PREVIOUSLY_REPLIED">曾经回复</option></select></div>
+          <div class="field"><label>每天最多唤醒</label><input id="daily-limit" type="number" min="1" max="100"></div>
+          <div class="field"><label>开始日期</label><input id="start-date" type="date"></div>
+          <div class="field"><label>发送开始小时</label><input id="start-hour" type="number" min="0" max="22"></div>
+          <div class="field"><label>发送结束小时</label><input id="end-hour" type="number" min="1" max="23"></div>
+          <div class="field"><label>二次唤醒间隔（天）</label><input id="second-days" type="number" min="30" max="3650"></div>
+          <div class="field"><label>最多唤醒次数</label><input id="max-reactivations" type="number" min="1" max="10" value="2"></div>
+          <div class="field full"><label><input class="checkbox" id="require-consent" type="checkbox" checked> 仅包含已记录联系依据的客户</label><span class="hint">退订、永久抑制、硬退信和活动中的客户始终不能选择。</span></div>
+          <div class="field full"><label>邮件主题模板</label><input id="subject" required maxlength="998"><span class="hint">支持：{contact_name} {company_name} {product_code} {product_name} {last_contact_date}</span></div>
+          <div class="field full"><label>唤醒邮件正文</label><textarea id="body" required maxlength="20000"></textarea><span class="hint">系统会自动追加正式邮件签名；模板在创建批次时冻结。</span></div>
+          <div class="field full"><button class="btn primary" id="create" type="submit">分析历史并创建候选名单</button></div>
+        </form>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>批次</h2><small class="muted">最近 100 个</small></div>
+        <div class="card-body campaign-list" id="campaign-list"><div class="empty">暂无批次</div></div>
+      </section>
+    </aside>
+
+    <section class="card">
+      <div class="card-head"><div><h2 id="detail-title">选择一个批次</h2><span class="muted" id="detail-sub"></span></div><div class="actions" id="campaign-actions"></div></div>
+      <div class="metrics" id="metrics"></div>
+      <div class="toolbar">
+        <select id="eligibility"><option value="all">全部</option><option value="eligible">仅可选</option><option value="excluded">仅排除</option></select>
+        <input id="search" placeholder="公司、姓名或邮箱">
+        <button class="btn" id="filter">筛选</button>
+        <button class="btn" id="select-page">选择当前可选项</button>
+        <button class="btn" id="clear-page">取消当前选择</button>
+        <span class="muted" id="row-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>选择</th><th>客户 / 联系人</th><th>产品</th><th>上次联系</th><th>回复</th><th>历史唤醒</th><th>计划 / 结果</th><th>状态 / 原因</th></tr></thead>
+          <tbody id="recipients"><tr><td colspan="8" class="empty">选择左侧批次查看候选客户</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card-body"><h3>本批次模板预览</h3><div class="preview" id="template-preview">—</div></div>
+    </section>
+  </div>
+</main>
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+  const fmt = (v) => { if(!v) return "—"; const d=new Date(v); return Number.isNaN(d.getTime())?String(v):new Intl.DateTimeFormat("zh-CN",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).format(d); };
+  const reasonText = {
+    DO_NOT_CONTACT:"客户禁止联系", CONTACT_SUPPRESSED:"联系人已抑制", INVALID_EMAIL_FORMAT:"邮箱格式无效", ADDRESS_SUPPRESSED:"邮箱已永久抑制", HARD_BOUNCE:"历史硬退信", KNOWN_UNDELIVERABLE_DOMAIN:"域名已知不可达", AUTO_SEND_NOT_ALLOWED:"客户未授权自动发送", CONSENT_BASIS_MISSING:"缺少联系依据", NEVER_CONTACTED:"没有历史联系记录", OPEN_HUMAN_HANDOFF:"存在待人工事项", ACTIVE_CONVERSATION:"正在沟通中", NO_PRODUCT_CONTEXT:"缺少唯一产品上下文", MULTIPLE_PRODUCT_CONTEXTS:"涉及多个产品，需人工选择", MAX_REACTIVATIONS_REACHED:"已达到最大唤醒次数", REPLIED_AFTER_REACTIVATION:"上次唤醒后已回复", CONTACTED_AFTER_REACTIVATION:"上次唤醒后已有人工联系", SECOND_REACTIVATION_WAIT:"尚未达到二次唤醒间隔", RECENT_CONTACT:"距离上次联系时间不足", PREVIOUSLY_REPLIED:"客户历史上回复过", NEVER_REPLIED:"客户历史上未回复", ACTIVITY_AFTER_SELECTION:"创建名单后出现新邮件", REPLIED_BEFORE_SEND:"发出前客户已经回复", OUTBOX_CANCELLED:"发件被安全策略取消", CAMPAIGN_CANCELLED:"批次已取消"
+  };
+  const statusKind = (v) => ["SENT","REPLIED","COMPLETED"].includes(v)?"good":["FAILED","CANCELLED","EXCLUDED","SKIPPED"].includes(v)?"bad":["RUNNING","SCHEDULED","QUEUED","SELECTED"].includes(v)?"info":"warn";
+  const pill = (v) => `<span class="pill ${statusKind(String(v||""))}">${esc(v||"—")}</span>`;
+  let defaults=null, campaigns=[], current=null, rows=[];
+
+  async function api(url, options={}) {
+    const response = await fetch(url, {cache:"no-store", headers:{Accept:"application/json", ...(options.body?{"Content-Type":"application/json"}:{}), ...(options.headers||{})}, ...options});
+    let data={}; try { data=await response.json(); } catch (_) {}
+    if(!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    return data;
+  }
+  function setNotice(message, kind="") { const el=$("#notice"); el.className=`notice ${kind}`; el.textContent=message; }
+  function fillDefaults() {
+    $("#name").value=`历史客户唤醒 ${defaults.start_date}`; $("#inactive-days").value=defaults.min_inactive_days; $("#daily-limit").value=defaults.daily_limit; $("#start-date").value=defaults.start_date; $("#start-hour").value=defaults.send_window_start_hour; $("#end-hour").value=defaults.send_window_end_hour; $("#second-days").value=defaults.second_reactivation_days; $("#subject").value=defaults.subject_template; $("#body").value=defaults.body_template;
+  }
+  function renderNotice() {
+    const r=defaults.runtime; if(!defaults.history_ready) return setNotice("Gmail Inbox/Sent 历史尚未同步完成，暂时不能生成可靠候选名单。","bad");
+    if(defaults.pending_inbound_jobs) return setNotice(`当前有 ${defaults.pending_inbound_jobs} 封收件邮件等待 AI 回复或转人工。系统会优先处理这些邮件，处理完才允许启动/继续批量唤醒。`,"warn");
+    if(!r.auto_send_enabled || r.mail_transport!=="smtp") return setNotice(`候选筛选可以使用，但当前 ${r.mail_transport} / AUTO_SEND=${r.auto_send_enabled}，不会真实自动发送。`,"warn");
+    setNotice(`Gmail 历史已完整；实时收件队列为空。唤醒每天最多 ${r.max_reactivation_sends_per_day} 封，并服从邮箱总限流。`,"good");
+  }
+  function renderCampaigns() {
+    $("#campaign-list").innerHTML=campaigns.length?campaigns.map(c=>`<button class="campaign ${current&&current.id===c.id?"active":""}" data-campaign="${c.id}"><div class="campaign-line"><strong>${esc(c.name)}</strong>${pill(c.status)}</div><span class="small">已选 ${c.selected_count} · 可选 ${c.counts.CANDIDATE||0} · 已发 ${c.counts.SENT||0} · 回复 ${c.counts.REPLIED||0}</span></button>`).join(""):'<div class="empty">暂无批次</div>';
+  }
+  function renderMetrics(c) {
+    const counts=c?.counts||{}; const items=[["已选择",c?.selected_count||0],["待计划",(counts.CANDIDATE||0)+(counts.SELECTED||0)],["已排除",counts.EXCLUDED||0],["计划/队列",(counts.SCHEDULED||0)+(counts.QUEUED||0)],["已发送",counts.SENT||0],["已回复",counts.REPLIED||0]];
+    $("#metrics").innerHTML=items.map(([k,v])=>`<div class="metric"><span class="muted">${k}</span><strong>${v}</strong></div>`).join("");
+  }
+  function renderActions(c) {
+    if(!c){$("#campaign-actions").innerHTML="";return} const parts=[];
+    if(c.status==="DRAFT"){parts.push('<button class="btn" data-action="refresh">重新筛选</button>','<button class="btn primary" data-action="start">启动批次</button>');}
+    if(c.status==="RUNNING") parts.push('<button class="btn" data-action="pause">暂停</button>');
+    if(c.status==="PAUSED") parts.push('<button class="btn primary" data-action="resume">继续</button>');
+    if(!["COMPLETED","CANCELLED"].includes(c.status)) parts.push('<button class="btn danger" data-action="cancel">取消批次</button>');
+    $("#campaign-actions").innerHTML=parts.join("");
+  }
+  function renderRows() {
+    $("#row-count").textContent=`显示 ${rows.length} / ${current?.detailTotal||0}`;
+    $("#recipients").innerHTML=rows.length?rows.map(r=>`<tr><td><input class="checkbox recipient-check" type="checkbox" data-id="${r.id}" ${r.selected?"checked":""} ${!r.eligible||current.status!=="DRAFT"?"disabled":""}></td><td><div class="main"><strong>${esc(r.company_name)}</strong></div><span class="small">${esc(r.contact_name)} · ${esc(r.email)}</span></td><td><span class="main">${esc(r.snapshot.product_code||"—")}</span><span class="small">${esc(r.snapshot.product_name||"")}</span></td><td>${fmt(r.last_contact_at)}<span class="small">${esc(r.latest_direction||"—")} · ${esc(r.snapshot.inactive_days??"—")} 天</span></td><td>${r.has_ever_replied?pill("曾回复"):pill("未回复")}</td><td>${r.previous_reactivation_count}</td><td>${fmt(r.scheduled_for||r.sent_at||r.replied_at)}<span class="small">${r.outbox_status?`Outbox ${esc(r.outbox_status)}`:""}</span></td><td>${pill(r.status)}<span class="small">${esc(reasonText[r.exclusion_reason]||r.exclusion_reason||"")}</span></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合当前筛选的记录</td></tr>';
+  }
+  async function loadCampaigns(preferred=null) {
+    campaigns=(await api("/admin/reactivation/campaigns")).campaigns||[];
+    const id=preferred || current?.id || campaigns[0]?.id; current=campaigns.find(c=>c.id===id)||null; renderCampaigns();
+    if(current) await loadDetail(); else {renderMetrics(null);renderActions(null);}
+  }
+  async function loadDetail() {
+    const params=new URLSearchParams({limit:"2000",eligibility:$("#eligibility").value}); const q=$("#search").value.trim(); if(q) params.set("search",q);
+    const data=await api(`/admin/reactivation/campaigns/${current.id}?${params}`); current={...data.campaign,detailTotal:data.total}; rows=data.recipients||[];
+    $("#detail-title").textContent=current.name; $("#detail-sub").textContent=`${current.status} · 每天 ${current.daily_limit} 封 · ${current.start_date} 起 · ${current.send_window_start_hour}:00-${current.send_window_end_hour}:00 ${current.timezone}`;
+    $("#template-preview").textContent=`主题：${current.subject_template}\n\n${current.body_template}\n\n[正式签名由系统自动追加]`;
+    renderCampaigns(); renderMetrics(current); renderActions(current); renderRows();
+  }
+  async function updateSelection(ids, selected) { if(!ids.length)return; await api(`/admin/reactivation/campaigns/${current.id}/selection`,{method:"POST",body:JSON.stringify({recipient_ids:ids,selected})}); await loadCampaigns(current.id); }
+  async function action(name) {
+    if(name==="start"&&!confirm(`确认启动“${current.name}”？系统将按计划自动发给已选的 ${current.selected_count} 位客户。`)) return;
+    if(name==="refresh"&&!confirm("重新筛选会清除当前勾选，确认继续？")) return;
+    if(name==="cancel"&&!confirm("确认取消这个批次？尚未发送的邮件会停止。")) return;
+    await api(`/admin/reactivation/campaigns/${current.id}/${name}`,{method:"POST"}); await reload(current.id);
+  }
+  async function reload(preferred=null) { try { defaults=await api("/admin/reactivation/defaults"); renderNotice(); await loadCampaigns(preferred); $("#updated").textContent=`更新 ${fmt(new Date().toISOString())}`; } catch(e){setNotice(e.message,"bad");} }
+
+  $("#create-form").addEventListener("submit",async e=>{e.preventDefault(); const button=$("#create");button.disabled=true;try{const payload={name:$("#name").value,subject_template:$("#subject").value,body_template:$("#body").value,min_inactive_days:Number($("#inactive-days").value),reply_filter:$("#reply-filter").value,daily_limit:Number($("#daily-limit").value),timezone:defaults.timezone,send_window_start_hour:Number($("#start-hour").value),send_window_end_hour:Number($("#end-hour").value),start_date:$("#start-date").value,max_reactivations:Number($("#max-reactivations").value),second_reactivation_days:Number($("#second-days").value),require_consent_basis:$("#require-consent").checked};const data=await api("/admin/reactivation/campaigns",{method:"POST",body:JSON.stringify(payload)});setNotice(`筛选完成：可选 ${data.scan.eligible}，排除 ${data.scan.excluded}。请检查并勾选客户。`,"good");await loadCampaigns(data.campaign.id);}catch(err){setNotice(err.message,"bad");}finally{button.disabled=false;}});
+  document.addEventListener("click",async e=>{const c=e.target.closest("[data-campaign]");if(c){current=campaigns.find(x=>x.id===Number(c.dataset.campaign));await loadDetail();return}const a=e.target.closest("[data-action]");if(a){try{await action(a.dataset.action)}catch(err){setNotice(err.message,"bad")}}});
+  $("#recipients").addEventListener("change",async e=>{if(e.target.matches(".recipient-check")){try{await updateSelection([Number(e.target.dataset.id)],e.target.checked)}catch(err){setNotice(err.message,"bad")}}});
+  $("#select-page").addEventListener("click",()=>updateSelection(rows.filter(r=>r.eligible&&!r.selected).map(r=>r.id),true).catch(e=>setNotice(e.message,"bad")));
+  $("#clear-page").addEventListener("click",()=>updateSelection(rows.filter(r=>r.selected).map(r=>r.id),false).catch(e=>setNotice(e.message,"bad")));
+  $("#filter").addEventListener("click",()=>current&&loadDetail().catch(e=>setNotice(e.message,"bad"))); $("#reload").addEventListener("click",()=>reload().catch(e=>setNotice(e.message,"bad")));
+  (async()=>{try{defaults=await api("/admin/reactivation/defaults");fillDefaults();renderNotice();await loadCampaigns();}catch(e){setNotice(e.message,"bad")}})();
+  setInterval(()=>{if(!document.hidden&&current&&current.status!=="DRAFT")reload(current.id)},15000);
+</script>
+</body>
+</html>

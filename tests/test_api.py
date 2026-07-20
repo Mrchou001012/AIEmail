@@ -6,9 +6,11 @@ import pytest
 from app.api import (
     COMMERCIAL_UPDATE_PATH,
     HANDOFF_REVIEW_PATH,
+    REACTIVATION_PATH,
     commercial_update_page,
     dashboard,
     health,
+    reactivation_page,
 )
 
 
@@ -76,3 +78,22 @@ def test_commercial_update_page_exposes_atomic_editor_workflow() -> None:
     assert "本周基础价" in html
     assert "库存数量" in html
     assert "确认并启用本周自动报价" in html
+
+
+@pytest.mark.asyncio
+async def test_reactivation_page_is_protected_no_store_html() -> None:
+    response = await reactivation_page("admin")
+
+    assert response.status_code == 200
+    assert "历史客户唤醒" in response.body.decode("utf-8")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_reactivation_page_exposes_selection_and_campaign_controls() -> None:
+    html = REACTIVATION_PATH.read_text(encoding="utf-8")
+
+    assert "/admin/reactivation/campaigns" in html
+    assert "选择当前可选项" in html
+    assert "启动批次" in html
+    assert "暂停" in html
