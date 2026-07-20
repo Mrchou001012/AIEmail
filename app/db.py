@@ -399,6 +399,67 @@ class Outbox(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class ReactivationCampaign(Base, TimestampMixin):
+    """A reviewable, pausable batch of historical-customer outreach."""
+
+    __tablename__ = "reactivation_campaigns"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="DRAFT", index=True)
+    subject_template: Mapped[str] = mapped_column(String(998))
+    body_template: Mapped[str] = mapped_column(Text)
+    min_inactive_days: Mapped[int] = mapped_column(Integer, default=365)
+    reply_filter: Mapped[str] = mapped_column(String(32), default="ANY")
+    daily_limit: Mapped[int] = mapped_column(Integer, default=10)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Kolkata")
+    send_window_start_hour: Mapped[int] = mapped_column(Integer, default=9)
+    send_window_end_hour: Mapped[int] = mapped_column(Integer, default=17)
+    start_date: Mapped[date] = mapped_column(Date, default=date.today)
+    max_reactivations: Mapped[int] = mapped_column(Integer, default=2)
+    second_reactivation_days: Mapped[int] = mapped_column(Integer, default=90)
+    created_by: Mapped[str] = mapped_column(String(128), default="admin")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ReactivationRecipient(Base, TimestampMixin):
+    """Eligibility snapshot and delivery state for one campaign contact."""
+
+    __tablename__ = "reactivation_recipients"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "contact_id", name="uq_reactivation_campaign_contact"),
+        Index("ix_reactivation_recipient_schedule", "status", "scheduled_for"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("reactivation_campaigns.id", ondelete="CASCADE"), index=True
+    )
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), index=True)
+    contact_id: Mapped[int] = mapped_column(ForeignKey("contacts.id"), index=True)
+    case_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cases.id", ondelete="SET NULL"), index=True
+    )
+    outbox_id: Mapped[int | None] = mapped_column(
+        ForeignKey("outbox.id", ondelete="SET NULL"), unique=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="CANDIDATE", index=True)
+    eligible: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    selected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(128), index=True)
+    has_ever_replied: Mapped[bool] = mapped_column(Boolean, default=False)
+    latest_direction: Mapped[str | None] = mapped_column(String(16))
+    last_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_outbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    previous_reactivation_count: Mapped[int] = mapped_column(Integer, default=0)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class AIInvocation(Base):
     __tablename__ = "ai_invocations"
     id: Mapped[int] = mapped_column(primary_key=True)
