@@ -7,6 +7,9 @@ from app.db import CommercialDataCycle, Handoff, SalesCase
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+# httpx logs complete request URLs at INFO level. DingTalk webhook tokens live in
+# the URL, so production logs must never retain those credentials.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class DingTalkNotifier:
@@ -32,7 +35,7 @@ class DingTalkNotifier:
 
     async def notify(self, handoff: Handoff, case: SalesCase | None) -> str:
         case_id = case.id if case else "unmatched"
-        title = f"Sales handoff #{handoff.id}: {handoff.reason_code}"
+        title = f"AIEmail · Sales handoff #{handoff.id}: {handoff.reason_code}"
         text = (
             f"### {title}\n\n"
             f"- Case: {case_id}\n"
