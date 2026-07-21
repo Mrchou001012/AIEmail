@@ -61,6 +61,7 @@ from app.services import (
     notify_handoff,
     process_inbound,
     queue_human_reply,
+    resolve_deliverability_handoff,
     seed_demo_data,
     send_one_outbox,
 )
@@ -2333,6 +2334,123 @@ async def test_smtp_preflight_blocks_missing_mx_without_permanent_suppression(
     assert address.suppressed is False
     assert case.status == CaseStatus.WAITING_HUMAN
     assert handoff is not None and handoff.reason_code == HandoffReason.EMAIL_DELIVERABILITY.value
+
+
+@pytest.mark.parametrize(
+    ("mx_status", "detail"),
+    [
+        (MXStatus.NO_DOMAIN, "domain does not exist"),
+        (MXStatus.NULL_MX, "domain explicitly accepts no email"),
+    ],
+)
+async def test_smtp_preflight_auto_suppresses_permanent_domain_failure_without_handoff(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    mx_status: MXStatus,
+    detail: str,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_email = case.contact.email
+    monkeypatch.setattr(
+        "app.services.lookup_mx",
+        lambda domain, *, timeout_seconds: MXResult(mx_status, domain, error=detail),
+    )
+    monkeypatch.setattr("app.services.transport_for", lambda settings: pytest.fail("SMTP must not be called"))
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+    )
+    pending = Outbox(
+        case_id=case.id,
+        business_key=f"preflight-{mx_status.value.lower()}",
+        message_id=f"<preflight-{mx_status.value.lower()}@example.com>",
+        recipient=contact_email,
+        raw_message="Subject: permanent domain failure\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(pending)
+    await db_session.refresh(case)
+    await db_session.refresh(case.contact)
+    address = await db_session.get(EmailAddressStatus, contact_email)
+    handoff_count = await db_session.scalar(select(func.count()).select_from(Handoff))
+
+    assert pending.status == DeliveryStatus.CANCELLED
+    assert pending.attempts == 0
+    assert address is not None and address.preflight_status == mx_status.value
+    assert address.suppressed is True
+    assert address.suppression_reason == f"PREFLIGHT_{mx_status.value}"
+    assert case.contact.suppressed is True
+    assert case.status == CaseStatus.PAUSED
+    assert handoff_count == 0
+
+
+async def test_operator_can_resolve_legacy_deliverability_handoff_by_suppressing_recipient(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_email = case.contact.email
+    case.status = CaseStatus.WAITING_HUMAN
+    pending = Outbox(
+        case_id=case.id,
+        business_key="legacy-deliverability",
+        message_id="<legacy-deliverability@example.com>",
+        recipient=contact_email,
+        raw_message="Subject: legacy deliverability\n\nbody",
+        status=DeliveryStatus.CANCELLED,
+        last_error="recipient preflight blocked: domain does not exist",
+    )
+    db_session.add(pending)
+    await db_session.flush()
+    address = EmailAddressStatus(
+        email=contact_email,
+        domain=contact_email.rsplit("@", 1)[1],
+        format_valid=True,
+        preflight_status=MXStatus.NO_DOMAIN.value,
+        suppressed=False,
+    )
+    handoff = Handoff(
+        case_id=case.id,
+        reason_code=HandoffReason.EMAIL_DELIVERABILITY.value,
+        summary="Recipient preflight blocked",
+        extracted_facts={
+            "outbox_id": pending.id,
+            "recipient": contact_email,
+            "preflight_status": MXStatus.NO_DOMAIN.value,
+        },
+    )
+    db_session.add_all([address, handoff])
+    await db_session.commit()
+
+    resolved = await resolve_deliverability_handoff(
+        db_session,
+        handoff_id=handoff.id,
+        actor="integration-admin",
+    )
+    await db_session.refresh(case)
+    await db_session.refresh(case.contact)
+    await db_session.refresh(address)
+
+    assert resolved.status == "RESOLVED"
+    assert address.suppressed is True
+    assert address.suppression_reason == "PREFLIGHT_NO_DOMAIN"
+    assert case.contact.suppressed is True
+    assert case.status == CaseStatus.PAUSED
+    assert pending.status == DeliveryStatus.CANCELLED
+    audit_row = await db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "handoff.deliverability_recipient_suppressed")
+    )
+    assert audit_row is not None and audit_row.actor == "integration-admin"
 
 
 async def test_smtp_preflight_defers_temporary_dns_failure_without_attempt(

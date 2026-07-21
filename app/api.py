@@ -70,6 +70,7 @@ from app.services import (
     enqueue_job,
     ingest_raw_email,
     queue_human_reply,
+    resolve_deliverability_handoff,
     seed_demo_data,
 )
 from app.settings import Settings, get_settings
@@ -2213,9 +2214,28 @@ async def update_handoff(
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
         raise HTTPException(404, "Handoff not found")
-    actions = {"approve", "reject", "resolve", "pause", "resume", "takeover"}
+    actions = {
+        "approve",
+        "reject",
+        "resolve",
+        "pause",
+        "resume",
+        "takeover",
+        "suppress_recipient",
+    }
     if update.action not in actions:
         raise HTTPException(400, f"action must be one of {sorted(actions)}")
+    if update.action == "suppress_recipient":
+        try:
+            handoff = await resolve_deliverability_handoff(
+                session,
+                handoff_id=handoff.id,
+                actor=admin,
+                note=update.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"id": handoff.id, "status": handoff.status, "action": update.action}
     handoff.status = "RESOLVED" if update.action in {"approve", "reject", "resolve"} else "OPEN"
     handoff.resolution_note = update.note
     if handoff.case_id:

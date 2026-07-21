@@ -911,7 +911,11 @@ async def _sync_delivery_states(session: AsyncSession) -> bool:
             "reactivation campaign paused"
         }:
             recipient.status = "SKIPPED"
-            recipient.exclusion_reason = "OUTBOX_CANCELLED"
+            recipient.exclusion_reason = (
+                "EMAIL_UNDELIVERABLE"
+                if (outbox.last_error or "").startswith("recipient preflight blocked:")
+                else "OUTBOX_CANCELLED"
+            )
             changed = True
     running = (
         (

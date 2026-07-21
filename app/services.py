@@ -90,6 +90,21 @@ from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+AUTO_SUPPRESS_PREFLIGHT_STATUSES = frozenset(
+    {
+        MXStatus.NO_DOMAIN.value,
+        MXStatus.NULL_MX.value,
+    }
+)
+DELIVERABILITY_BLOCK_STATUSES = frozenset(
+    {
+        *AUTO_SUPPRESS_PREFLIGHT_STATUSES,
+        "INVALID_FORMAT",
+        MXStatus.NO_MX.value,
+        "SUPPRESSED",
+    }
+)
+
 PRIOR_THREAD_MARKERS = (
     "previous quote",
     "previous quotation",
@@ -230,6 +245,7 @@ async def _recipient_preflight(
             "recipient": status.email,
             "preflight_status": "SUPPRESSED",
             "suppression_reason": status.suppression_reason,
+            "auto_suppressed": True,
         }
     if not format_result.valid:
         detail = f"invalid recipient format: {format_result.error or 'invalid address'}"
@@ -240,6 +256,7 @@ async def _recipient_preflight(
             "recipient": status.email,
             "preflight_status": "INVALID_FORMAT",
             "format_error": format_result.error,
+            "suppression_reason": "INVALID_FORMAT",
         }
     if not settings.mx_check_enabled:
         status.preflight_status = MXStatus.UNCHECKED.value
@@ -300,7 +317,92 @@ async def _recipient_preflight(
         return "ALLOW", "recipient format and MX checks passed", facts
     if mx_result.temporary:
         return "DEFER", mx_result.error or "temporary DNS lookup failure", facts
+    if mx_result.status.value in AUTO_SUPPRESS_PREFLIGHT_STATUSES:
+        suppression_reason = f"PREFLIGHT_{mx_result.status.value}"
+        await _suppress_email_address(session, status.email, reason=suppression_reason)
+        facts["suppression_reason"] = suppression_reason
+        facts["auto_suppressed"] = True
     return "BLOCK", mx_result.error or "recipient domain cannot receive email", facts
+
+
+async def resolve_deliverability_handoff(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    actor: str,
+    note: str = "",
+) -> Handoff:
+    """Resolve an old deliverability handoff by suppressing only its exact recipient."""
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.reason_code != HandoffReason.EMAIL_DELIVERABILITY.value:
+        raise ValueError("handoff is not an email deliverability review")
+
+    facts = dict(handoff.extracted_facts or {})
+    recipient = str(facts.get("recipient") or "").strip().casefold()
+    preflight_status = str(facts.get("preflight_status") or "").strip().upper()
+    if not recipient:
+        raise ValueError("deliverability handoff has no recipient")
+    address_status = await session.get(EmailAddressStatus, recipient)
+    if preflight_status not in DELIVERABILITY_BLOCK_STATUSES and not (
+        address_status and address_status.suppressed
+    ):
+        raise ValueError("deliverability result is not a permanent recipient block")
+
+    suppression_reason = (
+        address_status.suppression_reason
+        if address_status and address_status.suppressed and address_status.suppression_reason
+        else f"PREFLIGHT_{preflight_status or 'UNDELIVERABLE'}"
+    )
+    updated_status = await _suppress_email_address(session, recipient, reason=suppression_reason)
+    if preflight_status:
+        updated_status.preflight_status = preflight_status
+
+    outbox_id = facts.get("outbox_id")
+    outbox = await session.get(Outbox, outbox_id) if isinstance(outbox_id, int) else None
+    if outbox is not None and outbox.status in {
+        DeliveryStatus.PENDING,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.CLAIMED,
+        DeliveryStatus.UNKNOWN,
+    }:
+        outbox.status = DeliveryStatus.CANCELLED
+        outbox.last_error = "recipient marked permanently undeliverable by operator"
+
+    campaign_recipient = (
+        await session.scalar(
+            select(ReactivationRecipient).where(ReactivationRecipient.outbox_id == outbox_id)
+        )
+        if isinstance(outbox_id, int)
+        else None
+    )
+    if campaign_recipient is not None and campaign_recipient.status not in {"SENT", "REPLIED"}:
+        campaign_recipient.status = "SKIPPED"
+        campaign_recipient.exclusion_reason = "EMAIL_UNDELIVERABLE"
+
+    case = await session.get(SalesCase, handoff.case_id) if handoff.case_id else None
+    if case is not None and case.status not in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        case.status = CaseStatus.PAUSED
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = note.strip() or f"Recipient {recipient} marked permanently undeliverable"
+    await audit(
+        session,
+        "handoff.deliverability_recipient_suppressed",
+        case_id=handoff.case_id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "outbox_id": outbox_id,
+            "recipient": recipient,
+            "preflight_status": preflight_status,
+            "suppression_reason": suppression_reason,
+        },
+    )
+    await session.commit()
+    return handoff
 
 
 async def enqueue_job(
@@ -2741,6 +2843,12 @@ async def send_one_outbox(
         if preflight_outcome == "BLOCK":
             row.status = DeliveryStatus.CANCELLED
             row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
+            auto_suppressed = bool(preflight_facts.get("auto_suppressed"))
+            if auto_suppressed and case is not None and case.status not in {
+                CaseStatus.CLOSED_WON,
+                CaseStatus.CLOSED_LOST,
+            }:
+                case.status = CaseStatus.PAUSED
             await audit(
                 session,
                 "outbox.preflight_blocked",
@@ -2749,7 +2857,7 @@ async def send_one_outbox(
                 data={"outbox_id": row.id, **preflight_facts},
             )
             await session.commit()
-            if case is not None:
+            if case is not None and not auto_suppressed:
                 await create_handoff(
                     session,
                     case=case,
