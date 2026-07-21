@@ -58,15 +58,31 @@ def _business_local(settings: Settings, at: datetime | None = None) -> datetime:
     return value.astimezone(ZoneInfo(settings.business_timezone))
 
 
+def _commercial_local(settings: Settings, at: datetime | None = None) -> datetime:
+    value = at or datetime.now(UTC)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("commercial clock requires a timezone-aware datetime")
+    return value.astimezone(ZoneInfo(settings.commercial_timezone))
+
+
+def commercial_week_bounds(
+    settings: Settings,
+    at: datetime | None = None,
+) -> tuple[date, date]:
+    """Return Monday through Friday for the commercial team's local week."""
+
+    local_day = _commercial_local(settings, at).date()
+    week_start = local_day - timedelta(days=local_day.weekday())
+    return week_start, week_start + timedelta(days=4)
+
+
 def business_week_bounds(
     settings: Settings,
     at: datetime | None = None,
 ) -> tuple[date, date]:
-    """Return Monday through Friday for the business-local calendar week."""
+    """Backward-compatible name for the configured commercial-data week."""
 
-    local_day = _business_local(settings, at).date()
-    week_start = local_day - timedelta(days=local_day.weekday())
-    return week_start, week_start + timedelta(days=4)
+    return commercial_week_bounds(settings, at)
 
 
 def is_business_day(settings: Settings, at: datetime | None = None) -> bool:
@@ -84,6 +100,34 @@ def next_business_open(settings: Settings, at: datetime | None = None) -> dateti
     local = _business_local(settings, at)
     opening = local.replace(
         hour=settings.business_open_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if local.weekday() < 5 and local <= opening:
+        return opening.astimezone(UTC)
+
+    candidate = opening + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(UTC)
+
+
+def is_commercial_day(settings: Settings, at: datetime | None = None) -> bool:
+    return _commercial_local(settings, at).weekday() < 5
+
+
+def is_commercial_open(settings: Settings, at: datetime | None = None) -> bool:
+    local = _commercial_local(settings, at)
+    return local.weekday() < 5 and local.time() >= time(settings.commercial_open_hour)
+
+
+def next_commercial_open(settings: Settings, at: datetime | None = None) -> datetime:
+    """Return the commercial team's next local opening, normalized to UTC."""
+
+    local = _commercial_local(settings, at)
+    opening = local.replace(
+        hour=settings.commercial_open_hour,
         minute=0,
         second=0,
         microsecond=0,
@@ -126,7 +170,7 @@ async def get_or_create_current_cycle(
     """
 
     cycle_scope = (scope or settings.commercial_scope).strip() or "default"
-    week_start, week_end = business_week_bounds(settings, at)
+    week_start, week_end = commercial_week_bounds(settings, at)
     existing = await session.scalar(_cycle_lookup(cycle_scope, week_start))
     if existing is not None:
         return existing
@@ -371,7 +415,7 @@ def commercial_update_link(
     *,
     at: datetime | None = None,
 ) -> str:
-    week_start, week_end = business_week_bounds(settings, at)
+    week_start, week_end = commercial_week_bounds(settings, at)
     template = settings.commercial_update_url or (
         f"{settings.public_base_url.rstrip('/')}/admin/commercial/current/update"
     )

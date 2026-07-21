@@ -113,14 +113,17 @@ The generated import-ready workbook is `outputs/inr_price_policy_20260715/AIEmai
 
 ### Weekly price and inventory gate
 
-Production automation treats each India business week (Monday through Friday,
-`Asia/Kolkata`) as a separate commercial-data version. Price and inventory are
-confirmed independently. An active price row is not considered proof of stock.
+Production automation treats each Nanjing commercial week (Monday through
+Friday, `COMMERCIAL_TIMEZONE=Asia/Shanghai`) as a separate commercial-data
+version. Price and inventory are confirmed independently. An active price row
+is not considered proof of stock. Customer-facing automation remains on
+`BUSINESS_TIMEZONE=Asia/Kolkata`; the two clocks are intentionally independent.
 
 - Saturday and Sunday automated mail is held until Monday. Explicitly approved
   human replies may still be sent.
-- On Monday after `BUSINESS_OPEN_HOUR`, the worker creates one idempotent DingTalk
-  reminder for the week when either price or inventory is still pending.
+- On Monday after `COMMERCIAL_OPEN_HOUR` in `COMMERCIAL_TIMEZONE`, the worker
+  creates one idempotent DingTalk reminder for the week when either price or
+  inventory is still pending.
 - Automatic quotation generation waits without consuming the normal job retry
   budget until both confirmations are complete.
 - A frozen quotation from a previous week is cancelled before SMTP delivery and

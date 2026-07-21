@@ -15,7 +15,9 @@ from app.commercial import (
     get_commercial_data_provider,
     get_or_create_current_cycle,
     is_business_day,
+    is_commercial_day,
     next_business_open,
+    next_commercial_open,
     review_link,
 )
 from app.db import CommercialDataCycle, InventorySnapshot, PricePolicy
@@ -84,16 +86,38 @@ class _ScalarSession:
         return self.responses.pop(0)
 
 
-def test_business_week_uses_business_timezone_across_utc_date_boundary() -> None:
-    settings = _settings()
-    # Sunday UTC is already Monday in India.
-    observed_at = datetime(2026, 7, 19, 20, 0, tzinfo=UTC)
+def test_business_week_uses_commercial_timezone_across_utc_date_boundary() -> None:
+    settings = _settings(
+        commercial_timezone="Asia/Shanghai",
+        commercial_open_hour=10,
+    )
+    # Shanghai is already Monday while India is still Sunday. Commercial
+    # cycles must follow the independent commercial clock.
+    observed_at = datetime(2026, 7, 19, 16, 30, tzinfo=UTC)
 
     assert business_week_bounds(settings, observed_at) == (
         date(2026, 7, 20),
         date(2026, 7, 24),
     )
-    assert is_business_day(settings, observed_at)
+    assert is_commercial_day(settings, observed_at)
+    assert not is_business_day(settings, observed_at)
+
+
+def test_next_commercial_open_uses_independent_commercial_open_hour() -> None:
+    settings = _settings(
+        commercial_timezone="Asia/Shanghai",
+        commercial_open_hour=10,
+    )
+    observed_at = datetime(2026, 7, 20, 1, 0, tzinfo=UTC)  # 09:00 Shanghai
+
+    assert next_commercial_open(settings, observed_at) == datetime(
+        2026,
+        7,
+        20,
+        2,
+        0,
+        tzinfo=UTC,
+    )
 
 
 @pytest.mark.parametrize(

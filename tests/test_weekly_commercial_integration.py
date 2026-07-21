@@ -525,8 +525,14 @@ async def test_builtin_editor_rejects_stale_page_and_missing_available_quantity(
 async def test_weekly_reminder_is_idempotent_for_many_worker_ticks(
     db_session: AsyncSession,
 ) -> None:
-    settings = _settings(dingtalk_transport="log")
-    monday = datetime(2026, 7, 20, 4, 0, tzinfo=UTC)  # 09:30 India
+    settings = _settings(
+        dingtalk_transport="log",
+        commercial_timezone="Asia/Shanghai",
+        commercial_open_hour=10,
+    )
+    # 10:30 in Shanghai but only 08:00 in India. The commercial reminder must
+    # use its own clock rather than the customer-email business clock.
+    monday = datetime(2026, 7, 20, 2, 30, tzinfo=UTC)
 
     assert await ensure_weekly_commercial_refresh(db_session, settings, at=monday) is True
     assert await ensure_weekly_commercial_refresh(db_session, settings, at=monday) is False
@@ -604,19 +610,25 @@ async def test_commercial_job_defer_does_not_consume_retry_budget(
 async def test_weekend_automated_mail_waits_until_monday(
     db_session: AsyncSession,
 ) -> None:
-    saturday = datetime(2026, 7, 18, 4, 30, tzinfo=UTC)  # Saturday 10:00 India
+    # Shanghai is already Monday, but it is still Sunday in India. Customer
+    # mail continues to follow BUSINESS_TIMEZONE, not COMMERCIAL_TIMEZONE.
+    sunday = datetime(2026, 7, 19, 17, 0, tzinfo=UTC)
+    settings = _settings(
+        commercial_timezone="Asia/Shanghai",
+        commercial_open_hour=10,
+    )
     row = Outbox(
         business_key="weekend-test",
         message_id="<weekend-test@example.com>",
         recipient="buyer@example.com",
         raw_message="not sent",
         message_kind="GENERAL",
-        available_at=saturday,
+        available_at=sunday,
     )
     db_session.add(row)
     await db_session.commit()
 
-    assert await send_one_outbox(db_session, _settings(), at=saturday) is True
+    assert await send_one_outbox(db_session, settings, at=sunday) is True
     await db_session.refresh(row)
     assert row.status is DeliveryStatus.PENDING
     assert row.attempts == 0

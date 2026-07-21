@@ -1254,6 +1254,8 @@ async def _commercial_cycle_payload(
     return {
         "cycle_id": cycle.id,
         "scope": cycle.scope,
+        "commercial_timezone": settings.commercial_timezone,
+        "commercial_open_hour": settings.commercial_open_hour,
         "week_start": cycle.week_start.isoformat(),
         "week_end": cycle.week_end.isoformat(),
         "price_status": cycle.price_status,

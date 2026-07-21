@@ -26,7 +26,8 @@ from app.commercial import (
     get_commercial_data_provider,
     get_or_create_current_cycle,
     is_business_day,
-    is_business_open,
+    is_commercial_day,
+    is_commercial_open,
     lock_commercial_scope,
     next_business_open,
 )
@@ -342,8 +343,8 @@ async def ensure_weekly_commercial_refresh(
     if (
         settings.demo_mode
         or not settings.commercial_gate_enabled
-        or not is_business_day(settings, observed_at)
-        or not is_business_open(settings, observed_at)
+        or not is_commercial_day(settings, observed_at)
+        or not is_commercial_open(settings, observed_at)
     ):
         return False
     cycle = await get_or_create_current_cycle(session, settings, at=observed_at)

@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import select
 
+from app.api import reactivation_defaults
 from app.db import (
     CaseStage,
     CaseStatus,
@@ -26,6 +27,7 @@ from app.reactivation import (
     start_campaign,
     validate_template,
 )
+from app.settings import Settings
 
 
 def _campaign(**overrides) -> ReactivationCampaign:
@@ -76,6 +78,24 @@ def test_daily_schedule_uses_business_window_and_skips_weekends() -> None:
     next_window = next_campaign_window(campaign, friday_after_close)
     assert next_window is not None
     assert next_window.astimezone(india) == datetime(2026, 7, 27, 9, 0, tzinfo=india)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reactivation_defaults_keep_customer_business_timezone(db_session) -> None:
+    settings = Settings(
+        _env_file=None,
+        business_timezone="Asia/Kolkata",
+        business_open_hour=9,
+        commercial_timezone="Asia/Shanghai",
+        commercial_open_hour=10,
+    )
+
+    defaults = await reactivation_defaults("admin", db_session, settings)
+
+    assert defaults["timezone"] == "Asia/Kolkata"
+    assert defaults["send_window_start_hour"] == 9
+    assert defaults["send_window_end_hour"] == 17
 
 
 @pytest.mark.integration

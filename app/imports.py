@@ -454,7 +454,9 @@ async def import_prices(
     rows = _rows(path)
     result = ImportResult(source_hash=_hash_file(path), total_rows=len(rows))
     settings = get_settings()
-    business_today = datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date()
+    commercial_today = datetime.now(UTC).astimezone(
+        ZoneInfo(settings.commercial_timezone)
+    ).date()
     content = load_content(settings.content_dir)
     parsed: list[dict[str, Any]] = []
     for number, row in enumerate(rows, start=2):
@@ -493,11 +495,11 @@ async def import_prices(
             tier_1_max = tier_2_max = None
             tier_1_markup = tier_2_markup = Decimal("0")
         try:
-            valid_from = _date(row.get("valid_from")) or business_today
+            valid_from = _date(row.get("valid_from")) or commercial_today
             valid_to = _date(row.get("valid_to"))
         except ValueError:
             errors.append("valid_from and valid_to must be ISO dates")
-            valid_from = business_today
+            valid_from = commercial_today
             valid_to = None
         try:
             max_rounds = int(

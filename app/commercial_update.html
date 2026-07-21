@@ -67,7 +67,7 @@
     <section class="card">
       <div class="card-head"><h2>本周状态</h2><span id="ready-pill" class="pill warn">正在读取</span></div>
       <div class="summary">
-        <div class="metric"><span>业务周</span><strong id="week">—</strong></div>
+        <div class="metric"><span>报价更新周</span><strong id="week">—</strong></div>
         <div class="metric"><span>价格</span><strong id="price-status">—</strong></div>
         <div class="metric"><span>库存</span><strong id="inventory-status">—</strong></div>
         <div class="metric"><span>产品数量</span><strong id="product-count">—</strong></div>
@@ -120,7 +120,7 @@
     }
     function render(data) {
       state = data;
-      $("#week").textContent = `${data.week_start} 至 ${data.week_end}`;
+      $("#week").textContent = `${data.week_start} 至 ${data.week_end}（${data.commercial_timezone}）`;
       $("#price-status").textContent = data.price_status;
       $("#inventory-status").textContent = data.inventory_status;
       $("#product-count").textContent = data.editor_products.length;

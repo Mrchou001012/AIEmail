@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     commercial_gate_enabled: bool = True
     commercial_data_provider: Literal["database"] = "database"
     commercial_scope: str = "default"
+    commercial_timezone: str = "Asia/Shanghai"
+    commercial_open_hour: int = 9
     business_timezone: str = "Asia/Kolkata"
     business_open_hour: int = 9
     commercial_refresh_check_seconds: int = 60
@@ -120,11 +122,27 @@ class Settings(BaseSettings):
             raise ValueError("BUSINESS_TIMEZONE must be a valid IANA timezone") from exc
         return value
 
+    @field_validator("commercial_timezone")
+    @classmethod
+    def valid_commercial_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("COMMERCIAL_TIMEZONE must be a valid IANA timezone") from exc
+        return value
+
     @field_validator("business_open_hour")
     @classmethod
     def valid_business_open_hour(cls, value: int) -> int:
         if not 0 <= value <= 23:
             raise ValueError("BUSINESS_OPEN_HOUR must be between 0 and 23")
+        return value
+
+    @field_validator("commercial_open_hour")
+    @classmethod
+    def valid_commercial_open_hour(cls, value: int) -> int:
+        if not 0 <= value <= 23:
+            raise ValueError("COMMERCIAL_OPEN_HOUR must be between 0 and 23")
         return value
 
     @field_validator("imap_batch_size")
