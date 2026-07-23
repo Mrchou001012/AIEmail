@@ -97,3 +97,6 @@ def test_reactivation_page_exposes_selection_and_campaign_controls() -> None:
     assert "选择当前可选项" in html
     assert "启动批次" in html
     assert "暂停" in html
+    assert "pendingSelection=new Map()" in html
+    assert "setTimeout(()=>flushSelectionQueue()" in html
+    assert "await flushSelectionQueue();" in html

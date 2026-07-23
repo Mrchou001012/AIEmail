@@ -48,6 +48,7 @@
     .reason-item { padding:5px 9px; border-radius:999px; background:var(--red-soft); color:#8c2118; font-size:11px; }
     .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 15px; border-bottom:1px solid var(--line); }
     .toolbar input,.toolbar select { width:auto; min-width:150px; }
+    .selection-state { min-width:72px; }
     .table-wrap { overflow:auto; max-height:650px; }
     table { width:100%; border-collapse:collapse; min-width:1050px; }
     th,td { padding:10px 11px; text-align:left; border-bottom:1px solid #edf0f4; vertical-align:top; }
@@ -118,6 +119,7 @@
         <button class="btn" id="select-page">选择当前可选项</button>
         <button class="btn" id="clear-page">取消当前选择</button>
         <span class="muted" id="row-count"></span>
+        <span class="muted selection-state" id="selection-state"></span>
       </div>
       <div class="table-wrap">
         <table>
@@ -139,6 +141,8 @@
   const statusKind = (v) => ["SENT","REPLIED","COMPLETED"].includes(v)?"good":["FAILED","CANCELLED","EXCLUDED","SKIPPED"].includes(v)?"bad":["RUNNING","SCHEDULED","QUEUED","SELECTED"].includes(v)?"info":"warn";
   const pill = (v) => `<span class="pill ${statusKind(String(v||""))}">${esc(v||"—")}</span>`;
   let defaults=null, campaigns=[], current=null, rows=[];
+  let selectionTimer=null, selectionFlush=null, selectionCampaignId=null;
+  const pendingSelection=new Map();
 
   async function api(url, options={}) {
     const response = await fetch(url, {cache:"no-store", headers:{Accept:"application/json", ...(options.body?{"Content-Type":"application/json"}:{}), ...(options.headers||{})}, ...options});
@@ -175,7 +179,7 @@
   }
   function renderRows() {
     $("#row-count").textContent=`显示 ${rows.length} / ${current?.detailTotal||0}`;
-    $("#recipients").innerHTML=rows.length?rows.map(r=>`<tr><td><input class="checkbox recipient-check" type="checkbox" data-id="${r.id}" ${r.selected?"checked":""} ${!r.eligible||current.status!=="DRAFT"?"disabled":""}></td><td><div class="main"><strong>${esc(r.company_name)}</strong></div><span class="small">${esc(r.contact_name)} · ${esc(r.email)}</span></td><td><span class="main">${esc(r.snapshot.product_code||"—")}</span><span class="small">${esc(r.snapshot.product_name||"")}</span></td><td>${fmt(r.last_contact_at)}<span class="small">${esc(r.latest_direction||"—")} · ${esc(r.snapshot.inactive_days??"—")} 天</span></td><td>${r.has_ever_replied?pill("曾回复"):pill("未回复")}</td><td>${r.previous_reactivation_count}</td><td>${fmt(r.scheduled_for||r.sent_at||r.replied_at)}<span class="small">${r.outbox_status?`Outbox ${esc(r.outbox_status)}`:""}</span></td><td>${pill(r.status)}<span class="small">${esc(reasonText[r.exclusion_reason]||r.exclusion_reason||"")}</span></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合当前筛选的记录</td></tr>';
+    $("#recipients").innerHTML=rows.length?rows.map(r=>`<tr data-recipient-id="${r.id}"><td><input class="checkbox recipient-check" type="checkbox" data-id="${r.id}" ${r.selected?"checked":""} ${!r.eligible||current.status!=="DRAFT"?"disabled":""}></td><td><div class="main"><strong>${esc(r.company_name)}</strong></div><span class="small">${esc(r.contact_name)} · ${esc(r.email)}</span></td><td><span class="main">${esc(r.snapshot.product_code||"—")}</span><span class="small">${esc(r.snapshot.product_name||"")}</span></td><td>${fmt(r.last_contact_at)}<span class="small">${esc(r.latest_direction||"—")} · ${esc(r.snapshot.inactive_days??"—")} 天</span></td><td>${r.has_ever_replied?pill("曾回复"):pill("未回复")}</td><td>${r.previous_reactivation_count}</td><td>${fmt(r.scheduled_for||r.sent_at||r.replied_at)}<span class="small">${r.outbox_status?`Outbox ${esc(r.outbox_status)}`:""}</span></td><td class="recipient-status">${pill(r.status)}<span class="small">${esc(reasonText[r.exclusion_reason]||r.exclusion_reason||"")}</span></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合当前筛选的记录</td></tr>';
   }
   async function loadCampaigns(preferred=null) {
     campaigns=(await api("/admin/reactivation/campaigns")).campaigns||[];
@@ -189,8 +193,65 @@
     $("#template-preview").textContent=`主题：${current.subject_template}\n\n${current.body_template}\n\n[正式签名由系统自动追加]`;
     renderCampaigns(); renderMetrics(current); renderActions(current); renderRows();
   }
-  async function updateSelection(ids, selected) { if(!ids.length)return; await api(`/admin/reactivation/campaigns/${current.id}/selection`,{method:"POST",body:JSON.stringify({recipient_ids:ids,selected})}); await loadCampaigns(current.id); }
+  function reflectSelection(row, selected, updateDom=true) {
+    if(row.selected===selected)return;
+    const oldStatus=row.status;
+    row.selected=selected;
+    row.status=selected?"SELECTED":"CANDIDATE";
+    current.selected_count=Math.max(0,(current.selected_count||0)+(selected?1:-1));
+    current.counts={...(current.counts||{})};
+    current.counts[oldStatus]=Math.max(0,(current.counts[oldStatus]||0)-1);
+    current.counts[row.status]=(current.counts[row.status]||0)+1;
+    const summary=campaigns.find(item=>item.id===current.id);
+    if(summary){summary.selected_count=current.selected_count;summary.counts={...current.counts};}
+    if(!updateDom)return;
+    const tableRow=$(`#recipients tr[data-recipient-id="${row.id}"]`);
+    if(tableRow){
+      const checkbox=tableRow.querySelector(".recipient-check");
+      if(checkbox)checkbox.checked=selected;
+      const status=tableRow.querySelector(".recipient-status");
+      if(status)status.innerHTML=`${pill(row.status)}<span class="small">${esc(reasonText[row.exclusion_reason]||row.exclusion_reason||"")}</span>`;
+    }
+  }
+  function queueSelection(ids, selected) {
+    if(!current||current.status!=="DRAFT"||!ids.length)return;
+    if(selectionCampaignId!==null&&selectionCampaignId!==current.id)return setNotice("请等待上一批选择保存完成。","warn");
+    selectionCampaignId=current.id;
+    const bulk=ids.length>20;
+    const rowById=new Map(rows.map(row=>[row.id,row]));
+    for(const id of ids){
+      const row=rowById.get(id);
+      if(!row||!row.eligible)continue;
+      reflectSelection(row,selected,!bulk);
+      pendingSelection.set(id,selected);
+    }
+    if(bulk)renderRows();
+    renderCampaigns();renderMetrics(current);
+    $("#selection-state").textContent="等待保存…";
+    clearTimeout(selectionTimer);
+    selectionTimer=setTimeout(()=>flushSelectionQueue().catch(error=>setNotice(error.message,"bad")),250);
+  }
+  async function flushSelectionQueue() {
+    clearTimeout(selectionTimer);selectionTimer=null;
+    if(selectionFlush){await selectionFlush;if(pendingSelection.size)return flushSelectionQueue();return;}
+    if(!pendingSelection.size){selectionCampaignId=null;return;}
+    const campaignId=selectionCampaignId;
+    const batch=[...pendingSelection.entries()];pendingSelection.clear();
+    $("#selection-state").textContent="正在保存…";
+    selectionFlush=(async()=>{
+      for(const selected of [true,false]){
+        const ids=batch.filter(([,value])=>value===selected).map(([id])=>id);
+        if(ids.length)await api(`/admin/reactivation/campaigns/${campaignId}/selection`,{method:"POST",body:JSON.stringify({recipient_ids:ids,selected})});
+      }
+    })();
+    try{await selectionFlush;$("#selection-state").textContent="已保存";}
+    catch(error){pendingSelection.clear();selectionCampaignId=null;await loadCampaigns(campaignId);throw error;}
+    finally{selectionFlush=null;}
+    if(pendingSelection.size)return flushSelectionQueue();
+    selectionCampaignId=null;
+  }
   async function action(name) {
+    await flushSelectionQueue();
     if(name==="start"&&!confirm(`确认启动“${current.name}”？系统将按计划自动发给已选的 ${current.selected_count} 位客户。`)) return;
     if(name==="refresh"&&!confirm("重新筛选会清除当前勾选，确认继续？")) return;
     if(name==="cancel"&&!confirm("确认取消这个批次？尚未发送的邮件会停止。")) return;
@@ -199,11 +260,11 @@
   async function reload(preferred=null) { try { defaults=await api("/admin/reactivation/defaults"); renderNotice(); await loadCampaigns(preferred); $("#updated").textContent=`更新 ${fmt(new Date().toISOString())}`; } catch(e){setNotice(e.message,"bad");} }
 
   $("#create-form").addEventListener("submit",async e=>{e.preventDefault(); const button=$("#create");button.disabled=true;try{const payload={name:$("#name").value,subject_template:$("#subject").value,body_template:$("#body").value,min_inactive_days:Number($("#inactive-days").value),reply_filter:$("#reply-filter").value,daily_limit:Number($("#daily-limit").value),timezone:defaults.timezone,send_window_start_hour:Number($("#start-hour").value),send_window_end_hour:Number($("#end-hour").value),start_date:$("#start-date").value,max_reactivations:Number($("#max-reactivations").value),second_reactivation_days:Number($("#second-days").value),require_consent_basis:$("#require-consent").checked};const data=await api("/admin/reactivation/campaigns",{method:"POST",body:JSON.stringify(payload)});setNotice(`筛选完成：可选 ${data.scan.eligible}，排除 ${data.scan.excluded}。请检查并勾选客户。`,"good");await loadCampaigns(data.campaign.id);}catch(err){setNotice(err.message,"bad");}finally{button.disabled=false;}});
-  document.addEventListener("click",async e=>{const c=e.target.closest("[data-campaign]");if(c){current=campaigns.find(x=>x.id===Number(c.dataset.campaign));await loadDetail();return}const a=e.target.closest("[data-action]");if(a){try{await action(a.dataset.action)}catch(err){setNotice(err.message,"bad")}}});
-  $("#recipients").addEventListener("change",async e=>{if(e.target.matches(".recipient-check")){try{await updateSelection([Number(e.target.dataset.id)],e.target.checked)}catch(err){setNotice(err.message,"bad")}}});
-  $("#select-page").addEventListener("click",()=>updateSelection(rows.filter(r=>r.eligible&&!r.selected).map(r=>r.id),true).catch(e=>setNotice(e.message,"bad")));
-  $("#clear-page").addEventListener("click",()=>updateSelection(rows.filter(r=>r.selected).map(r=>r.id),false).catch(e=>setNotice(e.message,"bad")));
-  $("#filter").addEventListener("click",()=>current&&loadDetail().catch(e=>setNotice(e.message,"bad"))); $("#reload").addEventListener("click",()=>reload().catch(e=>setNotice(e.message,"bad")));
+  document.addEventListener("click",async e=>{const c=e.target.closest("[data-campaign]");if(c){try{await flushSelectionQueue();current=campaigns.find(x=>x.id===Number(c.dataset.campaign));await loadDetail()}catch(err){setNotice(err.message,"bad")}return}const a=e.target.closest("[data-action]");if(a){try{await action(a.dataset.action)}catch(err){setNotice(err.message,"bad")}}});
+  $("#recipients").addEventListener("change",e=>{if(e.target.matches(".recipient-check"))queueSelection([Number(e.target.dataset.id)],e.target.checked)});
+  $("#select-page").addEventListener("click",()=>queueSelection(rows.filter(r=>r.eligible&&!r.selected).map(r=>r.id),true));
+  $("#clear-page").addEventListener("click",()=>queueSelection(rows.filter(r=>r.selected).map(r=>r.id),false));
+  $("#filter").addEventListener("click",async()=>{try{await flushSelectionQueue();if(current)await loadDetail()}catch(e){setNotice(e.message,"bad")}}); $("#reload").addEventListener("click",async()=>{try{await flushSelectionQueue();await reload()}catch(e){setNotice(e.message,"bad")}});
   (async()=>{try{defaults=await api("/admin/reactivation/defaults");fillDefaults();renderNotice();await loadCampaigns();}catch(e){setNotice(e.message,"bad")}})();
   setInterval(()=>{if(!document.hidden&&current&&current.status!=="DRAFT")reload(current.id)},15000);
 </script>
