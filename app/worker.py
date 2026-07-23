@@ -7,6 +7,7 @@ from app.reactivation import ensure_reactivation_dispatch
 from app.services import (
     claim_and_run_job,
     ensure_weekly_commercial_refresh,
+    reconcile_permanent_bounce_handoffs,
     reconcile_unknown_outbox,
     send_one_outbox,
 )
@@ -32,6 +33,7 @@ async def main() -> None:
     settings = get_settings()
     next_commercial_check = 0.0
     next_reactivation_check = 0.0
+    next_bounce_reconcile = 0.0
     logger.info("worker started as %s", worker_id)
     while True:
         did_work = False
@@ -43,6 +45,12 @@ async def main() -> None:
         if loop_time >= next_reactivation_check:
             did_work = await _run_step("reactivation", ensure_reactivation_dispatch) or did_work
             next_reactivation_check = loop_time + settings.reactivation_check_seconds
+        if loop_time >= next_bounce_reconcile:
+            did_work = (
+                await _run_step("bounce-review-reconcile", reconcile_permanent_bounce_handoffs)
+                or did_work
+            )
+            next_bounce_reconcile = loop_time + 60
         did_work = await _run_step("reconcile", reconcile_unknown_outbox) or did_work
         did_work = await _run_step("outbox", send_one_outbox) or did_work
         if not did_work:

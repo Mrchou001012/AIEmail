@@ -63,6 +63,12 @@ _HARD_MARKERS = re.compile(
     r"does not exist|unrouteable address|bad destination mailbox|bad destination system|domain (?:does not exist|not found)|"
     r"用户不存在|收件人不存在|邮箱地址不存在|域名不存在)"
 )
+_PERMANENT_FAILURE_MARKERS = re.compile(
+    r"(?i)(nxdomain|badrcptdomain|no such (?:user|domain)|user unknown|unknown recipient|"
+    r"address not found|email account (?:does not|doesn't) exist|unrouteable address|"
+    r"bad destination (?:mailbox|system)|domain name not found|"
+    r"domain\s+[^\s,;]+\s+(?:does not exist|not found|couldn.?t be found|could not be found))"
+)
 
 
 def _field(block: Message, name: str) -> str | None:
@@ -93,6 +99,25 @@ def _original_message_data(message: Message) -> tuple[str | None, str | None]:
             addresses = [address.casefold() for _, address in getaddresses(recipients) if address]
             return message_id, addresses[0] if addresses else None
     return None, None
+
+
+def has_permanent_failure_evidence(text: str, *, status_code: str | None = None) -> bool:
+    """Return true only for evidence that identifies a permanently invalid route.
+
+    Some providers emit a temporary-looking enhanced status or include phrases
+    such as ``try again`` in a permanent NXDOMAIN/unknown-user report.  Those
+    generic soft markers must not override an explicit nonexistent domain or
+    recipient.
+    """
+    status_match = _STATUS_RE.search(status_code or text)
+    normalized_status = status_match.group(1) if status_match else status_code
+    return bool(
+        (
+            normalized_status
+            and (normalized_status.startswith("5.1.") or normalized_status == "5.4.4")
+        )
+        or _PERMANENT_FAILURE_MARKERS.search(text)
+    )
 
 
 def classify_bounce(raw: bytes, *, subject: str, body: str, sender: str) -> BounceClassification:
@@ -149,15 +174,17 @@ def classify_bounce(raw: bytes, *, subject: str, body: str, sender: str) -> Boun
         recipient = next((candidate for candidate in candidates if candidate != sender.casefold()), None)
 
     normalized_action = (action or "").casefold()
-    if (
+    if has_permanent_failure_evidence(combined, status_code=status_code):
+        bounce_type = BounceType.HARD
+    elif (status_code and status_code.startswith("5.7.")) or _POLICY_MARKERS.search(combined):
+        bounce_type = BounceType.POLICY
+    elif (
         (status_code and status_code.startswith("4."))
         or (status_code == "5.2.2")
         or normalized_action in {"delayed", "expanded"}
         or _SOFT_MARKERS.search(combined)
     ):
         bounce_type = BounceType.SOFT
-    elif (status_code and status_code.startswith("5.7.")) or _POLICY_MARKERS.search(combined):
-        bounce_type = BounceType.POLICY
     elif (
         (status_code and (status_code.startswith("5.1.") or status_code in {"5.4.4"}))
         or _HARD_MARKERS.search(combined)
@@ -181,10 +208,12 @@ def classify_bounce(raw: bytes, *, subject: str, body: str, sender: str) -> Boun
 def classify_smtp_failure(smtp_code: int, diagnostic: str) -> BounceType:
     status_match = _STATUS_RE.search(diagnostic)
     status_code = status_match.group(1) if status_match else None
-    if smtp_code < 500 or (status_code and status_code.startswith("4.")) or _SOFT_MARKERS.search(diagnostic):
-        return BounceType.SOFT
+    if has_permanent_failure_evidence(diagnostic, status_code=status_code):
+        return BounceType.HARD
     if (status_code and status_code.startswith("5.7.")) or _POLICY_MARKERS.search(diagnostic):
         return BounceType.POLICY
+    if smtp_code < 500 or (status_code and status_code.startswith("4.")) or _SOFT_MARKERS.search(diagnostic):
+        return BounceType.SOFT
     if (
         (status_code and (status_code.startswith("5.1.") or status_code == "5.4.4"))
         or _HARD_MARKERS.search(diagnostic)

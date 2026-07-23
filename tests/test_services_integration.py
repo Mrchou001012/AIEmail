@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai import stub_analyze
 from app.api import dashboard_data
 from app.auto_replies import AutomatedReplyType
+from app.bounces import BounceType
 from app.db import (
     AuditEvent,
     CaseStage,
@@ -61,6 +62,7 @@ from app.services import (
     notify_handoff,
     process_inbound,
     queue_human_reply,
+    reconcile_permanent_bounce_handoffs,
     resolve_deliverability_handoff,
     seed_demo_data,
     send_one_outbox,
@@ -2568,6 +2570,140 @@ async def test_correlated_hard_bounce_permanently_suppresses_recipient(
     assert contact is not None and contact.suppressed is True
     assert case.status == CaseStatus.PAUSED
     assert handoff_count == 0
+
+
+async def test_correlated_nxdomain_bounce_does_not_create_human_review(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_email = case.contact.email
+    original_message_id = "<nxdomain-bounce-original@example.com>"
+    sent = Outbox(
+        case_id=case.id,
+        business_key="nxdomain-bounce-original",
+        message_id=original_message_id,
+        recipient=contact_email,
+        raw_message="Subject: Quote\n\nHello",
+        status=DeliveryStatus.SENT,
+        sent_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    db_session.add(sent)
+    await db_session.commit()
+    diagnostic = (
+        "DNS Error: DNS type 'mx' lookup of aptuitlaurus.com responded with code NXDOMAIN. "
+        "Domain name not found: aptuitlaurus.com. Check the address and try again."
+    )
+    raw = _integration_dsn(
+        original_message_id=original_message_id,
+        recipient=contact_email,
+        status="4.4.1",
+        diagnostic=diagnostic,
+    )
+
+    email_row = await ingest_raw_email(db_session, raw, mailbox="integration-test")
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+    await db_session.refresh(case)
+    address = await db_session.get(EmailAddressStatus, contact_email)
+    handoff = await db_session.scalar(select(Handoff).where(Handoff.source_email_id == email_row.id))
+
+    assert email_row.bounce_type == BounceType.HARD.value
+    assert address is not None and address.suppressed is True
+    assert address.suppression_reason == "HARD_BOUNCE"
+    assert case.status == CaseStatus.PAUSED
+    assert handoff is None
+
+
+async def test_legacy_nxdomain_soft_review_is_resolved_automatically(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact"])
+    contact_email = case.contact.email
+    case.status = CaseStatus.WAITING_HUMAN
+    sent = Outbox(
+        case_id=case.id,
+        business_key="legacy-nxdomain-original",
+        message_id="<legacy-nxdomain-original@example.com>",
+        recipient=contact_email,
+        raw_message="Subject: Quote\n\nHello",
+        status=DeliveryStatus.SENT,
+        sent_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    db_session.add(sent)
+    await db_session.flush()
+    diagnostic = (
+        "DNS Error: DNS type 'mx' lookup responded with code NXDOMAIN. "
+        "Domain name not found. Check the address and try again."
+    )
+    email_row = EmailMessage(
+        case_id=case.id,
+        customer_id=case.customer_id,
+        contact_id=case.contact_id,
+        direction="INBOUND",
+        mailbox="integration-test",
+        mailbox_folder="INBOX",
+        message_id="<legacy-nxdomain-bounce@googlemail.com>",
+        from_address="mailer-daemon@googlemail.com",
+        to_addresses=["sales@example.com"],
+        subject="Delivery Status Notification (Failure)",
+        body_text=f"Address not found. {diagnostic}",
+        raw_sha256=hashlib.sha256(b"legacy-nxdomain-bounce").hexdigest(),
+        is_history=False,
+        is_bounce=True,
+        bounce_type=BounceType.SOFT.value,
+        bounce_metadata={
+            "recipient": contact_email,
+            "original_message_id": sent.message_id,
+            "matched_outbox_id": sent.id,
+            "status_code": "4.4.1",
+            "diagnostic": diagnostic,
+            "permanent": False,
+        },
+        bounce_handled_at=datetime.now(UTC),
+    )
+    db_session.add(email_row)
+    await db_session.flush()
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.BOUNCE_REVIEW.value,
+        summary=f"Review SOFT delivery failure for {contact_email}",
+        extracted_facts={
+            "recipient": contact_email,
+            "outbox_id": sent.id,
+            "status_code": "4.4.1",
+            "diagnostic": diagnostic,
+        },
+        status="OPEN",
+        dingtalk_status="PENDING",
+    )
+    db_session.add(handoff)
+    await db_session.flush()
+    notify_job = Job(
+        kind="notify_handoff",
+        payload={"handoff_id": handoff.id},
+        idempotency_key=f"handoff-notify:{handoff.id}",
+        status=JobStatus.PENDING,
+    )
+    db_session.add(notify_job)
+    await db_session.commit()
+
+    assert await reconcile_permanent_bounce_handoffs(db_session) == 1
+    await db_session.refresh(case)
+    await db_session.refresh(email_row)
+    await db_session.refresh(handoff)
+    await db_session.refresh(notify_job)
+    address = await db_session.get(EmailAddressStatus, contact_email)
+
+    assert email_row.bounce_type == BounceType.HARD.value
+    assert email_row.bounce_metadata["permanent"] is True
+    assert handoff.status == "RESOLVED"
+    assert handoff.dingtalk_status == "CANCELLED"
+    assert notify_job.status == JobStatus.DONE
+    assert address is not None and address.suppression_reason == "HARD_BOUNCE"
+    assert case.status == CaseStatus.PAUSED
 
 
 async def test_uncorrelated_hard_bounce_goes_to_review_without_suppression(

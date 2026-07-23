@@ -71,6 +71,24 @@ def test_mailbox_full_and_policy_failures_are_not_permanent() -> None:
     assert policy.permanent is False
 
 
+def test_nxdomain_evidence_overrides_temporary_status_and_try_again_text() -> None:
+    diagnostic = (
+        "DNS Error: DNS type 'mx' lookup of aptuitlaurus.com responded with code NXDOMAIN. "
+        "Domain name not found: aptuitlaurus.com. Check the address and try again."
+    )
+    result = classify_bounce(
+        dsn_raw(status="4.4.1", diagnostic=diagnostic),
+        subject="Delivery Status Notification (Failure)",
+        body=f"Address not found. {diagnostic}",
+        sender="mailer-daemon@googlemail.com",
+    )
+
+    assert result.is_bounce is True
+    assert result.bounce_type == BounceType.HARD
+    assert result.permanent is True
+    assert classify_smtp_failure(450, f"450 4.4.1 {diagnostic}") == BounceType.HARD
+
+
 def test_customer_text_about_delivery_failure_is_not_trusted_as_a_bounce() -> None:
     raw = b"From: buyer@example.com\r\nTo: sales@example.com\r\nSubject: Question\r\n\r\nOur own delivery failed yesterday."
     result = classify_bounce(

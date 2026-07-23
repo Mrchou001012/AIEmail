@@ -19,7 +19,12 @@ from sqlalchemy.orm import selectinload
 
 from app.ai import AIClient, validate_rendered_email
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
-from app.bounces import BounceType, classify_bounce, classify_smtp_failure
+from app.bounces import (
+    BounceType,
+    classify_bounce,
+    classify_smtp_failure,
+    has_permanent_failure_evidence,
+)
 from app.commercial import (
     QuoteContext,
     QuoteContextStatus,
@@ -1988,6 +1993,42 @@ async def _match_bounce_outbox(
     return outbox, recipient
 
 
+async def _apply_correlated_hard_bounce(
+    session: AsyncSession,
+    *,
+    email_row: EmailMessage,
+    outbox: Outbox,
+    recipient: str,
+    case: SalesCase | None,
+    audit_event: str,
+) -> None:
+    metadata = dict(email_row.bounce_metadata or {})
+    diagnostic = str(metadata.get("diagnostic") or "")[:2000] or None
+    await _suppress_email_address(
+        session,
+        recipient,
+        reason="HARD_BOUNCE",
+        source_email_id=email_row.id,
+        bounce_type=BounceType.HARD.value,
+        diagnostic=diagnostic,
+    )
+    if case and case.status not in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        case.status = CaseStatus.PAUSED
+    campaign_recipient = await session.scalar(
+        select(ReactivationRecipient).where(ReactivationRecipient.outbox_id == outbox.id)
+    )
+    if campaign_recipient is not None and campaign_recipient.status != "REPLIED":
+        campaign_recipient.status = "FAILED"
+        campaign_recipient.exclusion_reason = "HARD_BOUNCE"
+    await audit(
+        session,
+        audit_event,
+        case_id=case.id if case else None,
+        actor="system",
+        data={"email_id": email_row.id, "outbox_id": outbox.id, **metadata},
+    )
+
+
 async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None:
     if email_row.bounce_handled_at is not None:
         return
@@ -2010,22 +2051,13 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
     diagnostic = str(metadata.get("diagnostic") or "")[:2000] or None
 
     if email_row.bounce_type == BounceType.HARD.value and outbox is not None and recipient:
-        await _suppress_email_address(
+        await _apply_correlated_hard_bounce(
             session,
-            recipient,
-            reason="HARD_BOUNCE",
-            source_email_id=email_row.id,
-            bounce_type=email_row.bounce_type,
-            diagnostic=diagnostic,
-        )
-        if case and case.status == CaseStatus.ACTIVE:
-            case.status = CaseStatus.PAUSED
-        await audit(
-            session,
-            "inbound.hard_bounce_suppressed",
-            case_id=case.id if case else None,
-            actor="system",
-            data={"email_id": email_row.id, "outbox_id": outbox.id, **metadata},
+            email_row=email_row,
+            outbox=outbox,
+            recipient=recipient,
+            case=case,
+            audit_event="inbound.hard_bounce_suppressed",
         )
         await session.commit()
         return
@@ -2053,6 +2085,109 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
         facts={"email_id": email_row.id, "outbox_id": outbox.id if outbox else None, **metadata},
         source_email_id=email_row.id,
     )
+
+
+async def reconcile_permanent_bounce_handoffs(session: AsyncSession) -> int:
+    """Resolve legacy SOFT reviews whose content proves a permanent failure.
+
+    This is deliberately limited to a bounce that can be correlated to an
+    exact sent outbox recipient.  Uncorrelated delivery reports remain in
+    review so an arbitrary inbound message cannot suppress a customer.
+    """
+    handoffs = (
+        (
+            await session.execute(
+                select(Handoff)
+                .where(
+                    Handoff.status == "OPEN",
+                    Handoff.reason_code == HandoffReason.BOUNCE_REVIEW.value,
+                    Handoff.source_email_id.is_not(None),
+                )
+                .order_by(Handoff.id)
+                .limit(100)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    resolved = 0
+    for handoff in handoffs:
+        email_row = await session.get(EmailMessage, handoff.source_email_id)
+        if email_row is None or not email_row.is_bounce:
+            continue
+        facts = {**(email_row.bounce_metadata or {}), **(handoff.extracted_facts or {})}
+        evidence = "\n".join(
+            str(value)
+            for value in (
+                email_row.subject,
+                email_row.body_text,
+                handoff.summary,
+                facts.get("diagnostic"),
+                facts.get("detail"),
+                facts.get("status_code"),
+            )
+            if value
+        )
+        if not has_permanent_failure_evidence(
+            evidence,
+            status_code=str(facts.get("status_code") or "") or None,
+        ):
+            continue
+
+        outbox, recipient = await _match_bounce_outbox(session, email_row)
+        if outbox is None or recipient is None:
+            continue
+        case_id = handoff.case_id or outbox.case_id or email_row.case_id
+        case = await session.get(SalesCase, case_id) if case_id else None
+        if case is not None:
+            handoff.case_id = case.id
+            email_row.case_id = case.id
+            email_row.customer_id = case.customer_id
+            email_row.contact_id = case.contact_id
+
+        metadata = dict(email_row.bounce_metadata or {})
+        detected_by = list(metadata.get("detected_by") or [])
+        if "reconcile:permanent-failure-evidence" not in detected_by:
+            detected_by.append("reconcile:permanent-failure-evidence")
+        metadata.update(
+            {
+                "bounce_type": BounceType.HARD.value,
+                "permanent": True,
+                "recipient": recipient,
+                "matched_outbox_id": outbox.id,
+                "detected_by": detected_by,
+            }
+        )
+        email_row.bounce_type = BounceType.HARD.value
+        email_row.bounce_metadata = metadata
+        email_row.bounce_handled_at = datetime.now(UTC)
+        await _apply_correlated_hard_bounce(
+            session,
+            email_row=email_row,
+            outbox=outbox,
+            recipient=recipient,
+            case=case,
+            audit_event="inbound.bounce_review_auto_resolved",
+        )
+        handoff.status = "RESOLVED"
+        handoff.resolution_note = (
+            f"Automatically resolved: {recipient} has a permanent recipient/domain failure"
+        )
+        if handoff.dingtalk_status != "SENT":
+            handoff.dingtalk_status = "CANCELLED"
+        notify_job = await session.scalar(
+            select(Job).where(Job.idempotency_key == f"handoff-notify:{handoff.id}")
+        )
+        if notify_job is not None and notify_job.status in {JobStatus.PENDING, JobStatus.FAILED}:
+            notify_job.status = JobStatus.DONE
+            notify_job.last_error = "Cancelled: permanent bounce was handled automatically"
+            notify_job.locked_at = None
+            notify_job.locked_by = None
+            notify_job.updated_at = datetime.now(UTC)
+        await session.commit()
+        resolved += 1
+    return resolved
 
 
 async def _handle_automated_reply(
@@ -2471,6 +2606,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
 async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None or handoff.dingtalk_status == "SENT":
+        return
+    if handoff.status != "OPEN":
+        handoff.dingtalk_status = "CANCELLED"
+        await session.commit()
         return
     case = await session.get(SalesCase, handoff.case_id) if handoff.case_id else None
     try:

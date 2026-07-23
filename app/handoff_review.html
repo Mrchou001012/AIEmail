@@ -148,7 +148,8 @@
       $("#send").disabled = blocked;
       $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
       const deliverability = data.reason === "EMAIL_DELIVERABILITY";
-      $("#reply-card").classList.toggle("hidden", deliverability);
+      const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
+      $("#reply-card").classList.toggle("hidden", deliveryReport);
       $("#deliverability-help").classList.toggle("hidden", !deliverability);
       $("#suppress-recipient").classList.toggle("hidden", !deliverability);
       $("#suppress-recipient").disabled = data.status !== "OPEN";
