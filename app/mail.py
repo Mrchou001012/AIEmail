@@ -5,6 +5,7 @@ import hashlib
 import html
 import imaplib
 import logging
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -33,7 +34,29 @@ logger = logging.getLogger(__name__)
 SIGNATURE_LOGO_CID = "lanyachem-logo"
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_INLINE_IMAGES_TOTAL_BYTES = 15 * 1024 * 1024
+MAX_OUTBOUND_ATTACHMENT_COUNT = 10
+MAX_OUTBOUND_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES = 15 * 1024 * 1024
 MAX_OUTBOUND_MESSAGE_BYTES = 24 * 1024 * 1024
+DISALLOWED_OUTBOUND_ATTACHMENT_SUFFIXES = frozenset(
+    {
+        ".bat",
+        ".cmd",
+        ".com",
+        ".exe",
+        ".hta",
+        ".jar",
+        ".js",
+        ".jse",
+        ".msi",
+        ".ps1",
+        ".scr",
+        ".sh",
+        ".vbs",
+        ".vbe",
+        ".wsf",
+    }
+)
 
 
 def _imap_mailbox_arg(folder: str) -> str:
@@ -63,6 +86,13 @@ class InlineImageAsset:
     content_id: str
     content_type: str
     filename: str
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class OutboundAttachment:
+    filename: str
+    content_type: str
     payload: bytes
 
 
@@ -902,6 +932,59 @@ def _attach_related_images(
     html_part.set_boundary(f"=_sales_agent_related_{token}")
 
 
+def _safe_outbound_attachment_filename(raw_filename: str) -> str:
+    filename = re.split(r"[\\/]", raw_filename)[-1]
+    filename = re.sub(r"[\x00-\x1f\x7f]", "", filename).strip()
+    if not filename or filename in {".", ".."}:
+        raise ValueError("attachment filename is missing or invalid")
+    if len(filename) > 255:
+        raise ValueError(f"attachment filename is too long: {filename[:80]}")
+    if Path(filename).suffix.casefold() in DISALLOWED_OUTBOUND_ATTACHMENT_SUFFIXES:
+        raise ValueError(f"executable attachment type is not allowed: {filename}")
+    return filename
+
+
+def _normalized_outbound_attachment_type(content_type: str, filename: str) -> str:
+    normalized = content_type.partition(";")[0].strip().casefold()
+    if normalized == "application/octet-stream" or not re.fullmatch(
+        r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+",
+        normalized,
+    ):
+        normalized = (mimetypes.guess_type(filename)[0] or "application/octet-stream").casefold()
+    return normalized
+
+
+def _attach_outbound_files(
+    message: MIMEEmailMessage,
+    attachments: tuple[OutboundAttachment, ...],
+) -> None:
+    if len(attachments) > MAX_OUTBOUND_ATTACHMENT_COUNT:
+        raise ValueError(f"at most {MAX_OUTBOUND_ATTACHMENT_COUNT} attachments are allowed")
+    total_bytes = 0
+    for attachment in attachments:
+        filename = _safe_outbound_attachment_filename(attachment.filename)
+        size = len(attachment.payload)
+        if not size:
+            raise ValueError(f"attachment is empty: {filename}")
+        if size > MAX_OUTBOUND_ATTACHMENT_BYTES:
+            raise ValueError(f"attachment is too large: {filename}")
+        total_bytes += size
+        if total_bytes > MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES:
+            raise ValueError("attachments exceed the total upload size limit")
+        content_type = _normalized_outbound_attachment_type(
+            attachment.content_type,
+            filename,
+        )
+        maintype, subtype = content_type.split("/", 1)
+        message.add_attachment(
+            attachment.payload,
+            maintype=maintype,
+            subtype=subtype,
+            filename=filename,
+            disposition="attachment",
+        )
+
+
 async def match_case(
     session: AsyncSession,
     parsed: ParsedEmail,
@@ -986,6 +1069,7 @@ def build_message(
     in_reply_to: str | None = None,
     references: list[str] | None = None,
     inline_images: tuple[InlineImageAsset, ...] = (),
+    attachments: tuple[OutboundAttachment, ...] = (),
 ) -> tuple[str, str]:
     domain = from_address.split("@")[-1] if "@" in from_address else "localhost"
     token = uuid.uuid5(uuid.NAMESPACE_URL, stable_key).hex
@@ -1009,6 +1093,9 @@ def build_message(
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
     _attach_related_images(msg, html_body, token, inline_images)
+    if attachments:
+        msg.set_boundary(f"=_sales_agent_alternative_{token}")
+        _attach_outbound_files(msg, attachments)
     msg.set_boundary(f"=_sales_agent_{token}")
     raw = msg.as_string(policy=policy.SMTP)
     if len(raw.encode("utf-8")) > MAX_OUTBOUND_MESSAGE_BYTES:

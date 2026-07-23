@@ -77,6 +77,7 @@ from app.mail import (
     FullReplySource,
     GmailIMAPClient,
     InlineImageAsset,
+    OutboundAttachment,
     ParsedEmail,
     append_quoted_reply,
     attachments_require_review,
@@ -669,6 +670,7 @@ async def queue_human_reply(
     actor: str,
     note: str = "",
     resume_automation: bool = False,
+    attachments: tuple[OutboundAttachment, ...] = (),
 ) -> Outbox:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
@@ -745,6 +747,7 @@ async def queue_human_reply(
         in_reply_to=source_email.message_id,
         references=references,
         inline_images=source.inline_images,
+        attachments=attachments,
     )
     parsed_outbound = parse_mime(raw.encode("utf-8"))
     now = datetime.now(UTC)
@@ -775,7 +778,7 @@ async def queue_human_reply(
             subject=clean_subject,
             body_text=signed_text,
             body_html=signed_html,
-            attachment_metadata=[],
+            attachment_metadata=parsed_outbound.attachments,
             raw_sha256=parsed_outbound.raw_sha256,
         )
     )
@@ -792,6 +795,16 @@ async def queue_human_reply(
             "outbox_id": outbox.id,
             "message_id": message_id,
             "resume_automation": resume_automation,
+            "attachments": [
+                {
+                    "filename": item["filename"],
+                    "content_type": item["content_type"],
+                    "size": item["size"],
+                    "sha256": item["sha256"],
+                }
+                for item in parsed_outbound.attachments
+                if item.get("disposition") == "attachment"
+            ],
         },
     )
     await session.commit()

@@ -46,7 +46,7 @@ from app.history import (
     reconcile_email_history,
 )
 from app.imap_poller import poll_folder_once
-from app.mail import extract_full_message_bodies, parse_mime
+from app.mail import OutboundAttachment, extract_full_message_bodies, parse_mime
 from app.recovery import (
     FalseCounterofferDuplicateSource,
     FalseCounterofferRecoveryRequest,
@@ -542,6 +542,13 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         actor="reviewer",
         note="Reviewed and approved",
         resume_automation=False,
+        attachments=(
+            OutboundAttachment(
+                filename="reviewed-quotation.pdf",
+                content_type="application/pdf",
+                payload=b"%PDF-1.7\nreviewed quotation",
+            ),
+        ),
     )
 
     await db_session.refresh(case)
@@ -571,9 +578,21 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         for part in mime.walk()
         if str(part.get("Content-ID") or "").startswith("<quoted-")
     )
+    uploaded_attachment = next(
+        part
+        for part in mime.walk()
+        if part.get_content_disposition() == "attachment"
+    )
     assert historical_image.get_payload(decode=True) == (
         b"\x89PNG\r\n\x1a\nhuman-review-signature"
     )
+    assert uploaded_attachment.get_filename() == "reviewed-quotation.pdf"
+    assert uploaded_attachment.get_payload(decode=True) == b"%PDF-1.7\nreviewed quotation"
+    outbound_email = await db_session.scalar(
+        select(EmailMessage).where(EmailMessage.message_id == outbox.message_id)
+    )
+    assert outbound_email is not None
+    assert outbound_email.attachment_metadata[0]["filename"] == "reviewed-quotation.pdf"
     assert case.status == CaseStatus.HUMAN_TAKEOVER
     assert handoff.status == "RESOLVED"
     approval = await db_session.scalar(

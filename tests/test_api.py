@@ -67,6 +67,9 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/assign" in html
     assert "/cases" in html
     assert "/send" in html
+    assert "/send-with-attachments" in html
+    assert 'id="reply-attachments"' in html
+    assert "FormData" in html
     assert "确认并加入发件队列" in html
     assert "resume_automation" in html
 

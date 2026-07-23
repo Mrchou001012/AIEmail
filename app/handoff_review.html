@@ -36,6 +36,8 @@
     button:disabled { opacity:.45; cursor:not-allowed; }
     .check { display:flex; align-items:center; gap:8px; font-weight:400; }
     .check input { width:auto; }
+    .file-help { color:var(--muted); font-size:12px; margin-top:6px; }
+    .file-list { margin-top:8px; padding:9px 11px; border-radius:9px; background:#f8fafc; color:var(--muted); overflow-wrap:anywhere; }
     #notice { display:none; margin-bottom:16px; border-radius:10px; padding:11px 13px; background:#eef4ff; }
     #notice.error { display:block; background:#fff1f0; color:var(--red); }
     #notice.ok { display:block; background:#ecfdf3; color:var(--green); }
@@ -85,6 +87,10 @@
           <input id="reply-subject" maxlength="998">
           <label for="reply-body">邮件正文</label>
           <textarea id="reply-body" maxlength="50000"></textarea>
+          <label for="reply-attachments">回复附件（可选）</label>
+          <input id="reply-attachments" type="file" multiple>
+          <div class="file-help">最多 10 个附件；单个不超过 10 MB，总计不超过 15 MB。系统会阻止可执行脚本等危险文件。</div>
+          <div class="file-list" id="attachment-list">未选择附件</div>
           <label for="reply-note">处理备注</label>
           <input id="reply-note" maxlength="2000" placeholder="例如：已核对价格并人工回复">
           <label class="check"><input id="resume" type="checkbox">发送后恢复该案例的 AI 自动处理</label>
@@ -147,6 +153,7 @@
       $("#association-tools").classList.toggle("hidden", Boolean(data.case));
       const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
       $("#send").disabled = blocked;
+      $("#reply-attachments").disabled = blocked;
       $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
       const deliverability = data.reason === "EMAIL_DELIVERABILITY";
       const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
@@ -158,13 +165,40 @@
     }
     async function load() { try { render(await api(`/admin/handoffs/${id}`)); } catch (error) { notice(error.message, "error"); } }
     async function post(path, payload, success) { try { await api(path, {method:"POST", body:JSON.stringify(payload)}); notice(success); await load(); } catch (error) { notice(error.message, "error"); } }
+    function renderAttachments() {
+      const files = [...$("#reply-attachments").files];
+      const total = files.reduce((sum, file) => sum + file.size, 0);
+      $("#attachment-list").textContent = files.length
+        ? `${files.map((file) => `${file.name}（${(file.size / 1024 / 1024).toFixed(2)} MB）`).join("、")}；共 ${files.length} 个，${(total / 1024 / 1024).toFixed(2)} MB`
+        : "未选择附件";
+    }
 
     $("#assign").addEventListener("click", () => post(`/admin/handoffs/${id}/assign`, {case_id:Number($("#case-select").value)}, "案例已关联。"));
     $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
     $("#create-case").addEventListener("click", () => post(`/admin/handoffs/${id}/cases`, {contact_id:Number($("#contact-select").value), product_id:Number($("#product-select").value), currency:$("#currency").value.trim().toUpperCase()}, "新案例已建立并关联。"));
+    $("#reply-attachments").addEventListener("change", renderAttachments);
     $("#send").addEventListener("click", async () => {
       if (!confirm("确认以当前内容回复客户？邮件将进入发件队列并记录你的账号。")) return;
-      await post(`/admin/handoffs/${id}/send`, {subject:$("#reply-subject").value, body_text:$("#reply-body").value, note:$("#reply-note").value, resume_automation:$("#resume").checked}, "人工回复已加入发件队列。");
+      const form = new FormData();
+      form.append("subject", $("#reply-subject").value);
+      form.append("body_text", $("#reply-body").value);
+      form.append("note", $("#reply-note").value);
+      form.append("resume_automation", String($("#resume").checked));
+      for (const file of $("#reply-attachments").files) form.append("attachments", file);
+      $("#send").disabled = true;
+      try {
+        const response = await fetch(`/admin/handoffs/${id}/send-with-attachments`, {method:"POST", body:form});
+        if (!response.ok) {
+          let message = `${response.status} ${response.statusText}`;
+          try { message = (await response.json()).detail || message; } catch (_) {}
+          throw new Error(message);
+        }
+        notice("人工回复已加入发件队列。");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#send").disabled = false;
+      }
     });
     $("#suppress-recipient").addEventListener("click", async () => {
       if (!confirm("确认将这个具体邮箱标记为不可投递？系统会跳过后续自动发信并暂停关联案例。")) return;

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
@@ -51,6 +51,12 @@ from app.db import (
 from app.domain import money
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
+from app.mail import (
+    MAX_OUTBOUND_ATTACHMENT_BYTES,
+    MAX_OUTBOUND_ATTACHMENT_COUNT,
+    MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES,
+    OutboundAttachment,
+)
 from app.products import canonical_product_code
 from app.reactivation import (
     ALLOWED_TEMPLATE_FIELDS,
@@ -2204,6 +2210,73 @@ async def send_handoff_reply(
             actor=admin,
             note=request.note,
             resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+async def _read_handoff_reply_attachments(
+    files: list[UploadFile],
+) -> tuple[OutboundAttachment, ...]:
+    if len(files) > MAX_OUTBOUND_ATTACHMENT_COUNT:
+        raise HTTPException(
+            413,
+            f"At most {MAX_OUTBOUND_ATTACHMENT_COUNT} attachments are allowed",
+        )
+    attachments: list[OutboundAttachment] = []
+    total_bytes = 0
+    for file in files:
+        try:
+            payload = await file.read(MAX_OUTBOUND_ATTACHMENT_BYTES + 1)
+        finally:
+            await file.close()
+        filename = (file.filename or "").strip()
+        if not filename:
+            raise HTTPException(400, "Every attachment must have a filename")
+        if not payload:
+            raise HTTPException(400, f"Attachment is empty: {filename}")
+        if len(payload) > MAX_OUTBOUND_ATTACHMENT_BYTES:
+            raise HTTPException(413, f"Attachment is too large: {filename}")
+        total_bytes += len(payload)
+        if total_bytes > MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES:
+            raise HTTPException(413, "Attachments exceed the total upload size limit")
+        attachments.append(
+            OutboundAttachment(
+                filename=filename,
+                content_type=file.content_type or "application/octet-stream",
+                payload=payload,
+            )
+        )
+    return tuple(attachments)
+
+
+@router.post("/admin/handoffs/{handoff_id}/send-with-attachments", status_code=202)
+async def send_handoff_reply_with_attachments(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+    subject: Annotated[str, Form(min_length=1, max_length=998)],
+    body_text: Annotated[str, Form(min_length=1, max_length=50_000)],
+    note: Annotated[str, Form(max_length=2_000)] = "",
+    resume_automation: Annotated[bool, Form()] = False,
+    attachments: Annotated[list[UploadFile] | None, File()] = None,
+) -> dict[str, Any]:
+    uploaded = await _read_handoff_reply_attachments(attachments or [])
+    try:
+        outbox = await queue_human_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=subject,
+            body_text=body_text,
+            actor=admin,
+            note=note,
+            resume_automation=resume_automation,
+            attachments=uploaded,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc

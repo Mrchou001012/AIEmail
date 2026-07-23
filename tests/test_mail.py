@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app.mail import (
     GmailIMAPClient,
+    OutboundAttachment,
     _imap_mailbox_arg,
     append_quoted_reply,
     attachments_require_review,
@@ -396,6 +397,56 @@ def test_stable_message_id_and_thread_headers() -> None:
     assert first_id == second_id
     assert first_raw == second_raw
     assert "In-Reply-To: <incoming@example.com>" in first_raw
+
+
+def test_build_message_includes_uploaded_attachment_deterministically() -> None:
+    payload = b"%PDF-1.7\nreviewed quotation"
+
+    message_id, raw = build_message(
+        from_address="sales@example.com",
+        recipient="buyer@example.com",
+        subject="Re: Quote",
+        text_body="Please find the quotation attached.",
+        html_body="<p>Please find the quotation attached.</p>",
+        stable_key="case:1:human-reply",
+        attachments=(
+            OutboundAttachment(
+                filename="quotation.pdf",
+                content_type="application/pdf",
+                payload=payload,
+            ),
+        ),
+    )
+    repeated_message_id, repeated_raw = build_message(
+        from_address="sales@example.com",
+        recipient="buyer@example.com",
+        subject="Re: Quote",
+        text_body="Please find the quotation attached.",
+        html_body="<p>Please find the quotation attached.</p>",
+        stable_key="case:1:human-reply",
+        attachments=(
+            OutboundAttachment(
+                filename="quotation.pdf",
+                content_type="application/pdf",
+                payload=payload,
+            ),
+        ),
+    )
+    message = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8"))
+    attachment = next(
+        part
+        for part in message.walk()
+        if part.get_content_disposition() == "attachment"
+    )
+    parsed = parse_mime(raw.encode("utf-8"))
+
+    assert attachment.get_filename() == "quotation.pdf"
+    assert attachment.get_content_type() == "application/pdf"
+    assert attachment.get_payload(decode=True) == payload
+    assert parsed.attachments[0]["filename"] == "quotation.pdf"
+    assert parsed.attachments[0]["size"] == len(payload)
+    assert repeated_message_id == message_id
+    assert repeated_raw == raw
 
 
 def test_long_reference_chain_retains_root_and_recent_messages() -> None:
