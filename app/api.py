@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, func, or_, select, update
@@ -78,6 +78,7 @@ from app.settings import Settings, get_settings
 router = APIRouter()
 security = HTTPBasic()
 DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
+FAVICON_PATH = Path(__file__).with_name("favicon.ico")
 HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
@@ -214,6 +215,15 @@ async def health() -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_200_OK if database_ok else status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"status": "ok" if database_ok else "degraded", "database": database_ok},
+    )
+
+
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(
+        FAVICON_PATH,
+        media_type="image/x-icon",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

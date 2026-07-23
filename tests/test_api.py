@@ -5,10 +5,12 @@ import pytest
 
 from app.api import (
     COMMERCIAL_UPDATE_PATH,
+    FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
     commercial_update_page,
     dashboard,
+    favicon,
     health,
     reactivation_page,
 )
@@ -36,6 +38,15 @@ async def test_health_uses_one_database_probe(
     assert response.status_code == expected_status
     assert json.loads(response.body) == expected_body
     probe.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_favicon_is_public_and_served_as_an_icon() -> None:
+    response = await favicon()
+
+    assert FAVICON_PATH.exists()
+    assert response.media_type == "image/x-icon"
+    assert response.headers["cache-control"] == "public, max-age=86400"
 
 
 @pytest.mark.asyncio
