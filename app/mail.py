@@ -103,6 +103,19 @@ class FullReplySource:
     inline_images: tuple[InlineImageAsset, ...] = ()
 
 
+@dataclass(frozen=True)
+class EmailDisplayContent:
+    body_text: str
+    body_html: str | None
+
+
+@dataclass(frozen=True)
+class EmailResource:
+    filename: str
+    content_type: str
+    payload: bytes
+
+
 SAFE_INLINE_IMAGE_SUFFIXES = frozenset(
     {".avif", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 )
@@ -592,6 +605,95 @@ def extract_full_reply_source(raw: bytes) -> FullReplySource:
     )
 
 
+def extract_email_display(
+    raw: bytes,
+    *,
+    resource_url_prefix: str,
+) -> EmailDisplayContent:
+    """Return allowlist-sanitized email HTML with local, authenticated inline images."""
+    source = extract_full_reply_source(raw)
+    if not source.body_html:
+        return EmailDisplayContent(body_text=source.body_text, body_html=None)
+
+    sanitized = _sanitize_quoted_html(source.body_html)
+    soup = BeautifulSoup(sanitized, "html.parser")
+    assets_by_cid = {
+        _normalize_content_id(asset.content_id): asset
+        for asset in source.inline_images
+    }
+    prefix = resource_url_prefix.rstrip("/")
+    for image in list(soup.find_all("img")):
+        image_source = str(image.get("src") or "").strip()
+        asset = (
+            assets_by_cid.get(_normalize_content_id(image_source[4:]))
+            if image_source.casefold().startswith("cid:")
+            else None
+        )
+        if asset is None:
+            replacement = str(image.get("alt") or "").strip() or "[Image unavailable]"
+            image.replace_with(replacement)
+            continue
+        digest = hashlib.sha256(asset.payload).hexdigest()
+        image["src"] = f"{prefix}/{digest}?disposition=inline"
+        image["loading"] = "lazy"
+        image["referrerpolicy"] = "no-referrer"
+    for link in soup.find_all("a"):
+        link["target"] = "_blank"
+        link["rel"] = "noopener noreferrer"
+    return EmailDisplayContent(
+        body_text=source.body_text,
+        body_html=str(soup),
+    )
+
+
+def _is_mime_resource_part(part: email.message.Message) -> bool:
+    disposition = part.get_content_disposition()
+    filename = part.get_filename()
+    content_type = part.get_content_type()
+    content_id = str(part.get("Content-ID") or "").strip()
+    content_location = str(part.get("Content-Location") or "").strip()
+    return bool(
+        disposition == "attachment"
+        or filename
+        or (
+            (content_id or content_location)
+            and content_type not in {"text/plain", "text/html"}
+        )
+    )
+
+
+def extract_email_resource(raw: bytes, digest: str) -> EmailResource | None:
+    """Resolve one attachment or inline image by its immutable SHA-256 digest."""
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    for part in message.walk():
+        if part.is_multipart() or not _is_mime_resource_part(part):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if hashlib.sha256(payload).hexdigest() != digest:
+            continue
+        filename = part.get_filename() or f"attachment-{digest[:12]}"
+        content_type = _sniff_inline_image_content_type(payload) or part.get_content_type()
+        return EmailResource(
+            filename=filename,
+            content_type=content_type,
+            payload=payload,
+        )
+    try:
+        inline_images = extract_full_reply_source(raw).inline_images
+    except (ValueError, LookupError, RecursionError):
+        inline_images = ()
+    for asset in inline_images:
+        if hashlib.sha256(asset.payload).hexdigest() == digest:
+            return EmailResource(
+                filename=asset.filename,
+                content_type=asset.content_type,
+                payload=asset.payload,
+            )
+    return None
+
+
 def extract_full_message_bodies(raw: bytes) -> tuple[str, str | None]:
     """Compatibility helper returning complete text and HTML display bodies."""
     source = extract_full_reply_source(raw)
@@ -758,14 +860,7 @@ def parse_mime(raw: bytes) -> ParsedEmail:
         content_type = part.get_content_type()
         content_id = str(part.get("Content-ID") or "").strip() or None
         content_location = str(part.get("Content-Location") or "").strip() or None
-        if (
-            disposition == "attachment"
-            or filename
-            or (
-                (content_id or content_location)
-                and content_type not in {"text/plain", "text/html"}
-            )
-        ):
+        if _is_mime_resource_part(part):
             payload = part.get_payload(decode=True) or b""
             attachments.append(
                 {

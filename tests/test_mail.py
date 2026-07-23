@@ -1,3 +1,4 @@
+import hashlib
 import imaplib
 from datetime import UTC, datetime
 from email import policy
@@ -13,6 +14,8 @@ from app.mail import (
     append_quoted_reply,
     attachments_require_review,
     build_message,
+    extract_email_display,
+    extract_email_resource,
     extract_full_message_bodies,
     has_thread_subject_prefix,
     normalized_subject,
@@ -357,6 +360,69 @@ def test_small_cid_image_without_attachment_disposition_does_not_require_review(
     assert attachment["content_id"] == "<client-logo.png>"
     assert attachment["inline_content"] is True
     assert attachments_require_review(parsed.attachments, parsed.body_html) is False
+
+
+def test_email_display_renders_cid_images_and_exposes_attachments_without_remote_images() -> None:
+    inline_payload = b"\x89PNG\r\n\x1a\nembedded-client-logo"
+    pdf_payload = b"%PDF-1.4\ncustomer attachment"
+    message = EmailMessage()
+    message["From"] = "Buyer <buyer@example.com>"
+    message["To"] = "sales@example.com"
+    message["Subject"] = "Re: Quote"
+    message.set_content("Please see our requirements and attached PDF.")
+    message.add_alternative(
+        (
+            '<p>Please see our requirements.</p><img src="cid:client-logo">'
+            '<img src="https://tracker.example/open.gif" alt="tracking pixel">'
+            "<script>alert(1)</script>"
+        ),
+        subtype="html",
+    )
+    html_part = message.get_payload()[-1]
+    html_part.add_related(
+        inline_payload,
+        maintype="image",
+        subtype="png",
+        cid="<client-logo>",
+        filename="logo.png",
+    )
+    message.add_attachment(
+        pdf_payload,
+        maintype="application",
+        subtype="pdf",
+        filename="requirements.pdf",
+    )
+    raw = message.as_bytes()
+    inline_digest = hashlib.sha256(inline_payload).hexdigest()
+    pdf_digest = hashlib.sha256(pdf_payload).hexdigest()
+
+    display = extract_email_display(
+        raw,
+        resource_url_prefix="/admin/emails/42/resources",
+    )
+
+    assert display.body_html is not None
+    assert (
+        f"/admin/emails/42/resources/{inline_digest}?disposition=inline"
+        in display.body_html
+    )
+    assert "https://tracker.example" not in display.body_html
+    assert "<script" not in display.body_html
+    assert "[Image unavailable]" not in display.body_html
+    assert "tracking pixel" in display.body_html
+
+    inline_resource = extract_email_resource(raw, inline_digest)
+    assert inline_resource is not None
+    assert inline_resource.filename == "logo.png"
+    assert inline_resource.content_type == "image/png"
+    assert inline_resource.payload == inline_payload
+
+    attachment_resource = extract_email_resource(raw, pdf_digest)
+    assert attachment_resource is not None
+    assert attachment_resource.filename == "requirements.pdf"
+    assert attachment_resource.content_type == "application/pdf"
+    assert attachment_resource.payload == pdf_payload
+    assert extract_email_resource(raw, "not-a-sha") is None
 
 
 def test_cid_image_marked_as_attachment_still_requires_review() -> None:

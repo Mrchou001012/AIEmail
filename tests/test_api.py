@@ -92,7 +92,11 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/send" in html
     assert "/send-with-attachments" in html
     assert 'id="reply-attachments"' in html
+    assert 'id="source-attachments"' in html
     assert "FormData" in html
+    assert "/display" in html
+    assert "body.innerHTML = display.body_html" in html
+    assert "内嵌图片会显示在正文中" in html
     assert "确认并加入发件队列" in html
     assert "resume_automation" in html
 

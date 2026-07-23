@@ -23,7 +23,16 @@
     .pill { display:inline-flex; border-radius:999px; padding:3px 9px; background:#eef4ff; color:#1849a9; font-weight:650; }
     .danger { color:var(--red); }
     .success { color:var(--green); }
-    .mail { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:14px; max-height:440px; overflow:auto; }
+    .mail { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:14px; max-height:620px; overflow:auto; }
+    .mail.html { white-space:normal; background:#fff; }
+    .mail.html img { max-width:100%; height:auto; }
+    .mail.html table { max-width:100%; }
+    .mail.html blockquote { margin:10px 0 10px 12px; padding-left:12px; border-left:2px solid #d0d5dd; }
+    .source-attachments { margin-top:12px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .source-attachments-title { padding:9px 12px; background:#f8fafc; font-weight:650; }
+    .source-attachment { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:10px 12px; border-top:1px solid var(--line); }
+    .source-attachment-info { min-width:0; overflow-wrap:anywhere; }
+    .source-attachment-actions { display:flex; gap:10px; white-space:nowrap; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:260px; overflow:auto; }
     label { display:block; font-weight:650; margin:12px 0 6px; }
     input,select,textarea { width:100%; border:1px solid #c7d0dd; border-radius:9px; padding:9px 11px; background:#fff; color:var(--ink); }
@@ -58,6 +67,7 @@
           <h2>客户原邮件</h2>
           <div class="meta" id="email-meta"></div>
           <div class="mail" id="email-body">暂无原邮件</div>
+          <div class="source-attachments hidden" id="source-attachments"></div>
         </article>
         <article class="card">
           <h2>系统判断</h2>
@@ -135,12 +145,60 @@
       if (!data) { node.textContent = "尚未关联案例；发送前必须关联或建立案例。"; return; }
       node.innerHTML = `<div class="meta"><span class="label">案例</span><strong>#${esc(data.id)} · ${esc(data.company)}</strong><span class="label">联系人</span><span>${esc(data.contact_name)} · ${esc(data.contact_email)}</span><span class="label">产品</span><span>${esc(data.product)} · ${esc(data.currency)}</span><span class="label">状态</span><span>${esc(data.stage)} / ${esc(data.status)}</span><span class="label">最新报价</span><span>${data.latest_quote ? esc(`${data.latest_quote.currency} ${data.latest_quote.unit_price} · ${data.latest_quote.quantity} · 有效至 ${data.latest_quote.valid_until}`) : "无"}</span></div>`;
     }
+    function fileSize(bytes) {
+      const value = Number(bytes || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+      return `${(value / 1024 / 1024).toFixed(2)} MB`;
+    }
+    async function renderSourceEmail(mail) {
+      const body = $("#email-body");
+      const attachmentBox = $("#source-attachments");
+      body.classList.remove("html");
+      body.textContent = mail?.body_text || "暂无原邮件";
+      attachmentBox.classList.add("hidden");
+      attachmentBox.innerHTML = "";
+      if (!mail) return;
+      try {
+        const display = await api(`/admin/emails/${mail.id}/display`);
+        if (display.body_html) {
+          body.classList.add("html");
+          body.innerHTML = display.body_html;
+        } else {
+          body.textContent = display.body_text || mail.body_text || "暂无原邮件";
+        }
+        const attachments = display.attachments || [];
+        if (attachments.length) {
+          attachmentBox.innerHTML = `
+            <div class="source-attachments-title">附件（${attachments.length}）</div>
+            ${attachments.map((item) => `
+              <div class="source-attachment">
+                <div class="source-attachment-info">
+                  <strong>${esc(item.filename)}</strong>
+                  <div class="sub">${esc(item.content_type)} · ${esc(fileSize(item.size))}</div>
+                </div>
+                <div class="source-attachment-actions">
+                  <a href="${esc(item.view_url)}" target="_blank" rel="noopener noreferrer">查看</a>
+                  <a href="${esc(item.download_url)}">下载</a>
+                </div>
+              </div>`).join("")}`;
+          attachmentBox.classList.remove("hidden");
+        }
+        if (display.notice) {
+          attachmentBox.innerHTML += `<div class="source-attachment"><span class="sub">${esc(display.notice)}</span></div>`;
+          attachmentBox.classList.remove("hidden");
+        }
+      } catch (error) {
+        attachmentBox.innerHTML = `<div class="source-attachment"><span class="sub">原始格式暂不可用，当前显示纯文本：${esc(error.message)}</span></div>`;
+        attachmentBox.classList.remove("hidden");
+      }
+    }
     function render(data) {
       state = data;
       $("#handoff-id").textContent = `#${data.id}`;
       $("#headline").textContent = `${data.reason} · ${data.status} · ${data.summary}`;
       const mail = data.source_email;
-      $("#email-meta").innerHTML = mail ? `<span class="label">发件人</span><span>${esc(mail.from)}</span><span class="label">主题</span><strong>${esc(mail.subject)}</strong><span class="label">时间</span><span>${esc(new Date(mail.received_at).toLocaleString())}</span><span class="label">附件</span><span>${esc((mail.attachments || []).map((item) => item.filename).join(", ") || "无")}</span>` : '<span class="danger">该处理单没有原始收件</span>';
+      $("#email-meta").innerHTML = mail ? `<span class="label">发件人</span><span>${esc(mail.from)}</span><span class="label">主题</span><strong>${esc(mail.subject)}</strong><span class="label">时间</span><span>${esc(new Date(mail.received_at).toLocaleString())}</span><span class="label">MIME 资源</span><span>${esc((mail.attachments || []).length ? `${mail.attachments.length} 个（内嵌图片会显示在正文中）` : "无")}</span>` : '<span class="danger">该处理单没有原始收件</span>';
       $("#email-body").textContent = mail?.body_text || "暂无原邮件";
       $("#handoff-meta").innerHTML = `<span class="label">原因</span><span class="pill">${esc(data.reason)}</span><span class="label">摘要</span><span>${esc(data.summary)}</span><span class="label">通知</span><span>${esc(data.dingtalk_status)}</span><span class="label">处理备注</span><span>${esc(data.resolution_note || "无")}</span>`;
       $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
@@ -163,7 +221,15 @@
       $("#suppress-recipient").disabled = data.status !== "OPEN";
       $("#resolve").classList.toggle("hidden", deliverability);
     }
-    async function load() { try { render(await api(`/admin/handoffs/${id}`)); } catch (error) { notice(error.message, "error"); } }
+    async function load() {
+      try {
+        const data = await api(`/admin/handoffs/${id}`);
+        render(data);
+        await renderSourceEmail(data.source_email);
+      } catch (error) {
+        notice(error.message, "error");
+      }
+    }
     async function post(path, payload, success) { try { await api(path, {method:"POST", body:JSON.stringify(payload)}); notice(success); await load(); } catch (error) { notice(error.message, "error"); } }
     function renderAttachments() {
       const files = [...$("#reply-attachments").files];

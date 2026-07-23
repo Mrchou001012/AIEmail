@@ -1,15 +1,17 @@
 import hashlib
 import json
+import re
 import secrets
 import tempfile
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, func, or_, select, update
@@ -56,6 +58,9 @@ from app.mail import (
     MAX_OUTBOUND_ATTACHMENT_COUNT,
     MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES,
     OutboundAttachment,
+    extract_email_display,
+    extract_email_resource,
+    parse_mime,
 )
 from app.products import canonical_product_code
 from app.reactivation import (
@@ -88,6 +93,7 @@ FAVICON_PATH = Path(__file__).with_name("favicon.ico")
 HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
+MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
 def require_admin(
@@ -991,6 +997,151 @@ async def email_detail(email_id: int, _: Admin, session: Session) -> dict[str, A
         "body_text": row.body_text[:body_limit],
         "body_truncated": len(row.body_text) > body_limit,
     }
+
+
+def _email_archive_path(row: EmailMessage) -> Path:
+    archive_folder = "mail_archive" if row.is_history else "inbound_archive"
+    return get_settings().runtime_dir / archive_folder / f"{row.raw_sha256}.eml"
+
+
+def _read_email_archive(row: EmailMessage) -> bytes:
+    archive_path = _email_archive_path(row)
+    try:
+        archive_size = archive_path.stat().st_size
+        if archive_size > MAX_EMAIL_DISPLAY_ARCHIVE_BYTES:
+            raise HTTPException(413, "Original email archive is too large to display")
+        raw = archive_path.read_bytes()
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(404, "Original email MIME archive is unavailable") from exc
+    if hashlib.sha256(raw).hexdigest() != row.raw_sha256:
+        raise HTTPException(409, "Original email MIME archive failed integrity verification")
+    return raw
+
+
+def _ordinary_email_attachments(raw: bytes, email_id: int) -> list[dict[str, Any]]:
+    prefix = f"/admin/emails/{email_id}/resources"
+    result: list[dict[str, Any]] = []
+    for item in parse_mime(raw).attachments:
+        if item.get("inline_content") is True:
+            continue
+        digest = str(item.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            continue
+        result.append(
+            {
+                "filename": str(item.get("filename") or "unnamed"),
+                "content_type": str(
+                    item.get("detected_content_type")
+                    or item.get("content_type")
+                    or "application/octet-stream"
+                ),
+                "size": int(item.get("size") or 0),
+                "view_url": f"{prefix}/{digest}?disposition=inline",
+                "download_url": f"{prefix}/{digest}?disposition=attachment",
+            }
+        )
+    return result
+
+
+@router.get("/admin/emails/{email_id}/display")
+async def email_display(email_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    row = await session.get(EmailMessage, email_id)
+    if row is None:
+        raise HTTPException(404, "Email not found")
+    try:
+        raw = _read_email_archive(row)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return {
+            "body_text": row.body_text,
+            "body_html": None,
+            "attachments": [],
+            "archive_available": False,
+            "notice": "Original MIME archive is unavailable; showing stored plain text.",
+        }
+    try:
+        display = extract_email_display(
+            raw,
+            resource_url_prefix=f"/admin/emails/{row.id}/resources",
+        )
+    except (ValueError, LookupError, RecursionError):
+        return {
+            "body_text": row.body_text,
+            "body_html": None,
+            "attachments": _ordinary_email_attachments(raw, row.id),
+            "archive_available": True,
+            "notice": "HTML could not be rendered safely; showing plain text.",
+        }
+    return {
+        "body_text": display.body_text or row.body_text,
+        "body_html": display.body_html,
+        "attachments": _ordinary_email_attachments(raw, row.id),
+        "archive_available": True,
+        "notice": None,
+    }
+
+
+def _safe_resource_filename(filename: str, digest: str) -> str:
+    basename = re.split(r"[\\/]", filename)[-1]
+    basename = re.sub(r"[\x00-\x1f\x7f]", "", basename).strip()
+    return basename[:255] or f"attachment-{digest[:12]}"
+
+
+def _resource_response_media_type(content_type: str, payload: bytes) -> str | None:
+    normalized = content_type.strip().casefold()
+    if normalized in {
+        "image/avif",
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/tiff",
+        "image/webp",
+    }:
+        return normalized
+    if normalized == "application/pdf" and payload.startswith(b"%PDF-"):
+        return normalized
+    if normalized in {"text/plain", "text/csv"}:
+        return f"{normalized}; charset=utf-8"
+    return None
+
+
+@router.get("/admin/emails/{email_id}/resources/{digest}")
+async def email_resource(
+    email_id: int,
+    digest: str,
+    _: Admin,
+    session: Session,
+    disposition: Literal["inline", "attachment"] = Query(default="attachment"),
+) -> Response:
+    row = await session.get(EmailMessage, email_id)
+    if row is None:
+        raise HTTPException(404, "Email not found")
+    resource = extract_email_resource(_read_email_archive(row), digest)
+    if resource is None:
+        raise HTTPException(404, "Email resource not found")
+
+    preview_media_type = _resource_response_media_type(resource.content_type, resource.payload)
+    actual_disposition = "inline" if disposition == "inline" and preview_media_type else "attachment"
+    media_type = preview_media_type or "application/octet-stream"
+    filename = _safe_resource_filename(resource.filename, digest)
+    ascii_filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename) or f"attachment-{digest[:12]}"
+    content_disposition = (
+        f'{actual_disposition}; filename="{ascii_filename}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=resource.payload,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "Content-Disposition": content_disposition,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/admin/outbox/{outbox_id}")
