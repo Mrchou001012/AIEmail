@@ -28,6 +28,9 @@
     .mail.html img { max-width:100%; height:auto; }
     .mail.html table { max-width:100%; }
     .mail.html blockquote { margin:10px 0 10px 12px; padding-left:12px; border-left:2px solid #d0d5dd; }
+    .aiemail-remote-image { display:inline-block; padding:4px 8px; border:1px dashed #f79009; border-radius:6px; color:#b54708; background:#fffaeb; }
+    .remote-image-controls { display:flex; align-items:center; gap:10px; margin-top:10px; padding:9px 11px; border-radius:9px; background:#fffaeb; color:#7a2e0e; }
+    .remote-image-controls button { flex:0 0 auto; background:#fef0c7; color:#7a2e0e; }
     .source-attachments { margin-top:12px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
     .source-attachments-title { padding:9px 12px; background:#f8fafc; font-weight:650; }
     .source-attachment { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:10px 12px; border-top:1px solid var(--line); }
@@ -67,6 +70,10 @@
           <h2>客户原邮件</h2>
           <div class="meta" id="email-meta"></div>
           <div class="mail" id="email-body">暂无原邮件</div>
+          <div class="remote-image-controls hidden" id="remote-image-controls">
+            <button id="load-remote-images" type="button">加载远程图片</button>
+            <span id="remote-image-help">默认已拦截；加载后可能向图片服务器暴露你的 IP 和浏览行为。</span>
+          </div>
           <div class="source-attachments hidden" id="source-attachments"></div>
         </article>
         <article class="card">
@@ -126,6 +133,7 @@
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     let state = null;
+    let blockedRemoteImages = [];
 
     async function api(path, options = {}) {
       const response = await fetch(path, {headers:{"Content-Type":"application/json", ...(options.headers || {})}, ...options});
@@ -154,10 +162,14 @@
     async function renderSourceEmail(mail) {
       const body = $("#email-body");
       const attachmentBox = $("#source-attachments");
+      const remoteControls = $("#remote-image-controls");
       body.classList.remove("html");
       body.textContent = mail?.body_text || "暂无原邮件";
       attachmentBox.classList.add("hidden");
       attachmentBox.innerHTML = "";
+      blockedRemoteImages = [];
+      remoteControls.classList.add("hidden");
+      $("#load-remote-images").disabled = false;
       if (!mail) return;
       try {
         const display = await api(`/admin/emails/${mail.id}/display`);
@@ -168,6 +180,12 @@
           body.textContent = display.body_text || mail.body_text || "暂无原邮件";
         }
         const attachments = display.attachments || [];
+        blockedRemoteImages = display.remote_images || [];
+        if (blockedRemoteImages.length) {
+          $("#load-remote-images").textContent = `加载远程图片（${blockedRemoteImages.length}）`;
+          $("#remote-image-help").textContent = "默认已拦截；加载后可能向图片服务器暴露你的 IP 和浏览行为。";
+          remoteControls.classList.remove("hidden");
+        }
         if (attachments.length) {
           attachmentBox.innerHTML = `
             <div class="source-attachments-title">附件（${attachments.length}）</div>
@@ -242,6 +260,35 @@
     $("#assign").addEventListener("click", () => post(`/admin/handoffs/${id}/assign`, {case_id:Number($("#case-select").value)}, "案例已关联。"));
     $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
     $("#create-case").addEventListener("click", () => post(`/admin/handoffs/${id}/cases`, {contact_id:Number($("#contact-select").value), product_id:Number($("#product-select").value), currency:$("#currency").value.trim().toUpperCase()}, "新案例已建立并关联。"));
+    $("#load-remote-images").addEventListener("click", () => {
+      if (!blockedRemoteImages.length) return;
+      if (!confirm("远程图片可能用于追踪邮件是否被打开，并会向对方服务器暴露你的 IP。确认加载吗？")) return;
+      let loaded = 0;
+      let linked = 0;
+      for (const item of blockedRemoteImages) {
+        const placeholder = document.querySelector(`[data-remote-image="${item.token}"]`);
+        if (!placeholder) continue;
+        if (String(item.url).toLowerCase().startsWith("https://")) {
+          const image = document.createElement("img");
+          image.src = item.url;
+          image.alt = item.alt || "远程图片";
+          image.loading = "lazy";
+          image.referrerPolicy = "no-referrer";
+          placeholder.replaceWith(image);
+          loaded += 1;
+        } else {
+          const link = document.createElement("a");
+          link.href = item.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = item.alt || "在新窗口查看非 HTTPS 远程图片";
+          placeholder.replaceWith(link);
+          linked += 1;
+        }
+      }
+      $("#load-remote-images").disabled = true;
+      $("#remote-image-help").textContent = `已加载 ${loaded} 张；${linked ? `${linked} 张非 HTTPS 图片仅提供新窗口链接。` : "远程图片不会保存到本服务器。"}`;
+    });
     $("#reply-attachments").addEventListener("change", renderAttachments);
     $("#send").addEventListener("click", async () => {
       if (!confirm("确认以当前内容回复客户？邮件将进入发件队列并记录你的账号。")) return;

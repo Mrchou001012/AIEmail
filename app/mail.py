@@ -104,9 +104,17 @@ class FullReplySource:
 
 
 @dataclass(frozen=True)
+class RemoteImageReference:
+    token: str
+    url: str
+    alt: str
+
+
+@dataclass(frozen=True)
 class EmailDisplayContent:
     body_text: str
     body_html: str | None
+    remote_images: tuple[RemoteImageReference, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -621,14 +629,33 @@ def extract_email_display(
         _normalize_content_id(asset.content_id): asset
         for asset in source.inline_images
     }
+    remote_images: list[RemoteImageReference] = []
     prefix = resource_url_prefix.rstrip("/")
-    for image in list(soup.find_all("img")):
+    for index, image in enumerate(list(soup.find_all("img"))):
         image_source = str(image.get("src") or "").strip()
         asset = (
             assets_by_cid.get(_normalize_content_id(image_source[4:]))
             if image_source.casefold().startswith("cid:")
             else None
         )
+        if re.match(r"^https?://", image_source, flags=re.I):
+            alt = str(image.get("alt") or "").strip()[:500]
+            token = hashlib.sha256(
+                f"{index}\0{image_source}".encode()
+            ).hexdigest()[:24]
+            remote_images.append(
+                RemoteImageReference(
+                    token=token,
+                    url=image_source,
+                    alt=alt,
+                )
+            )
+            placeholder = soup.new_tag("span")
+            placeholder["class"] = "aiemail-remote-image"
+            placeholder["data-remote-image"] = token
+            placeholder.string = alt or "[Remote image blocked]"
+            image.replace_with(placeholder)
+            continue
         if asset is None:
             replacement = str(image.get("alt") or "").strip() or "[Image unavailable]"
             image.replace_with(replacement)
@@ -643,6 +670,7 @@ def extract_email_display(
     return EmailDisplayContent(
         body_text=source.body_text,
         body_html=str(soup),
+        remote_images=tuple(remote_images),
     )
 
 

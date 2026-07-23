@@ -410,6 +410,10 @@ def test_email_display_renders_cid_images_and_exposes_attachments_without_remote
     assert "<script" not in display.body_html
     assert "[Image unavailable]" not in display.body_html
     assert "tracking pixel" in display.body_html
+    assert len(display.remote_images) == 1
+    assert display.remote_images[0].url == "https://tracker.example/open.gif"
+    assert display.remote_images[0].alt == "tracking pixel"
+    assert f'data-remote-image="{display.remote_images[0].token}"' in display.body_html
 
     inline_resource = extract_email_resource(raw, inline_digest)
     assert inline_resource is not None

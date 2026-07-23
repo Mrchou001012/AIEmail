@@ -8,6 +8,7 @@ from app.api import (
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
+    _dashboard_headers,
     _suggested_handoff_reply,
     commercial_update_page,
     dashboard,
@@ -97,8 +98,18 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/display" in html
     assert "body.innerHTML = display.body_html" in html
     assert "内嵌图片会显示在正文中" in html
+    assert 'id="load-remote-images"' in html
+    assert "远程图片可能用于追踪邮件是否被打开" in html
     assert "确认并加入发件队列" in html
     assert "resume_automation" in html
+
+
+def test_remote_images_are_only_permitted_by_the_handoff_specific_csp() -> None:
+    assert "img-src 'self' data:;" in _dashboard_headers()["Content-Security-Policy"]
+    assert (
+        "img-src 'self' data: https:;"
+        in _dashboard_headers(allow_remote_images=True)["Content-Security-Policy"]
+    )
 
 
 @pytest.mark.asyncio

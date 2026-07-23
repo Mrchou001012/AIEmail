@@ -207,13 +207,14 @@ class ReactivationSelectionRequest(BaseModel):
     selected: bool
 
 
-def _dashboard_headers() -> dict[str, str]:
+def _dashboard_headers(*, allow_remote_images: bool = False) -> dict[str, str]:
+    image_sources = "'self' data: https:" if allow_remote_images else "'self' data:"
     return {
         "Cache-Control": "no-store",
         "Content-Security-Policy": (
             "default-src 'self'; style-src 'self' 'unsafe-inline'; "
             "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
-            "img-src 'self' data:; frame-ancestors 'none'"
+            f"img-src {image_sources}; frame-ancestors 'none'"
         ),
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
@@ -1059,6 +1060,7 @@ async def email_display(email_id: int, _: Admin, session: Session) -> dict[str, 
             "body_text": row.body_text,
             "body_html": None,
             "attachments": [],
+            "remote_images": [],
             "archive_available": False,
             "notice": "Original MIME archive is unavailable; showing stored plain text.",
         }
@@ -1072,6 +1074,7 @@ async def email_display(email_id: int, _: Admin, session: Session) -> dict[str, 
             "body_text": row.body_text,
             "body_html": None,
             "attachments": _ordinary_email_attachments(raw, row.id),
+            "remote_images": [],
             "archive_available": True,
             "notice": "HTML could not be rendered safely; showing plain text.",
         }
@@ -1079,6 +1082,10 @@ async def email_display(email_id: int, _: Admin, session: Session) -> dict[str, 
         "body_text": display.body_text or row.body_text,
         "body_html": display.body_html,
         "attachments": _ordinary_email_attachments(raw, row.id),
+        "remote_images": [
+            {"token": image.token, "url": image.url, "alt": image.alt}
+            for image in display.remote_images
+        ],
         "archive_available": True,
         "notice": None,
     }
@@ -2160,7 +2167,7 @@ async def handoff_review(handoff_id: int, _: Admin, session: Session) -> HTMLRes
         raise HTTPException(404, "Handoff not found")
     return HTMLResponse(
         HANDOFF_REVIEW_PATH.read_text(encoding="utf-8"),
-        headers=_dashboard_headers(),
+        headers=_dashboard_headers(allow_remote_images=True),
     )
 
 
