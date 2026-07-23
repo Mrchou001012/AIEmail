@@ -538,7 +538,7 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         db_session,
         handoff_id=handoff.id,
         subject="Re: New customer inquiry",
-        body_text="Dear Customer,\n\nWe have reviewed your request.",
+        body_text="Dear Customer,\n\nWe have reviewed your request.\n\nBest regards,",
         actor="reviewer",
         note="Reviewed and approved",
         resume_automation=False,
@@ -558,6 +558,7 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
     assert outbox.human_approved_at is not None
     assert "Shreya Saxena" in outbox.raw_message
     parsed = parse_mime(outbox.raw_message.encode("utf-8"))
+    assert parsed.body_text.count("Best regards,") == 1
     assert parsed.in_reply_to == source_email.message_id
     assert parsed.references == [
         "<thread-root@example.com>",

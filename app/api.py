@@ -1941,7 +1941,7 @@ def _suggested_handoff_reply(
     )
     return {
         "subject": subject[:998],
-        "body_text": f"Dear {contact_name},\n\n{opening}\n\nBest regards,",
+        "body_text": f"Dear {contact_name},\n\n{opening}",
     }
 
 

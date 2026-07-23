@@ -661,6 +661,28 @@ async def create_case_for_handoff(
     return sales_case
 
 
+def _strip_duplicate_signature_lead(
+    body_text: str,
+    signature_text: str,
+) -> str:
+    signature_lead = next(
+        (
+            line.strip()
+            for line in signature_text.splitlines()
+            if line.strip()
+        ),
+        "",
+    )
+    body_lines = body_text.splitlines()
+    if (
+        signature_lead
+        and body_lines
+        and body_lines[-1].strip().casefold() == signature_lead.casefold()
+    ):
+        return "\n".join(body_lines[:-1]).rstrip()
+    return body_text
+
+
 async def queue_human_reply(
     session: AsyncSession,
     *,
@@ -720,6 +742,12 @@ async def queue_human_reply(
     if not clean_body:
         raise ValueError("reply body cannot be empty")
     bundle = load_content(get_settings().content_dir)
+    clean_body = _strip_duplicate_signature_lead(
+        clean_body,
+        bundle.signature_text,
+    )
+    if not clean_body:
+        raise ValueError("reply body cannot contain only the signature sign-off")
     signed_text = "\n".join([clean_body, "", bundle.signature_text.strip()])
     html_lines = [
         f"<p>{html.escape(line) if line else '&nbsp;'}</p>"

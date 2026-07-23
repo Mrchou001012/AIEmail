@@ -8,12 +8,15 @@ from app.api import (
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
+    _suggested_handoff_reply,
     commercial_update_page,
     dashboard,
     favicon,
     health,
     reactivation_page,
 )
+from app.db import Handoff
+from app.services import _strip_duplicate_signature_lead
 
 
 @pytest.mark.asyncio
@@ -47,6 +50,26 @@ async def test_favicon_is_public_and_served_as_an_icon() -> None:
     assert FAVICON_PATH.exists()
     assert response.media_type == "image/x-icon"
     assert response.headers["cache-control"] == "public, max-age=86400"
+
+
+def test_handoff_suggestion_does_not_duplicate_the_automatic_signature() -> None:
+    suggestion = _suggested_handoff_reply(
+        Handoff(reason_code="THREAD_AMBIGUOUS"),
+        None,
+        None,
+    )
+
+    assert suggestion["body_text"].startswith("Dear Customer,")
+    assert "Best regards" not in suggestion["body_text"]
+
+
+def test_human_reply_removes_a_trailing_automatic_signature_lead() -> None:
+    body = _strip_duplicate_signature_lead(
+        "Dear Customer,\n\nPlease see the attached quotation.\n\nBEST REGARDS,",
+        "Best regards,\n\nShreya Saxena",
+    )
+
+    assert body == "Dear Customer,\n\nPlease see the attached quotation."
 
 
 @pytest.mark.asyncio
