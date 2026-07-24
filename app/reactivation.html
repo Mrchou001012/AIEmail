@@ -39,7 +39,7 @@
     .campaign { width:100%; text-align:left; border:1px solid var(--line); border-radius:10px; padding:10px 11px; background:#fff; cursor:pointer; }
     .campaign.active { border-color:var(--blue); background:var(--blue-soft); }
     .campaign-line { display:flex; justify-content:space-between; gap:10px; align-items:center; }
-    .pill { display:inline-flex; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:700; background:#eef2f6; color:#526074; }
+    .pill { display:inline-flex; flex-shrink:0; white-space:nowrap; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:700; background:#eef2f6; color:#526074; }
     .pill.good{background:var(--green-soft);color:var(--green)}.pill.warn{background:var(--amber-soft);color:var(--amber)}.pill.bad{background:var(--red-soft);color:var(--red)}.pill.info{background:var(--blue-soft);color:var(--blue)}
     .metrics { display:grid; grid-template-columns:repeat(6,minmax(90px,1fr)); gap:8px; padding:14px 15px; border-bottom:1px solid var(--line); }
     .metric { padding:10px; border-radius:10px; background:#f8fafc; }
@@ -55,8 +55,13 @@
     th,td { padding:10px 11px; text-align:left; border-bottom:1px solid #edf0f4; vertical-align:top; }
     th { position:sticky; top:0; z-index:2; background:#fbfcfe; color:var(--muted); font-size:11px; }
     td { font-size:12px; }
+    th:nth-child(5),td:nth-child(5) { min-width:62px; white-space:nowrap; }
     .main { max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .small { display:block; margin-top:2px; color:var(--muted); font-size:10px; }
+    .schedule-line { display:block; white-space:nowrap; }
+    .schedule-label { display:inline-block; min-width:48px; color:var(--muted); }
+    .retry-time { color:var(--blue); white-space:nowrap; }
+    .delay-reason { max-width:220px; color:var(--amber); }
     .empty { padding:34px; text-align:center; color:var(--muted); }
     .checkbox { width:16px; height:16px; }
     .preview { white-space:pre-wrap; padding:12px; border:1px solid var(--line); background:#fafbfc; border-radius:10px; max-height:260px; overflow:auto; }
@@ -124,7 +129,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>选择</th><th>客户 / 联系人</th><th>产品</th><th>上次联系</th><th>回复</th><th>历史唤醒</th><th>计划 / 结果</th><th>状态 / 原因</th></tr></thead>
+          <thead><tr><th>选择</th><th>客户 / 联系人</th><th>产品</th><th>上次联系</th><th>回复</th><th>历史唤醒</th><th>计划 / 当前发送时间</th><th>状态 / 原因</th></tr></thead>
           <tbody id="recipients"><tr><td colspan="8" class="empty">选择左侧批次查看候选客户</td></tr></tbody>
         </table>
       </div>
@@ -141,6 +146,28 @@
   };
   const statusKind = (v) => ["SENT","REPLIED","COMPLETED"].includes(v)?"good":["FAILED","CANCELLED","EXCLUDED","SKIPPED"].includes(v)?"bad":["RUNNING","SCHEDULED","QUEUED","SELECTED"].includes(v)?"info":"warn";
   const pill = (v) => `<span class="pill ${statusKind(String(v||""))}">${esc(v||"—")}</span>`;
+  const delayReason = (value) => {
+    const reason=String(value||"");
+    if(!reason)return "";
+    if(reason.includes("rolling 24-hour"))return "邮箱滚动 24 小时发送限额";
+    if(reason.includes("hourly send limit"))return "邮箱每小时发送限额";
+    if(reason.includes("send spacing"))return "等待最小发送间隔";
+    if(reason.includes("outside reactivation business hours"))return "等待唤醒发送时段";
+    if(reason.includes("reactivation daily limit reached"))return "唤醒每日额度已用完";
+    if(reason.includes("mailbox cooldown active"))return "Gmail 冷却期";
+    return reason;
+  };
+  const scheduleCell = (r) => {
+    const parts=[];
+    if(r.scheduled_for)parts.push(`<span class="schedule-line"><span class="schedule-label">原计划</span>${esc(fmt(r.scheduled_for))}</span>`);
+    if(r.sent_at)parts.push(`<span class="schedule-line"><span class="schedule-label">已发送</span>${esc(fmt(r.sent_at))}</span>`);
+    if(r.replied_at)parts.push(`<span class="schedule-line"><span class="schedule-label">已回复</span>${esc(fmt(r.replied_at))}</span>`);
+    if(!r.sent_at&&r.outbox_available_at&&["PENDING","FAILED"].includes(r.outbox_status))parts.push(`<span class="small retry-time">最早发送 ${esc(fmt(r.outbox_available_at))}</span>`);
+    const reason=delayReason(r.outbox_last_error);
+    if(reason)parts.push(`<span class="small delay-reason" title="${esc(r.outbox_last_error)}">${esc(reason)}</span>`);
+    if(r.outbox_status)parts.push(`<span class="small">Outbox ${esc(r.outbox_status)}</span>`);
+    return parts.join("")||"—";
+  };
   let defaults=null, campaigns=[], current=null, rows=[];
   let selectionTimer=null, selectionFlush=null, selectionCampaignId=null;
   const pendingSelection=new Map();
@@ -180,7 +207,7 @@
   }
   function renderRows() {
     $("#row-count").textContent=`显示 ${rows.length} / ${current?.detailTotal||0}`;
-    $("#recipients").innerHTML=rows.length?rows.map(r=>`<tr data-recipient-id="${r.id}"><td><input class="checkbox recipient-check" type="checkbox" data-id="${r.id}" ${r.selected?"checked":""} ${!r.eligible||current.status!=="DRAFT"?"disabled":""}></td><td><div class="main"><strong>${esc(r.company_name)}</strong></div><span class="small">${esc(r.contact_name)} · ${esc(r.email)}</span></td><td><span class="main">${esc(r.snapshot.product_code||"—")}</span><span class="small">${esc(r.snapshot.product_name||"")}</span></td><td>${fmt(r.last_contact_at)}<span class="small">${esc(r.latest_direction||"—")} · ${esc(r.snapshot.inactive_days??"—")} 天</span></td><td>${r.has_ever_replied?pill("曾回复"):pill("未回复")}</td><td>${r.previous_reactivation_count}</td><td>${fmt(r.scheduled_for||r.sent_at||r.replied_at)}<span class="small">${r.outbox_status?`Outbox ${esc(r.outbox_status)}`:""}</span></td><td class="recipient-status">${pill(r.status)}<span class="small">${esc(reasonText[r.exclusion_reason]||r.exclusion_reason||"")}</span></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合当前筛选的记录</td></tr>';
+    $("#recipients").innerHTML=rows.length?rows.map(r=>`<tr data-recipient-id="${r.id}"><td><input class="checkbox recipient-check" type="checkbox" data-id="${r.id}" ${r.selected?"checked":""} ${!r.eligible||current.status!=="DRAFT"?"disabled":""}></td><td><div class="main"><strong>${esc(r.company_name)}</strong></div><span class="small">${esc(r.contact_name)} · ${esc(r.email)}</span></td><td><span class="main">${esc(r.snapshot.product_code||"—")}</span><span class="small">${esc(r.snapshot.product_name||"")}</span></td><td>${fmt(r.last_contact_at)}<span class="small">${esc(r.latest_direction||"—")} · ${esc(r.snapshot.inactive_days??"—")} 天</span></td><td>${r.has_ever_replied?pill("曾回复"):pill("未回复")}</td><td>${r.previous_reactivation_count}</td><td>${scheduleCell(r)}</td><td class="recipient-status">${pill(r.status)}<span class="small">${esc(reasonText[r.exclusion_reason]||r.exclusion_reason||"")}</span></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合当前筛选的记录</td></tr>';
   }
   async function loadCampaigns(preferred=null) {
     campaigns=(await api("/admin/reactivation/campaigns")).campaigns||[];

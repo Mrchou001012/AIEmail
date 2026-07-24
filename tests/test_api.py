@@ -146,6 +146,12 @@ def test_reactivation_page_exposes_selection_and_campaign_controls() -> None:
     html = REACTIVATION_PATH.read_text(encoding="utf-8")
 
     assert "/admin/reactivation/campaigns" in html
+    assert "计划 / 当前发送时间" in html
+    assert "outbox_available_at" in html
+    assert "outbox_last_error" in html
+    assert "最早发送" in html
+    assert "邮箱滚动 24 小时发送限额" in html
+    assert "white-space:nowrap" in html
     assert "选择当前可选项" in html
     assert "启动批次" in html
     assert "暂停" in html

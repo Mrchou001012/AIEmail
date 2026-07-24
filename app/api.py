@@ -529,6 +529,10 @@ async def reactivation_campaign_detail(
                 "case_id": recipient.case_id,
                 "outbox_id": recipient.outbox_id,
                 "outbox_status": outbox.status.value if outbox else None,
+                "outbox_available_at": (
+                    outbox.available_at.isoformat() if outbox and outbox.available_at else None
+                ),
+                "outbox_last_error": outbox.last_error if outbox else None,
                 "status": recipient.status,
                 "eligible": recipient.eligible,
                 "selected": recipient.selected,
