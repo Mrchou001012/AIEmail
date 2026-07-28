@@ -324,6 +324,42 @@ migration `0012` and backfill the structured dates from the original CRM file:
 The first command is a read-only preview. After the apply run, use “重新筛选”
 on a draft campaign so its frozen candidate snapshot uses the restored dates.
 
+To import every address from both the Chinese `邮箱` and `其他邮箱` columns,
+deploy migration `0013` and use the full importer. It expands each address into
+an independently deliverable endpoint without claiming that the addresses are
+different people or different companies. Exact duplicate email addresses are
+created only once, while every source row/company/product association is kept
+in `Contact.metadata_json` for later CRM reconciliation. Ambiguous names use
+`Customer`; missing products create contact-only records and therefore render
+as `our products` / `our product range` in reactivation templates.
+
+Run a read-only database-aware preview first:
+
+```bash
+/opt/aiemail-env/bin/python scripts/import_full_customer_list.py \
+  /path/to/印度客户_一年以上未联系_已过滤.xlsx
+```
+
+Review `unique_addresses`, `new_addresses`, `invalid_format_addresses`, and
+`unparsed_email_cells`. The apply command refuses to continue when any cell
+still contains an unparsed `@` fragment. After taking a database backup, apply
+the missing endpoints and authorize these existing CRM relationships for
+outreach:
+
+```bash
+/opt/aiemail-env/bin/python scripts/import_full_customer_list.py \
+  /path/to/印度客户_一年以上未联系_已过滤.xlsx \
+  --apply \
+  --enable-auto-send
+```
+
+The command is idempotent: rerunning it updates activity/source metadata and
+does not create another Contact for an email address already present anywhere
+in the database. Existing do-not-contact and suppression flags are never
+cleared. Format and MX checks, suppression, bounce handling, mailbox rate
+limits, and campaign selection still run before delivery. Re-scan a draft
+reactivation campaign after the import so the new endpoints appear.
+
 The history status endpoint reports customer-unmatched messages separately from case-unmatched messages. Importing customer data automatically retries reconciliation; rows whose products are not in the active catalog still create customers and contacts but do not create a case. Keep file mail, safe mode, and disabled auto-send throughout history migration.
 
 ### Live new-thread safety
