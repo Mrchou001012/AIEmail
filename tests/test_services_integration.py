@@ -54,6 +54,7 @@ from app.recovery import (
 )
 from app.services import (
     active_policy,
+    add_customer_contact_endpoint,
     assign_handoff_case,
     create_case_for_handoff,
     create_case_outreach,
@@ -63,9 +64,11 @@ from app.services import (
     process_inbound,
     queue_human_reply,
     reconcile_permanent_bounce_handoffs,
+    replace_handoff_recipient,
     resolve_deliverability_handoff,
     seed_demo_data,
     send_one_outbox,
+    suppress_contact_endpoint,
 )
 from app.settings import Settings, get_settings
 
@@ -593,7 +596,12 @@ async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled
         select(EmailMessage).where(EmailMessage.message_id == outbox.message_id)
     )
     assert outbound_email is not None
-    assert outbound_email.attachment_metadata[0]["filename"] == "reviewed-quotation.pdf"
+    uploaded_metadata = next(
+        item
+        for item in outbound_email.attachment_metadata
+        if item["filename"] == "reviewed-quotation.pdf"
+    )
+    assert uploaded_metadata["size"] == len(b"%PDF-1.7\nreviewed quotation")
     assert case.status == CaseStatus.HUMAN_TAKEOVER
     assert handoff.status == "RESOLVED"
     approval = await db_session.scalar(
@@ -2402,7 +2410,7 @@ async def test_smtp_preflight_auto_suppresses_permanent_domain_failure_without_h
     assert await send_one_outbox(db_session, settings) is True
     await db_session.refresh(pending)
     await db_session.refresh(case)
-    await db_session.refresh(case.contact)
+    contact = await db_session.get(Contact, case.contact_id)
     address = await db_session.get(EmailAddressStatus, contact_email)
     handoff_count = await db_session.scalar(select(func.count()).select_from(Handoff))
 
@@ -2411,7 +2419,7 @@ async def test_smtp_preflight_auto_suppresses_permanent_domain_failure_without_h
     assert address is not None and address.preflight_status == mx_status.value
     assert address.suppressed is True
     assert address.suppression_reason == f"PREFLIGHT_{mx_status.value}"
-    assert case.contact.suppressed is True
+    assert contact is not None and contact.suppressed is True
     assert case.status == CaseStatus.PAUSED
     assert handoff_count == 0
 
@@ -2460,19 +2468,124 @@ async def test_operator_can_resolve_legacy_deliverability_handoff_by_suppressing
         actor="integration-admin",
     )
     await db_session.refresh(case)
-    await db_session.refresh(case.contact)
+    contact = await db_session.get(Contact, case.contact_id)
     await db_session.refresh(address)
 
     assert resolved.status == "RESOLVED"
     assert address.suppressed is True
     assert address.suppression_reason == "PREFLIGHT_NO_DOMAIN"
-    assert case.contact.suppressed is True
+    assert contact is not None and contact.suppressed is True
     assert case.status == CaseStatus.PAUSED
     assert pending.status == DeliveryStatus.CANCELLED
     audit_row = await db_session.scalar(
         select(AuditEvent).where(AuditEvent.event_type == "handoff.deliverability_recipient_suppressed")
     )
     assert audit_row is not None and audit_row.actor == "integration-admin"
+
+
+async def test_contact_directory_suppresses_only_one_endpoint(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact", "customer"])
+    old_contact = case.contact
+    sibling, created = await add_customer_contact_endpoint(
+        db_session,
+        customer_id=case.customer_id,
+        email="other-buyer@example.com",
+        name="Other Buyer",
+        actor="integration-admin",
+    )
+    pending = Outbox(
+        case_id=case.id,
+        business_key="manual-suppression-pending",
+        message_id="<manual-suppression-pending@example.com>",
+        recipient=old_contact.email,
+        raw_message="Subject: pending\n\nbody",
+        status=DeliveryStatus.PENDING,
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    suppressed = await suppress_contact_endpoint(
+        db_session,
+        contact_id=old_contact.id,
+        actor="integration-admin",
+        note="Permanent bounce",
+    )
+    await db_session.refresh(case)
+    await db_session.refresh(sibling)
+    await db_session.refresh(pending)
+
+    assert created is True
+    assert suppressed.id == old_contact.id
+    assert suppressed.suppressed is True
+    assert sibling.suppressed is False
+    assert case.status == CaseStatus.PAUSED
+    assert pending.status == DeliveryStatus.CANCELLED
+    assert await db_session.get(
+        EmailAddressStatus, sibling.email.casefold()
+    ) is None
+
+
+async def test_deliverability_handoff_can_replace_only_its_case_recipient(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session, with_quote=False)
+    await db_session.refresh(case, ["contact", "customer"])
+    old_contact = case.contact
+    sibling, _ = await add_customer_contact_endpoint(
+        db_session,
+        customer_id=case.customer_id,
+        email="existing-sibling@example.com",
+        name="Existing Sibling",
+        actor="integration-admin",
+    )
+    case.status = CaseStatus.WAITING_HUMAN
+    handoff = Handoff(
+        case_id=case.id,
+        reason_code=HandoffReason.EMAIL_DELIVERABILITY.value,
+        summary="Recipient preflight blocked",
+        extracted_facts={
+            "recipient": old_contact.email,
+            "preflight_status": MXStatus.NO_MX.value,
+        },
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+
+    resolved, replacement, created = await replace_handoff_recipient(
+        db_session,
+        handoff_id=handoff.id,
+        new_email="replacement-buyer@example.com",
+        new_name="Replacement Buyer",
+        actor="integration-admin",
+        note="Customer supplied a corrected address",
+        resume_case=True,
+    )
+    await db_session.refresh(case)
+    await db_session.refresh(old_contact)
+    await db_session.refresh(sibling)
+
+    assert resolved.status == "RESOLVED"
+    assert created is True
+    assert replacement.customer_id == case.customer_id
+    assert replacement.email == "replacement-buyer@example.com"
+    assert replacement.suppressed is False
+    assert old_contact.suppressed is True
+    assert sibling.suppressed is False
+    assert case.contact_id == replacement.id
+    assert case.status == CaseStatus.ACTIVE
+    assert old_contact.metadata_json["replacement_contact_id"] == replacement.id
+    audit_row = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type
+            == "handoff.deliverability_recipient_replaced"
+        )
+    )
+    assert audit_row is not None
+    assert audit_row.data["old_contact_id"] == old_contact.id
+    assert audit_row.data["new_contact_id"] == replacement.id
 
 
 async def test_smtp_preflight_defers_temporary_dns_failure_without_attempt(

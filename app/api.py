@@ -76,13 +76,16 @@ from app.reactivation import (
 )
 from app.services import (
     active_policy,
+    add_customer_contact_endpoint,
     assign_handoff_case,
     create_case_for_handoff,
     enqueue_job,
     ingest_raw_email,
     queue_human_reply,
+    replace_handoff_recipient,
     resolve_deliverability_handoff,
     seed_demo_data,
+    suppress_contact_endpoint,
 )
 from app.settings import Settings, get_settings
 
@@ -93,6 +96,7 @@ FAVICON_PATH = Path(__file__).with_name("favicon.ico")
 HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
+CONTACTS_PATH = Path(__file__).with_name("contacts.html")
 MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
@@ -152,6 +156,23 @@ class HandoffReplyRequest(BaseModel):
     body_text: str = Field(min_length=1, max_length=50_000)
     note: str = Field(default="", max_length=2_000)
     resume_automation: bool = False
+
+
+class ContactEndpointCreateRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="Customer", min_length=1, max_length=255)
+    note: str = Field(default="", max_length=2_000)
+
+
+class ContactEndpointSuppressRequest(BaseModel):
+    note: str = Field(default="", max_length=2_000)
+
+
+class HandoffRecipientReplacementRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="", max_length=255)
+    note: str = Field(default="", max_length=2_000)
+    resume_case: bool = False
 
 
 class InventoryItemRequest(BaseModel):
@@ -261,6 +282,14 @@ async def commercial_update_page(_: Admin) -> HTMLResponse:
 async def reactivation_page(_: Admin) -> HTMLResponse:
     return HTMLResponse(
         REACTIVATION_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+@router.get("/admin/contacts", response_class=HTMLResponse, include_in_schema=False)
+async def contacts_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        CONTACTS_PATH.read_text(encoding="utf-8"),
         headers=_dashboard_headers(),
     )
 
@@ -2062,6 +2091,122 @@ async def case_detail(case_id: int, _: Admin, session: Session) -> dict[str, Any
     }
 
 
+@router.get("/admin/contact-directory")
+async def contact_directory(
+    _: Admin,
+    session: Session,
+    query: Annotated[str, Query(max_length=320)] = "",
+) -> dict[str, Any]:
+    normalized_query = query.strip().casefold()
+    statement = (
+        select(Contact, Customer, EmailAddressStatus)
+        .join(Customer, Contact.customer_id == Customer.id)
+        .outerjoin(
+            EmailAddressStatus,
+            func.lower(Contact.email) == EmailAddressStatus.email,
+        )
+    )
+    if normalized_query:
+        pattern = f"%{normalized_query}%"
+        statement = statement.where(
+            or_(
+                func.lower(Customer.company_name).like(pattern),
+                func.lower(Contact.name).like(pattern),
+                func.lower(Contact.email).like(pattern),
+            )
+        )
+    rows = (
+        await session.execute(
+            statement.order_by(Customer.company_name, Contact.name, Contact.id).limit(
+                200
+            )
+        )
+    ).all()
+    return {
+        "query": query,
+        "limit": 200,
+        "contacts": [
+            {
+                "id": contact.id,
+                "customer_id": customer.id,
+                "company_name": customer.company_name,
+                "name": contact.name,
+                "email": contact.email,
+                "suppressed": bool(
+                    contact.suppressed
+                    or (address_status is not None and address_status.suppressed)
+                ),
+                "suppression_reason": (
+                    address_status.suppression_reason if address_status else None
+                ),
+                "last_bounce_type": (
+                    address_status.last_bounce_type if address_status else None
+                ),
+                "last_bounce_at": (
+                    address_status.last_bounce_at.isoformat()
+                    if address_status and address_status.last_bounce_at
+                    else None
+                ),
+                "source_associations": len(
+                    (contact.metadata_json or {}).get("source_associations") or []
+                ),
+            }
+            for contact, customer, address_status in rows
+        ],
+    }
+
+
+@router.post("/admin/customers/{customer_id}/contacts", status_code=201)
+async def create_customer_contact_endpoint(
+    customer_id: int,
+    request: ContactEndpointCreateRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        contact, created = await add_customer_contact_endpoint(
+            session,
+            customer_id=customer_id,
+            email=str(request.email),
+            name=request.name,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "id": contact.id,
+        "customer_id": contact.customer_id,
+        "name": contact.name,
+        "email": contact.email,
+        "created": created,
+    }
+
+
+@router.post("/admin/contacts/{contact_id}/suppress")
+async def suppress_customer_contact_endpoint(
+    contact_id: int,
+    request: ContactEndpointSuppressRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        contact = await suppress_contact_endpoint(
+            session,
+            contact_id=contact_id,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "id": contact.id,
+        "customer_id": contact.customer_id,
+        "email": contact.email,
+        "suppressed": True,
+    }
+
+
 def _suggested_handoff_reply(
     handoff: Handoff,
     source_email: EmailMessage | None,
@@ -2354,6 +2499,35 @@ async def create_handoff_case(
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"case_id": case.id, "status": case.status.value}
+
+
+@router.post("/admin/handoffs/{handoff_id}/replace-recipient")
+async def replace_handoff_email_recipient(
+    handoff_id: int,
+    request: HandoffRecipientReplacementRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        handoff, contact, created = await replace_handoff_recipient(
+            session,
+            handoff_id=handoff_id,
+            new_email=str(request.email),
+            new_name=request.name,
+            actor=admin,
+            note=request.note,
+            resume_case=request.resume_case,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "handoff_id": handoff.id,
+        "status": handoff.status,
+        "contact_id": contact.id,
+        "customer_id": contact.customer_id,
+        "email": contact.email,
+        "created": created,
+    }
 
 
 @router.post("/admin/handoffs/{handoff_id}/send", status_code=202)

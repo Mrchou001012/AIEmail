@@ -232,6 +232,8 @@ def _contact_datetime(value: Any, timezone_name: str) -> datetime | None:
             parsed = datetime.combine(parsed.date(), time(hour=12))
     elif isinstance(value, datetime):
         parsed = value
+        if parsed.tzinfo is None and parsed.time() == time.min:
+            parsed = datetime.combine(parsed.date(), time(hour=12))
     elif isinstance(value, date):
         parsed = datetime.combine(value, time(hour=12))
     else:

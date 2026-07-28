@@ -117,6 +117,19 @@
         <article class="card">
           <h2>其他处理</h2>
           <div class="sub hidden" id="deliverability-help">该地址无法投递，请勿回复。确认后系统将抑制这个具体地址、跳过对应唤醒任务并暂停案例；不会影响同公司的其他邮箱。</div>
+          <div class="hidden" id="recipient-replacement">
+            <label>失败邮箱</label>
+            <div class="file-list" id="failed-recipient">—</div>
+            <label for="replacement-name">新联系人称呼</label>
+            <input id="replacement-name" maxlength="255" placeholder="留空则沿用原联系人称呼">
+            <label for="replacement-email">替代邮箱</label>
+            <input id="replacement-email" type="email" maxlength="320" placeholder="name@example.com">
+            <label class="check"><input id="replacement-resume" type="checkbox">替换后恢复当前案例的 AI 自动处理</label>
+            <div class="actions">
+              <button class="primary" id="replace-recipient" type="button">停用旧邮箱并添加替代邮箱</button>
+            </div>
+            <div class="file-help">只迁移当前处理单关联的案例；同公司其他邮箱和其他案例不会被修改。已启动的唤醒批次不会自动改收件人。</div>
+          </div>
           <div class="actions">
             <button class="warn hidden" id="suppress-recipient" type="button">标记地址不可投递并关闭</button>
             <button id="takeover" type="button">人工接管</button>
@@ -233,8 +246,15 @@
       $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
       const deliverability = data.reason === "EMAIL_DELIVERABILITY";
       const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
+      const failedRecipient = String(data.facts?.recipient || data.case?.contact_email || "").trim();
       $("#reply-card").classList.toggle("hidden", deliveryReport);
       $("#deliverability-help").classList.toggle("hidden", !deliverability);
+      $("#recipient-replacement").classList.toggle("hidden", !deliveryReport || !failedRecipient);
+      $("#failed-recipient").textContent = failedRecipient || "未识别";
+      if (!$("#replacement-name").value && data.case?.contact_name) {
+        $("#replacement-name").value = data.case.contact_name;
+      }
+      $("#replace-recipient").disabled = data.status !== "OPEN" || !failedRecipient;
       $("#suppress-recipient").classList.toggle("hidden", !deliverability);
       $("#suppress-recipient").disabled = data.status !== "OPEN";
       $("#resolve").classList.toggle("hidden", deliverability);
@@ -316,6 +336,32 @@
     $("#suppress-recipient").addEventListener("click", async () => {
       if (!confirm("确认将这个具体邮箱标记为不可投递？系统会跳过后续自动发信并暂停关联案例。")) return;
       await post(`/admin/handoffs/${id}`, {action:"suppress_recipient", note:$("#reply-note").value}, "地址已抑制，处理单已关闭，案例已暂停。");
+    });
+    $("#replace-recipient").addEventListener("click", async () => {
+      const email = $("#replacement-email").value.trim();
+      if (!email) {
+        notice("请输入替代邮箱。", "error");
+        return;
+      }
+      const oldEmail = $("#failed-recipient").textContent;
+      if (!confirm(`确认停用 ${oldEmail}，并将当前案例改用 ${email}？同公司其他邮箱和其他案例不会被修改。`)) return;
+      $("#replace-recipient").disabled = true;
+      try {
+        const result = await api(`/admin/handoffs/${id}/replace-recipient`, {
+          method:"POST",
+          body:JSON.stringify({
+            email,
+            name:$("#replacement-name").value.trim(),
+            note:$("#reply-note").value.trim(),
+            resume_case:$("#replacement-resume").checked,
+          }),
+        });
+        notice(`旧邮箱已停用，替代邮箱 ${result.email} 已关联到当前案例。`);
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#replace-recipient").disabled = false;
+      }
     });
     for (const [selector, action, message] of [["#takeover","takeover","案例已设为人工接管。"],["#pause","pause","案例已暂停。"],["#resume-case","resume","案例已恢复。"],["#resolve","resolve","处理单已关闭。"]]) {
       $(selector).addEventListener("click", () => post(`/admin/handoffs/${id}`, {action, note:$("#reply-note").value}, message));

@@ -376,6 +376,16 @@ Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC thr
 
 A handoff is a durable database record, not merely a DingTalk message. Automatic sending stops for the affected case and the DingTalk notifier links to `/admin/handoffs/{id}/review`. The protected review page shows the source email, extracted facts, related cases, contact/product choices, latest quotation, and a conservative editable reply draft.
 
+Customer email endpoints are maintained at `/admin/contacts`. A permanent
+bounce suppresses only the exact failed address; sibling contacts under the
+same customer remain usable. Operators can add another address without
+rewriting historical messages. From an `EMAIL_DELIVERABILITY` or
+`BOUNCE_REVIEW` handoff, the replacement action suppresses the old endpoint and
+moves only that handoff's current case to the new or existing same-customer
+contact. Other cases are not reassigned. Pending delivery to the failed exact
+address is cancelled, and launched reactivation snapshots must be rescanned
+before the new endpoint can be selected.
+
 An authenticated reviewer can associate the inbound email with an existing case, create and associate a new case for a matching contact, edit and approve a reply, pause or resume the case, take over the case, or close the handoff. Approved replies record the handoff ID, reviewer account, approval timestamp, exact MIME message, and append-only audit event. They still pass recipient matching, do-not-contact and suppression checks, SAFE_MODE allowlisting, address/MX preflight, Gmail spacing, hourly/daily limits, and SMTP cooldowns. Explicitly human-approved replies may be delivered while autonomous sending is disabled; `MAIL_TRANSPORT=file` remains the global no-network-send control.
 
 The human-review page can add up to 10 ordinary attachments to an approved reply. Each file is limited to 10 MB, the combined upload is limited to 15 MB, and the final encoded MIME message must remain below 24 MB. Clear executable/script file types are rejected. Deployments behind Nginx must allow the request body before it reaches FastAPI; set `client_max_body_size 20m;` in the `aiemail` site/server block and reload Nginx.

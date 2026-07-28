@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <title>AIEmail 客户邮箱管理</title>
+  <style>
+    :root { color-scheme:light; --bg:#f5f7fb; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#175cd3; --red:#b42318; --green:#067647; --amber:#b54708; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,input { font:inherit; }
+    .shell { max-width:1320px; margin:0 auto; padding:24px; }
+    .top { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    h1,h2 { margin:0; }
+    h1 { font-size:24px; }
+    h2 { font-size:17px; }
+    .sub { color:var(--muted); margin-top:4px; }
+    .notice { padding:11px 13px; border:1px solid #fedf89; border-radius:10px; background:#fffaeb; color:#7a2e0e; margin-bottom:18px; }
+    .notice.ok { border-color:#abefc6; background:#ecfdf3; color:var(--green); }
+    .notice.error { border-color:#fecdca; background:#fff1f0; color:var(--red); }
+    .grid { display:grid; grid-template-columns:minmax(0,1fr) 350px; gap:18px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 4px 18px rgba(16,24,40,.04); overflow:hidden; }
+    .card-head { padding:16px 18px; border-bottom:1px solid var(--line); }
+    .card-body { padding:18px; }
+    .search { display:flex; gap:8px; }
+    input { width:100%; border:1px solid #c7d0dd; border-radius:9px; padding:9px 11px; background:#fff; color:var(--ink); }
+    label { display:block; font-weight:650; margin:12px 0 6px; }
+    button { border:0; border-radius:9px; padding:9px 13px; cursor:pointer; background:#e9eef6; color:var(--ink); font-weight:650; white-space:nowrap; }
+    button.primary { background:var(--blue); color:#fff; }
+    button.warn { background:#fff1f0; color:var(--red); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .table-wrap { overflow:auto; max-height:72vh; }
+    table { width:100%; border-collapse:collapse; min-width:900px; }
+    th,td { padding:11px 12px; text-align:left; border-bottom:1px solid #eef1f5; vertical-align:top; }
+    th { position:sticky; top:0; z-index:1; background:#f8fafc; color:var(--muted); font-size:12px; }
+    .company { font-weight:700; }
+    .email { overflow-wrap:anywhere; }
+    .pill { display:inline-flex; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:#ecfdf3; color:var(--green); }
+    .pill.bad { background:#fff1f0; color:var(--red); }
+    .pill.warn { background:#fffaeb; color:var(--amber); }
+    .actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .selected { outline:2px solid #84adff; outline-offset:-2px; }
+    .empty { padding:28px; text-align:center; color:var(--muted); }
+    .selected-company { padding:10px 12px; border-radius:9px; background:#eef4ff; color:#1849a9; overflow-wrap:anywhere; }
+    .help { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+    @media (max-width:900px) { .grid { grid-template-columns:1fr; } .shell { padding:14px; } .table-wrap { max-height:none; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <h1>客户邮箱管理</h1>
+        <div class="sub">一个公司可以保留多个独立发信地址；停用只作用于选中的具体邮箱。</div>
+      </div>
+      <a href="/dashboard">← 返回运行看板</a>
+    </header>
+
+    <div class="notice" id="notice">
+      永久退信时请保留旧地址作为历史记录并单独停用；新地址应作为同一客户下的新联系人添加，不要覆盖旧邮件记录。
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <div class="card-head">
+          <div class="search">
+            <input id="search" maxlength="320" placeholder="输入公司、联系人或邮箱">
+            <button class="primary" id="search-button" type="button">查询</button>
+          </div>
+          <div class="sub" id="result-summary">正在读取…</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>公司</th><th>联系人</th><th>邮箱</th><th>投递状态</th><th>来源</th><th>操作</th></tr>
+            </thead>
+            <tbody id="rows"><tr><td colspan="6" class="empty">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="card">
+        <div class="card-head"><h2>新增同公司邮箱</h2></div>
+        <div class="card-body">
+          <div class="selected-company" id="selected-company">请先在左侧选择公司</div>
+          <label for="contact-name">联系人称呼</label>
+          <input id="contact-name" maxlength="255" value="Customer">
+          <label for="contact-email">新邮箱</label>
+          <input id="contact-email" type="email" maxlength="320" placeholder="name@example.com">
+          <label for="contact-note">操作备注</label>
+          <input id="contact-note" maxlength="2000" placeholder="例如：客户提供的新采购邮箱">
+          <div class="actions">
+            <button class="primary" id="create" type="button" disabled>新增邮箱</button>
+          </div>
+          <div class="help">
+            新地址不会自动加入已经启动的历史唤醒批次；添加后需要重新筛选批次。格式和 MX 会在真正发送前再次检查。
+          </div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    let selectedCustomerId = null;
+    let selectedCompanyName = "";
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: {"Content-Type":"application/json", ...(options.headers || {})},
+        ...options,
+      });
+      if (!response.ok) {
+        let message = `${response.status} ${response.statusText}`;
+        try { message = (await response.json()).detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+
+    function notice(message, kind = "ok") {
+      const node = $("#notice");
+      node.className = `notice ${kind}`;
+      node.textContent = message;
+    }
+
+    function selectCompany(customerId, companyName, row) {
+      selectedCustomerId = Number(customerId);
+      selectedCompanyName = companyName;
+      $("#selected-company").textContent = `客户 #${selectedCustomerId} · ${selectedCompanyName}`;
+      $("#create").disabled = false;
+      document.querySelectorAll("tr.selected").forEach((item) => item.classList.remove("selected"));
+      row?.classList.add("selected");
+      $("#contact-email").focus();
+    }
+
+    function render(data) {
+      const rows = data.contacts || [];
+      $("#result-summary").textContent = `显示 ${rows.length} 条，单次最多 200 条`;
+      $("#rows").innerHTML = rows.length ? rows.map((row) => {
+        const suppressed = Boolean(row.suppressed);
+        const bounce = row.last_bounce_type ? ` · 最近退信 ${esc(row.last_bounce_type)}` : "";
+        const reason = row.suppression_reason ? ` · ${esc(row.suppression_reason)}` : "";
+        return `
+          <tr data-contact="${row.id}" data-customer="${row.customer_id}">
+            <td><div class="company">${esc(row.company_name)}</div><div class="sub">客户 #${row.customer_id}</div></td>
+            <td>${esc(row.name)}</td>
+            <td class="email">${esc(row.email)}</td>
+            <td><span class="pill ${suppressed ? "bad" : ""}">${suppressed ? "已停用" : "可用"}</span><div class="sub">${bounce}${reason}</div></td>
+            <td><span class="pill warn">${esc(row.source_associations || 0)} 条来源</span></td>
+            <td><div class="actions">
+              <button type="button" data-add="${row.customer_id}" data-company="${esc(row.company_name)}">在此公司新增</button>
+              <button class="warn" type="button" data-suppress="${row.id}" data-email="${esc(row.email)}" ${suppressed ? "disabled" : ""}>只停用此邮箱</button>
+            </div></td>
+          </tr>`;
+      }).join("") : '<tr><td colspan="6" class="empty">没有匹配结果</td></tr>';
+
+      document.querySelectorAll("[data-add]").forEach((button) => {
+        button.addEventListener("click", () => {
+          selectCompany(button.dataset.add, button.dataset.company, button.closest("tr"));
+        });
+      });
+      document.querySelectorAll("[data-suppress]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          if (!confirm(`确认只停用 ${button.dataset.email}？同公司的其他邮箱不会受影响，指向此邮箱的未结束案例会暂停。`)) return;
+          const note = prompt("操作备注（可选）", "永久退信或客户确认地址失效") || "";
+          try {
+            await api(`/admin/contacts/${button.dataset.suppress}/suppress`, {
+              method:"POST",
+              body:JSON.stringify({note}),
+            });
+            notice(`已停用 ${button.dataset.email}；其他邮箱未受影响。`);
+            await load();
+          } catch (error) {
+            notice(error.message, "error");
+          }
+        });
+      });
+    }
+
+    async function load() {
+      try {
+        const query = encodeURIComponent($("#search").value.trim());
+        render(await api(`/admin/contact-directory?query=${query}`));
+      } catch (error) {
+        notice(error.message, "error");
+      }
+    }
+
+    $("#search-button").addEventListener("click", load);
+    $("#search").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") load();
+    });
+    $("#create").addEventListener("click", async () => {
+      if (!selectedCustomerId) return;
+      const email = $("#contact-email").value.trim();
+      const name = $("#contact-name").value.trim() || "Customer";
+      const note = $("#contact-note").value.trim();
+      if (!email) {
+        notice("请输入新邮箱。", "error");
+        return;
+      }
+      if (!confirm(`确认在“${selectedCompanyName}”下新增 ${email}？旧地址不会被覆盖。`)) return;
+      $("#create").disabled = true;
+      try {
+        const result = await api(`/admin/customers/${selectedCustomerId}/contacts`, {
+          method:"POST",
+          body:JSON.stringify({email, name, note}),
+        });
+        notice(result.created ? `新邮箱 ${result.email} 已添加。` : `邮箱 ${result.email} 已存在，无需重复创建。`);
+        $("#contact-email").value = "";
+        $("#contact-note").value = "";
+        $("#search").value = selectedCompanyName;
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+      } finally {
+        $("#create").disabled = !selectedCustomerId;
+      }
+    });
+    load();
+  </script>
+</body>
+</html>

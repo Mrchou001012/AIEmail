@@ -5,12 +5,14 @@ import pytest
 
 from app.api import (
     COMMERCIAL_UPDATE_PATH,
+    CONTACTS_PATH,
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
     _dashboard_headers,
     _suggested_handoff_reply,
     commercial_update_page,
+    contacts_page,
     dashboard,
     favicon,
     health,
@@ -102,6 +104,29 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "远程图片可能用于追踪邮件是否被打开" in html
     assert "确认并加入发件队列" in html
     assert "resume_automation" in html
+    assert "/replace-recipient" in html
+    assert 'id="replacement-email"' in html
+    assert "同公司其他邮箱和其他案例不会被修改" in html
+
+
+@pytest.mark.asyncio
+async def test_contacts_page_is_protected_no_store_html() -> None:
+    response = await contacts_page("admin")
+
+    assert response.status_code == 200
+    assert "客户邮箱管理" in response.body.decode("utf-8")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_contacts_page_exposes_endpoint_level_management() -> None:
+    html = CONTACTS_PATH.read_text(encoding="utf-8")
+
+    assert "/admin/contact-directory" in html
+    assert "/admin/customers/" in html
+    assert "/admin/contacts/" in html
+    assert "只停用此邮箱" in html
+    assert "旧地址不会被覆盖" in html
 
 
 def test_remote_images_are_only_permitted_by_the_handoff_specific_csp() -> None:
