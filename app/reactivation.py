@@ -46,6 +46,7 @@ from app.settings import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 CAMPAIGN_STATUSES = frozenset({"DRAFT", "RUNNING", "PAUSED", "COMPLETED", "CANCELLED"})
+CONTACT_RESERVING_CAMPAIGN_STATUSES = frozenset({"RUNNING", "PAUSED"})
 REPLY_FILTERS = frozenset({"ANY", "NEVER_REPLIED", "PREVIOUSLY_REPLIED"})
 SELECTABLE_STATUSES = frozenset({"CANDIDATE", "SELECTED"})
 TERMINAL_RECIPIENT_STATUSES = frozenset({"SENT", "REPLIED", "SKIPPED", "FAILED", "EXCLUDED"})
@@ -251,6 +252,31 @@ def _schedule_slots(
     return result
 
 
+async def _reserved_reactivation_contact_ids(
+    session: AsyncSession,
+    *,
+    excluding_campaign_id: int,
+    contact_ids: list[int] | None = None,
+) -> set[int]:
+    query = (
+        select(ReactivationRecipient.contact_id)
+        .join(
+            ReactivationCampaign,
+            ReactivationRecipient.campaign_id == ReactivationCampaign.id,
+        )
+        .where(
+            ReactivationRecipient.campaign_id != excluding_campaign_id,
+            ReactivationCampaign.status.in_(CONTACT_RESERVING_CAMPAIGN_STATUSES),
+            ReactivationRecipient.selected.is_(True),
+        )
+    )
+    if contact_ids is not None:
+        if not contact_ids:
+            return set()
+        query = query.where(ReactivationRecipient.contact_id.in_(contact_ids))
+    return set((await session.execute(query)).scalars())
+
+
 async def scan_campaign_candidates(
     session: AsyncSession,
     campaign: ReactivationCampaign,
@@ -303,6 +329,10 @@ async def scan_campaign_candidates(
         )
         .scalars()
         .all()
+    )
+    reserved_contact_ids = await _reserved_reactivation_contact_ids(
+        session,
+        excluding_campaign_id=campaign.id,
     )
 
     activities: dict[int, dict[str, Any]] = defaultdict(
@@ -465,6 +495,8 @@ async def scan_campaign_candidates(
             reason = "AUTO_SEND_NOT_ALLOWED"
         elif require_consent and not (customer.consent_basis or "").strip():
             reason = "CONSENT_BASIS_MISSING"
+        elif contact.id in reserved_contact_ids:
+            reason = "ACTIVE_REACTIVATION_CAMPAIGN"
         elif last_contact is None:
             reason = "NEVER_CONTACTED"
         elif contact.id in open_handoff_contacts:
@@ -571,8 +603,42 @@ async def start_campaign(
     )
     if not selected:
         raise ValueError("select at least one eligible recipient before starting")
+    selected_contact_ids = sorted({recipient.contact_id for recipient in selected})
+    # Serialize starts that share contacts. The second transaction sees the
+    # first campaign after waiting for these stable, deterministically ordered
+    # row locks and cannot schedule the same person again.
+    await session.execute(
+        select(Contact.id)
+        .where(Contact.id.in_(selected_contact_ids))
+        .order_by(Contact.id)
+        .with_for_update()
+    )
+    reserved_contact_ids = await _reserved_reactivation_contact_ids(
+        session,
+        excluding_campaign_id=campaign.id,
+        contact_ids=selected_contact_ids,
+    )
+    available = [
+        recipient for recipient in selected if recipient.contact_id not in reserved_contact_ids
+    ]
+    if not available:
+        raise ValueError(
+            "all selected recipients are already reserved by another running or paused campaign"
+        )
+    for recipient in selected:
+        if recipient.contact_id not in reserved_contact_ids:
+            continue
+        recipient.status = "EXCLUDED"
+        recipient.eligible = False
+        recipient.selected = False
+        recipient.exclusion_reason = "ACTIVE_REACTIVATION_CAMPAIGN"
+        recipient.scheduled_for = None
     observed_at = at or datetime.now(UTC)
-    for recipient, slot in zip(selected, _schedule_slots(campaign, len(selected), at=observed_at), strict=True):
+    for recipient, slot in zip(
+        available,
+        _schedule_slots(campaign, len(available), at=observed_at),
+        strict=True,
+    ):
         recipient.status = "SCHEDULED"
         recipient.scheduled_for = slot
     campaign.status = "RUNNING"
@@ -583,11 +649,15 @@ async def start_campaign(
             case_id=None,
             actor=campaign.created_by,
             event_type="reactivation.campaign_started",
-            data={"campaign_id": campaign.id, "selected": len(selected)},
+            data={
+                "campaign_id": campaign.id,
+                "selected": len(available),
+                "excluded_reserved": len(selected) - len(available),
+            },
         )
     )
     await session.commit()
-    return len(selected)
+    return len(available)
 
 
 async def pause_campaign(session: AsyncSession, campaign: ReactivationCampaign) -> int:

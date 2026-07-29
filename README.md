@@ -290,6 +290,10 @@ Starting a campaign assigns selected recipients across Monday-Friday business
 windows and freezes the approved dedicated template plus the normal company
 signature. Campaigns can be paused, resumed, or cancelled from the page. Pausing
 stops pending campaign outbox records; resuming restores only those records.
+While a campaign is running or paused, every selected contact is reserved and
+excluded from all other campaign candidate lists. Campaign start locks and
+rechecks those contacts before scheduling, so concurrent administrators cannot
+place one contact into two active batches.
 The worker does not materialize campaign mail while any `process_inbound` job is
 pending or running, and the outbox always prioritizes live replies, quotations,
 and human-approved messages ahead of reactivation mail.

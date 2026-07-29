@@ -181,6 +181,134 @@ async def test_scan_and_dispatch_eligible_dormant_customer(db_session) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("active_status", ["RUNNING", "PAUSED"])
+async def test_scan_excludes_contact_reserved_by_another_active_campaign(
+    db_session,
+    active_status: str,
+) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    customer = Customer(
+        company_name="Already Scheduled Buyer",
+        auto_send_allowed=True,
+        consent_basis="existing business relationship",
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Buyer",
+        email="reserved@example.com",
+        last_contact_at=observed_at - timedelta(days=500),
+    )
+    db_session.add(contact)
+    active_campaign = _campaign(name="Existing campaign", status=active_status)
+    new_campaign = _campaign(name="New campaign")
+    db_session.add_all([active_campaign, new_campaign])
+    await db_session.flush()
+    db_session.add(
+        ReactivationRecipient(
+            campaign_id=active_campaign.id,
+            customer_id=customer.id,
+            contact_id=contact.id,
+            status="SCHEDULED",
+            eligible=True,
+            selected=True,
+            scheduled_for=observed_at + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, new_campaign, at=observed_at)
+
+    assert result == {"eligible": 0, "excluded": 1, "total": 1}
+    recipient = await db_session.scalar(
+        select(ReactivationRecipient).where(
+            ReactivationRecipient.campaign_id == new_campaign.id
+        )
+    )
+    assert recipient is not None
+    assert recipient.eligible is False
+    assert recipient.selected is False
+    assert recipient.exclusion_reason == "ACTIVE_REACTIVATION_CAMPAIGN"
+
+
+@pytest.mark.integration
+async def test_start_campaign_rechecks_cross_campaign_contact_reservations(
+    db_session,
+) -> None:
+    observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
+    customers = [
+        Customer(
+            company_name=f"Start Race Buyer {index}",
+            auto_send_allowed=True,
+            consent_basis="existing business relationship",
+        )
+        for index in (1, 2)
+    ]
+    db_session.add_all(customers)
+    await db_session.flush()
+    contacts = [
+        Contact(
+            customer_id=customer.id,
+            name=f"Buyer {index}",
+            email=f"start-race-{index}@example.com",
+            last_contact_at=observed_at - timedelta(days=500),
+        )
+        for index, customer in enumerate(customers, start=1)
+    ]
+    db_session.add_all(contacts)
+    campaign = _campaign(name="Campaign being started")
+    db_session.add(campaign)
+    await db_session.flush()
+    await db_session.commit()
+
+    result = await scan_campaign_candidates(db_session, campaign, at=observed_at)
+    assert result == {"eligible": 2, "excluded": 0, "total": 2}
+    recipients = (
+        (
+            await db_session.execute(
+                select(ReactivationRecipient)
+                .where(ReactivationRecipient.campaign_id == campaign.id)
+                .order_by(ReactivationRecipient.contact_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for recipient in recipients:
+        recipient.selected = True
+        recipient.status = "SELECTED"
+
+    other_campaign = _campaign(name="Campaign that won the race", status="RUNNING")
+    db_session.add(other_campaign)
+    await db_session.flush()
+    db_session.add(
+        ReactivationRecipient(
+            campaign_id=other_campaign.id,
+            customer_id=customers[0].id,
+            contact_id=contacts[0].id,
+            status="SCHEDULED",
+            eligible=True,
+            selected=True,
+            scheduled_for=observed_at + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    assert await start_campaign(db_session, campaign, at=observed_at) == 1
+    await db_session.refresh(recipients[0])
+    await db_session.refresh(recipients[1])
+
+    assert recipients[0].status == "EXCLUDED"
+    assert recipients[0].eligible is False
+    assert recipients[0].selected is False
+    assert recipients[0].exclusion_reason == "ACTIVE_REACTIVATION_CAMPAIGN"
+    assert recipients[1].status == "SCHEDULED"
+    assert recipients[1].selected is True
+    assert recipients[1].scheduled_for is not None
+
+
+@pytest.mark.integration
 async def test_scan_excludes_suppressed_and_active_contacts(db_session) -> None:
     observed_at = datetime(2026, 7, 20, 8, 0, tzinfo=UTC)
     product = Product(code="YAC-TES", name="YAC-TES", unit="kg", approved_text_key="yac_tes", active=True)
