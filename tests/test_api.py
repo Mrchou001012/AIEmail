@@ -66,6 +66,27 @@ def test_handoff_suggestion_does_not_duplicate_the_automatic_signature() -> None
     assert "Best regards" not in suggestion["body_text"]
 
 
+def test_handoff_suggestion_prefers_saved_ai_preview() -> None:
+    suggestion = _suggested_handoff_reply(
+        Handoff(
+            reason_code="NEW_INQUIRY_REVIEW",
+            extracted_facts={
+                "ai_draft_preview": {
+                    "subject": "Re: AI preview",
+                    "body_text": "Dear Zhou Lei,\n\nSaved preview.",
+                }
+            },
+        ),
+        None,
+        None,
+    )
+
+    assert suggestion == {
+        "subject": "Re: AI preview",
+        "body_text": "Dear Zhou Lei,\n\nSaved preview.",
+    }
+
+
 def test_human_reply_removes_a_trailing_automatic_signature_lead() -> None:
     body = _strip_duplicate_signature_lead(
         "Dear Customer,\n\nPlease see the attached quotation.\n\nBEST REGARDS,",

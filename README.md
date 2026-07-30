@@ -209,6 +209,63 @@ The inbound-analysis schema requires every property while retaining nullable val
 
 Keep `MAIL_TRANSPORT=file`, `SAFE_MODE=true`, and `AUTO_SEND_ENABLED=false` while testing real Claude.
 
+## Historical-email RAG
+
+RAG is model-provider independent. Alibaba Bailian supplies the embedding
+vectors; Claude or another supported generation model can still draft the
+language. Set these values locally:
+
+```dotenv
+BAILIAN_API_KEY=...
+BAILIAN_API_HOST=...
+BAILIAN_EMBEDDING_MODEL=qwen3.7-text-embedding
+BAILIAN_EMBEDDING_DIMENSION=1024
+RAG_ENABLED=false
+RAG_INDEX_PATH=runtime/rag_history/email_rag_index.json
+RAG_TOP_K=4
+RAG_MIN_SIMILARITY=0.25
+```
+
+Build the index only from the `knowledge_base` split. Never index
+`development` or `test_holdout`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_email_rag_index.py `
+  --examples runtime\rag_history\final_dataset\knowledge_base\examples.jsonl `
+  --output runtime\rag_history\email_rag_index.json
+```
+
+Then set `RAG_ENABLED=true` and restart the API/worker. Query and document text
+is stripped of email addresses and phone numbers before it is sent to the
+embedding endpoint. Historical responses remain local and are supplied to the
+language model only as untrusted tone/structure examples. Deterministic code
+continues to own pricing, payment terms, lead time, compliance text, and sending
+policy.
+
+Evaluate retrieval without changing the index:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_email_rag.py `
+  --index runtime\rag_history\email_rag_index.json `
+  --examples runtime\rag_history\final_dataset\test_holdout\examples.jsonl `
+  --output runtime\rag_history\rag_evaluation.json
+```
+
+Before enabling RAG on a server, upload the generated index outside Git and
+run the secret-safe readiness check as the service account:
+
+```bash
+sudo -u aiemail /opt/aiemail-env/bin/python \
+  /opt/aiemail/scripts/check_rag_readiness.py \
+  --env-file /etc/aiemail/aiemail.env
+```
+
+This validates the local index schema, example count, embedding dimension and
+configuration without making a network request. Add `--online` only when one
+real Bailian query-embedding request is intended. The report never prints the
+API key. Keep `RAG_ENABLED=false` until both checks pass; enabling retrieval
+does not change the mail transport or autonomous-send settings.
+
 ## Gmail and DingTalk activation
 
 Gmail IMAP/SMTP uses a Workspace mailbox plus app password where Workspace policy permits. Gmail OAuth/Gmail API is the recommended production upgrade.

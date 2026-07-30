@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     ai_provider: Literal["stub", "anthropic"] = "stub"
     anthropic_model: str = "claude-opus-4-8"
     anthropic_api_key: str | None = None
+    rag_enabled: bool = False
+    rag_index_path: Path = Path("runtime/rag_history/email_rag_index.json")
+    rag_top_k: int = 4
+    rag_min_similarity: float = 0.25
 
     mail_transport: Literal["file", "smtp"] = "file"
     mail_from: str = "sales-agent@example.com"
@@ -111,6 +115,20 @@ class Settings(BaseSettings):
     def exact_default_model(cls, value: str) -> str:
         if not value.startswith("claude-"):
             raise ValueError("ANTHROPIC_MODEL must be an exact Claude model identifier")
+        return value
+
+    @field_validator("rag_top_k")
+    @classmethod
+    def valid_rag_top_k(cls, value: int) -> int:
+        if not 1 <= value <= 10:
+            raise ValueError("RAG_TOP_K must be between 1 and 10")
+        return value
+
+    @field_validator("rag_min_similarity")
+    @classmethod
+    def valid_rag_min_similarity(cls, value: float) -> float:
+        if not -1 <= value <= 1:
+            raise ValueError("RAG_MIN_SIMILARITY must be between -1 and 1")
         return value
 
     @field_validator("business_timezone")

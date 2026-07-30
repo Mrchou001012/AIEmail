@@ -7,10 +7,13 @@ import pytest
 
 from app.ai import (
     AIClient,
+    EmailDraftPreview,
     InboundAnalysis,
     _anthropic_inference_options,
     _normalize_quantity_revision,
+    render_draft_preview,
     stub_analyze,
+    validate_draft_preview,
     validate_rendered_email,
 )
 from app.domain import Intent, PricingPolicy, counteroffer
@@ -90,6 +93,40 @@ def test_quantity_only_revision_is_not_a_counteroffer() -> None:
 
     assert normalized.intent == Intent.QUOTE_REQUEST
     assert genuine_counteroffer.intent == Intent.COUNTEROFFER
+
+
+def test_stub_draft_preview_is_review_only_and_ignores_historical_prices() -> None:
+    ai = AIClient(Settings(ai_provider="stub"))
+    preview, metadata = asyncio.run(
+        ai.draft_preview(
+            {
+                "subject": "Inquiry for YAC-TEOS40",
+                "contact_name": "Zhou Lei",
+                "product_code": "YAC-TEOS40",
+                "quantity": 600,
+                "historical_style_examples": [
+                    {"historical_response": "Our price is USD 1.23/kg."}
+                ],
+            }
+        )
+    )
+
+    rendered = render_draft_preview(preview)
+    assert metadata["provider"] == "stub"
+    assert "600 kg of YAC-TEOS40" in rendered
+    assert "USD" not in rendered
+
+
+def test_draft_preview_rejects_unapproved_money() -> None:
+    preview = EmailDraftPreview(
+        subject="Re: Inquiry",
+        greeting="Dear Customer,",
+        paragraphs=["Our price is USD 1.23/kg."],
+        closing="Best regards,",
+    )
+
+    with pytest.raises(ValueError, match="unapproved monetary value"):
+        validate_draft_preview(preview)
 
 
 def test_demo_end_to_end_flow() -> None:

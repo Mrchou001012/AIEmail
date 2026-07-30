@@ -80,6 +80,7 @@ from app.services import (
     assign_handoff_case,
     create_case_for_handoff,
     enqueue_job,
+    generate_handoff_draft_preview,
     ingest_raw_email,
     queue_human_reply,
     replace_handoff_recipient,
@@ -2212,6 +2213,15 @@ def _suggested_handoff_reply(
     source_email: EmailMessage | None,
     case: SalesCase | None,
 ) -> dict[str, str]:
+    stored_preview = (handoff.extracted_facts or {}).get("ai_draft_preview")
+    if isinstance(stored_preview, dict):
+        stored_subject = str(stored_preview.get("subject") or "").strip()
+        stored_body = str(stored_preview.get("body_text") or "").strip()
+        if stored_subject and stored_body:
+            return {
+                "subject": stored_subject[:998],
+                "body_text": stored_body[:50_000],
+            }
     subject = (source_email.subject if source_email else "Your inquiry").strip()
     if not subject.casefold().startswith("re:"):
         subject = f"Re: {subject}"
@@ -2478,6 +2488,28 @@ async def assign_handoff(
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"id": handoff.id, "case_id": handoff.case_id, "status": handoff.status}
+
+
+@router.post("/admin/handoffs/{handoff_id}/draft-preview")
+async def generate_handoff_preview(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        return await generate_handoff_draft_preview(
+            session,
+            handoff_id=handoff_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(
+            502,
+            f"AI draft preview failed: {type(exc).__name__}",
+        ) from exc
 
 
 @router.post("/admin/handoffs/{handoff_id}/cases", status_code=201)

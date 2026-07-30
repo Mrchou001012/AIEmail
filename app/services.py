@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.ai import AIClient, validate_rendered_email
+from app.ai import AIClient, render_draft_preview, validate_rendered_email
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.bounces import (
     BounceType,
@@ -91,10 +91,29 @@ from app.mail import (
     transport_for,
 )
 from app.products import canonical_product_code, find_product_codes, product_codes_match
+from app.rag_retrieval import LocalRAGRetriever
 from app.reactivation import reactivation_send_guard, record_reactivation_reply
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _retrieve_historical_style_examples(
+    settings: Settings,
+    *,
+    subject: str,
+    body: str,
+    intent: str,
+) -> list[dict[str, Any]]:
+    retriever = LocalRAGRetriever(settings.rag_index_path)
+    matches = retriever.retrieve(
+        f"Intent: {intent}\nSubject: {subject}\nCustomer request:\n{body}",
+        intent=intent,
+        top_k=settings.rag_top_k,
+        min_similarity=settings.rag_min_similarity,
+    )
+    return [match.prompt_document() for match in matches]
+
 
 AUTO_SUPPRESS_PREFLIGHT_STATUSES = frozenset(
     {
@@ -931,6 +950,153 @@ async def create_handoff(
         f"handoff-notify:{handoff.id}",
     )
     return handoff
+
+
+async def generate_handoff_draft_preview(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    actor: str,
+) -> dict[str, Any]:
+    """Generate and save a review-only draft without creating any delivery work."""
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("only an open handoff can generate a draft preview")
+    if handoff.source_email_id is None:
+        raise ValueError("handoff has no source email")
+    if handoff.case_id is None:
+        raise ValueError("handoff must be associated with a case")
+    if await session.scalar(
+        select(Outbox.id).where(Outbox.approval_handoff_id == handoff.id)
+    ):
+        raise ValueError("handoff already has an approved outbound email")
+
+    source_email = await session.get(EmailMessage, handoff.source_email_id)
+    sales_case = await session.scalar(
+        select(SalesCase)
+        .options(
+            selectinload(SalesCase.contact),
+            selectinload(SalesCase.product),
+        )
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if source_email is None or sales_case is None:
+        raise ValueError("handoff source email or case not found")
+    if source_email.direction != "INBOUND":
+        raise ValueError("draft previews can only be generated for inbound email")
+
+    settings = get_settings()
+    ai = AIClient(settings)
+    analysis, analysis_metadata = await ai.analyze(
+        source_email.subject,
+        source_email.body_text,
+        source_email.attachment_metadata,
+    )
+    historical_style_examples: list[dict[str, Any]] = []
+    retrieval_error: str | None = None
+    if settings.rag_enabled:
+        try:
+            historical_style_examples = await asyncio.to_thread(
+                _retrieve_historical_style_examples,
+                settings,
+                subject=source_email.subject,
+                body=source_email.body_text,
+                intent=analysis.intent.value,
+            )
+        except Exception as exc:
+            retrieval_error = type(exc).__name__
+            logger.warning(
+                "RAG retrieval failed while generating handoff %s preview: %s",
+                handoff.id,
+                exc,
+            )
+
+    preview, preview_metadata = await ai.draft_preview(
+        {
+            "subject": source_email.subject,
+            "contact_name": sales_case.contact.name,
+            "customer_message": source_email.body_text[:12_000],
+            "intent": analysis.intent.value,
+            "product_code": sales_case.product.code,
+            "quantity": analysis.quantity,
+            "requested_information": analysis.missing_fields,
+            "approved_commercial_facts": {},
+            "historical_style_examples": historical_style_examples,
+        }
+    )
+    generated_at = datetime.now(UTC)
+    preview_facts: dict[str, Any] = {
+        "subject": preview.subject,
+        "body_text": render_draft_preview(preview),
+        "analysis": analysis.model_dump(mode="json"),
+        "provider": preview_metadata["provider"],
+        "model": preview_metadata["model"],
+        "generated_at": generated_at.isoformat(),
+        "generated_by": actor,
+        "input_tokens": preview_metadata.get("input_tokens"),
+        "output_tokens": preview_metadata.get("output_tokens"),
+        "rag_enabled": settings.rag_enabled,
+        "rag_matches": [
+            {
+                "example_id": item.get("example_id"),
+                "similarity": item.get("similarity"),
+                "boss_anchor": bool(item.get("boss_anchor")),
+                "intent": item.get("intent"),
+            }
+            for item in historical_style_examples
+        ],
+        "rag_error": retrieval_error,
+        "delivery_created": False,
+    }
+    stored_facts = dict(handoff.extracted_facts or {})
+    stored_facts["ai_draft_preview"] = preview_facts
+    handoff.extracted_facts = stored_facts
+
+    session.add_all(
+        [
+            AIInvocation(
+                case_id=sales_case.id,
+                provider=analysis_metadata["provider"],
+                model=analysis_metadata["model"],
+                purpose="handoff_preview_analysis",
+                request_hash=analysis_metadata["request_hash"],
+                parsed_output=analysis.model_dump(mode="json"),
+                success=True,
+                input_tokens=analysis_metadata.get("input_tokens"),
+                output_tokens=analysis_metadata.get("output_tokens"),
+            ),
+            AIInvocation(
+                case_id=sales_case.id,
+                provider=preview_metadata["provider"],
+                model=preview_metadata["model"],
+                purpose="handoff_draft_preview",
+                request_hash=preview_metadata["request_hash"],
+                parsed_output=preview.model_dump(mode="json"),
+                success=True,
+                input_tokens=preview_metadata.get("input_tokens"),
+                output_tokens=preview_metadata.get("output_tokens"),
+            ),
+        ]
+    )
+    await audit(
+        session,
+        "handoff.draft_preview_generated",
+        case_id=sales_case.id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "source_email_id": source_email.id,
+            "intent": analysis.intent.value,
+            "provider": preview_metadata["provider"],
+            "model": preview_metadata["model"],
+            "rag_match_count": len(historical_style_examples),
+            "delivery_created": False,
+        },
+    )
+    await session.commit()
+    return preview_facts
 
 
 async def assign_handoff_case(
@@ -2945,12 +3111,29 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
+    historical_style_examples: list[dict[str, Any]] = []
+    if settings.rag_enabled:
+        try:
+            historical_style_examples = await asyncio.to_thread(
+                _retrieve_historical_style_examples,
+                settings,
+                subject=email_row.subject,
+                body=email_row.body_text,
+                intent=analysis.intent.value,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Historical RAG retrieval skipped for email %s: %s",
+                email_row.id,
+                type(exc).__name__,
+            )
     try:
         plan = await ai.draft_plan(
             {
                 "subject": email_row.subject,
                 "contact_name": case.contact.name,
                 "approved_product_key": case.product.approved_text_key,
+                "historical_style_examples": historical_style_examples,
             }
         )
         text, html_body = render_quote(

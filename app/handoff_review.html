@@ -99,7 +99,9 @@
       <aside>
         <article class="card" id="reply-card">
           <h2>人工回复</h2>
-          <div class="sub">以下是保守建议草稿。请人工核对并修改；发送时系统自动追加正式签名。</div>
+          <div class="sub">可先调用当前大模型和历史邮件 RAG 生成预览。生成只保存草稿，不会发邮件或通知钉钉。</div>
+          <div class="actions"><button id="generate-draft" type="button">生成 / 重新生成 AI 草稿预览</button></div>
+          <div class="sub" id="draft-state"></div>
           <label for="reply-subject">邮件主题</label>
           <input id="reply-subject" maxlength="998">
           <label for="reply-body">邮件正文</label>
@@ -241,8 +243,13 @@
       if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
       $("#association-tools").classList.toggle("hidden", Boolean(data.case));
       const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
+      $("#generate-draft").disabled = blocked;
       $("#send").disabled = blocked;
       $("#reply-attachments").disabled = blocked;
+      const preview = data.facts?.ai_draft_preview;
+      $("#draft-state").textContent = preview
+        ? `预览生成于 ${new Date(preview.generated_at).toLocaleString()} · ${preview.provider}/${preview.model} · RAG 命中 ${(preview.rag_matches || []).length} 条 · 未创建发件任务`
+        : (!data.case ? "请先关联案例后生成。" : "尚未生成 AI 草稿预览。");
       $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
       const deliverability = data.reason === "EMAIL_DELIVERABILITY";
       const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
@@ -310,6 +317,20 @@
       $("#remote-image-help").textContent = `已加载 ${loaded} 张；${linked ? `${linked} 张非 HTTPS 图片仅提供新窗口链接。` : "远程图片不会保存到本服务器。"}`;
     });
     $("#reply-attachments").addEventListener("change", renderAttachments);
+    $("#generate-draft").addEventListener("click", async () => {
+      $("#generate-draft").disabled = true;
+      notice("正在调用分类模型、RAG 和草稿模型生成预览…");
+      try {
+        const preview = await api(`/admin/handoffs/${id}/draft-preview`, {method:"POST"});
+        $("#reply-subject").value = preview.subject || "";
+        $("#reply-body").value = preview.body_text || "";
+        notice("AI 草稿预览已生成并保存；没有创建发件任务或钉钉通知。");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#generate-draft").disabled = false;
+      }
+    });
     $("#send").addEventListener("click", async () => {
       if (!confirm("确认以当前内容回复客户？邮件将进入发件队列并记录你的账号。")) return;
       const form = new FormData();
