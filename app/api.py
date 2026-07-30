@@ -11,7 +11,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, func, or_, select, update
@@ -86,6 +86,7 @@ from app.services import (
     replace_handoff_recipient,
     resolve_deliverability_handoff,
     seed_demo_data,
+    stream_handoff_draft_preview,
     suppress_contact_endpoint,
     update_handoff_case_product,
 )
@@ -2519,6 +2520,41 @@ async def generate_handoff_preview(
             502,
             f"AI draft preview failed: {type(exc).__name__}",
         ) from exc
+
+
+@router.post("/admin/handoffs/{handoff_id}/draft-preview/stream")
+async def stream_handoff_preview(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+) -> StreamingResponse:
+    async def events():
+        try:
+            async for event in stream_handoff_draft_preview(
+                session,
+                handoff_id=handoff_id,
+                actor=admin,
+            ):
+                yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        except Exception as exc:
+            await session.rollback()
+            message = str(exc) if isinstance(exc, ValueError) else f"AI draft preview failed: {type(exc).__name__}"
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": message,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/admin/handoffs/{handoff_id}/cases", status_code=201)

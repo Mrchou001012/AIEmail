@@ -2,6 +2,7 @@ import asyncio
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,8 @@ from app.ai import (
     EmailDraftPreview,
     InboundAnalysis,
     _anthropic_inference_options,
+    _complete_json_string_array_field,
+    _complete_json_string_field,
     _normalize_quantity_revision,
     render_draft_preview,
     stub_analyze,
@@ -127,6 +130,125 @@ def test_draft_preview_rejects_unapproved_money() -> None:
 
     with pytest.raises(ValueError, match="unapproved monetary value"):
         validate_draft_preview(preview)
+
+
+def test_structured_draft_stream_exposes_only_completed_semantic_blocks() -> None:
+    snapshot = (
+        '{"subject":"Re: Inquiry","greeting":"Dear \\"Vinay\\",",'
+        '"paragraphs":["Thank you for your email.","We are reviewing'
+    )
+
+    assert _complete_json_string_field(snapshot, "greeting") == 'Dear "Vinay",'
+    assert _complete_json_string_array_field(snapshot, "paragraphs") == [
+        "Thank you for your email."
+    ]
+
+
+def test_stub_draft_preview_streams_body_blocks_before_final_result() -> None:
+    async def collect() -> list[dict[str, object]]:
+        ai = AIClient(Settings(ai_provider="stub"))
+        return [
+            event
+            async for event in ai.draft_preview_stream(
+                {
+                    "subject": "Product list request",
+                    "contact_name": "Vinay",
+                }
+            )
+        ]
+
+    events = asyncio.run(collect())
+
+    assert [event["type"] for event in events] == [
+        "subject",
+        "body_reset",
+        "body_block",
+        "body_block",
+        "body_block",
+        "body_block",
+        "complete",
+    ]
+    assert events[0]["value"] == "Re: Product list request"
+    assert events[2]["value"] == "Dear Vinay,"
+    final_preview = events[-1]["preview"]
+    assert isinstance(final_preview, EmailDraftPreview)
+    assert "\n\n".join(str(event["value"]) for event in events[2:-1]) == render_draft_preview(
+        final_preview
+    )
+
+
+def test_anthropic_structured_stream_is_exposed_as_email_blocks() -> None:
+    preview = EmailDraftPreview(
+        subject="Ignored by deterministic subject",
+        greeting="Dear Vinay,",
+        paragraphs=[
+            "Thank you for your email.",
+            "We are reviewing the requested information.",
+        ],
+        closing="Best regards,",
+    )
+    snapshots = [
+        '{"subject":"Ignored by deterministic subject",',
+        '{"subject":"Ignored by deterministic subject","greeting":"Dear Vinay,",',
+        (
+            '{"subject":"Ignored by deterministic subject","greeting":"Dear Vinay,",'
+            '"paragraphs":["Thank you for your email.",'
+        ),
+        (
+            '{"subject":"Ignored by deterministic subject","greeting":"Dear Vinay,",'
+            '"paragraphs":["Thank you for your email.",'
+            '"We are reviewing the requested information."],"closing":"Best regards,"}'
+        ),
+    ]
+
+    class FakeStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def __aiter__(self):
+            async def events():
+                for snapshot in snapshots:
+                    yield SimpleNamespace(type="text", snapshot=snapshot)
+
+            return events()
+
+        async def get_final_message(self):
+            return SimpleNamespace(
+                stop_reason="end_turn",
+                parsed_output=preview,
+                model="claude-test",
+                _request_id="req_test",
+                usage=SimpleNamespace(input_tokens=12, output_tokens=34),
+            )
+
+    async def collect() -> list[dict[str, object]]:
+        ai = AIClient(Settings(ai_provider="stub"))
+        ai._client = SimpleNamespace(
+            messages=SimpleNamespace(stream=lambda **kwargs: FakeStream())
+        )
+        return [
+            event
+            async for event in ai.draft_preview_stream(
+                {
+                    "subject": "Product list request",
+                    "contact_name": "Vinay",
+                }
+            )
+        ]
+
+    events = asyncio.run(collect())
+
+    assert [event.get("value") for event in events if event["type"] == "body_block"] == [
+        "Dear Vinay,",
+        "Thank you for your email.",
+        "We are reviewing the requested information.",
+        "Best regards,",
+    ]
+    assert events[-1]["preview"].subject == "Re: Product list request"
+    assert events[-1]["metadata"]["provider"] == "anthropic"
 
 
 def test_demo_end_to_end_flow() -> None:

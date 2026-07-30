@@ -18,6 +18,7 @@ from app.api import (
     favicon,
     health,
     reactivation_page,
+    stream_handoff_preview,
 )
 from app.db import Handoff
 from app.services import _strip_duplicate_signature_lead
@@ -131,6 +132,32 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/replace-recipient" in html
     assert 'id="replacement-email"' in html
     assert "同公司其他邮箱和其他案例不会被修改" in html
+    assert "/draft-preview/stream" in html
+    assert "response.body.getReader()" in html
+    assert 'new TextDecoder("utf-8")' in html
+
+
+@pytest.mark.asyncio
+async def test_handoff_draft_stream_uses_ndjson_and_disables_proxy_buffering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_stream(*args, **kwargs):
+        yield {"type": "status", "message": "正在生成"}
+        yield {
+            "type": "complete",
+            "preview": {"subject": "Re: Inquiry", "body_text": "Dear Customer,"},
+        }
+
+    monkeypatch.setattr("app.api.stream_handoff_draft_preview", fake_stream)
+
+    response = await stream_handoff_preview(123, "admin", AsyncMock())
+    body = "".join([chunk async for chunk in response.body_iterator])
+    events = [json.loads(line) for line in body.splitlines()]
+
+    assert response.media_type == "application/x-ndjson"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert [event["type"] for event in events] == ["status", "complete"]
 
 
 def test_handoff_case_request_allows_product_to_remain_pending() -> None:

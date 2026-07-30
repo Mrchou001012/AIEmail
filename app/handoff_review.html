@@ -169,6 +169,35 @@
       }
       return response.json();
     }
+    async function readNdjson(response, onEvent) {
+      if (!response.ok) {
+        let message = `${response.status} ${response.statusText}`;
+        try { message = (await response.json()).detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      if (!response.body) throw new Error("当前浏览器不支持流式响应");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      try {
+        while (true) {
+          const {value, done} = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.trim()) await onEvent(JSON.parse(line));
+          }
+          if (done) break;
+        }
+        if (buffer.trim()) await onEvent(JSON.parse(buffer));
+      } catch (error) {
+        await reader.cancel();
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+    }
     function notice(message, kind = "ok") { const node = $("#notice"); node.className = kind; node.textContent = message; }
     function options(select, rows, label) {
       select.innerHTML = rows.length ? rows.map((row) => `<option value="${esc(row.id)}">${esc(label(row))}</option>`).join("") : '<option value="">暂无可选项</option>';
@@ -364,17 +393,48 @@
     });
     $("#reply-attachments").addEventListener("change", renderAttachments);
     $("#generate-draft").addEventListener("click", async () => {
-      $("#generate-draft").disabled = true;
-      notice("正在调用分类模型、RAG 和草稿模型生成预览…");
+      const button = $("#generate-draft");
+      const previousSubject = $("#reply-subject").value;
+      const previousBody = $("#reply-body").value;
+      let completed = false;
+      button.disabled = true;
+      button.textContent = "生成中…";
+      notice("正在分析客户邮件…");
       try {
-        const preview = await api(`/admin/handoffs/${id}/draft-preview`, {method:"POST"});
-        $("#reply-subject").value = preview.subject || "";
-        $("#reply-body").value = preview.body_text || "";
+        const response = await fetch(`/admin/handoffs/${id}/draft-preview/stream`, {
+          method: "POST",
+          headers: {"Accept": "application/x-ndjson"},
+        });
+        await readNdjson(response, async (event) => {
+          if (event.type === "status") {
+            $("#draft-state").textContent = event.message || "正在生成…";
+            notice(event.message || "正在生成…");
+          } else if (event.type === "subject") {
+            $("#reply-subject").value = event.value || "";
+          } else if (event.type === "body_reset") {
+            $("#reply-body").value = "";
+          } else if (event.type === "body_block") {
+            const body = $("#reply-body");
+            body.value += `${body.value ? "\n\n" : ""}${event.value || ""}`;
+            body.scrollTop = body.scrollHeight;
+          } else if (event.type === "complete") {
+            completed = true;
+            $("#reply-subject").value = event.preview?.subject || $("#reply-subject").value;
+            $("#reply-body").value = event.preview?.body_text || $("#reply-body").value;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "AI 草稿生成失败");
+          }
+        });
+        if (!completed) throw new Error("AI 草稿流提前结束，未保存结果");
         notice("AI 草稿预览已生成并保存；没有创建发件任务或钉钉通知。");
         await load();
       } catch (error) {
+        $("#reply-subject").value = previousSubject;
+        $("#reply-body").value = previousBody;
         notice(error.message, "error");
-        $("#generate-draft").disabled = false;
+      } finally {
+        button.textContent = "生成 / 重新生成 AI 草稿预览";
+        button.disabled = state?.status !== "OPEN" || !state?.case || Boolean(state?.approved_outbox);
       }
     });
     $("#send").addEventListener("click", async () => {

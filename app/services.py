@@ -4,6 +4,7 @@ import html
 import logging
 import re
 import smtplib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -952,13 +953,13 @@ async def create_handoff(
     return handoff
 
 
-async def generate_handoff_draft_preview(
+async def stream_handoff_draft_preview(
     session: AsyncSession,
     *,
     handoff_id: int,
     actor: str,
-) -> dict[str, Any]:
-    """Generate and save a review-only draft without creating any delivery work."""
+) -> AsyncIterator[dict[str, Any]]:
+    """Stream and save a review-only draft without creating delivery work."""
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
         raise ValueError("handoff not found")
@@ -989,11 +990,21 @@ async def generate_handoff_draft_preview(
 
     settings = get_settings()
     ai = AIClient(settings)
+    yield {
+        "type": "status",
+        "stage": "analysis",
+        "message": "正在分析客户邮件…",
+    }
     analysis, analysis_metadata = await ai.analyze(
         source_email.subject,
         source_email.body_text,
         source_email.attachment_metadata,
     )
+    yield {
+        "type": "status",
+        "stage": "retrieval",
+        "message": "正在检索历史邮件表达方式…" if settings.rag_enabled else "历史邮件 RAG 未启用，正在准备草稿…",
+    }
     historical_style_examples: list[dict[str, Any]] = []
     retrieval_error: str | None = None
     if settings.rag_enabled:
@@ -1013,7 +1024,14 @@ async def generate_handoff_draft_preview(
                 exc,
             )
 
-    preview, preview_metadata = await ai.draft_preview(
+    yield {
+        "type": "status",
+        "stage": "drafting",
+        "message": "正在流式生成邮件草稿…",
+    }
+    preview = None
+    preview_metadata: dict[str, Any] | None = None
+    async for event in ai.draft_preview_stream(
         {
             "subject": source_email.subject,
             "contact_name": sales_case.contact.name,
@@ -1025,7 +1043,15 @@ async def generate_handoff_draft_preview(
             "approved_commercial_facts": {},
             "historical_style_examples": historical_style_examples,
         }
-    )
+    ):
+        if event["type"] == "complete":
+            preview = event["preview"]
+            preview_metadata = event["metadata"]
+            continue
+        yield event
+    if preview is None or preview_metadata is None:
+        raise RuntimeError("AI draft preview stream ended without a final result")
+
     generated_at = datetime.now(UTC)
     preview_facts: dict[str, Any] = {
         "subject": preview.subject,
@@ -1096,7 +1122,30 @@ async def generate_handoff_draft_preview(
         },
     )
     await session.commit()
-    return preview_facts
+    yield {
+        "type": "complete",
+        "preview": preview_facts,
+    }
+
+
+async def generate_handoff_draft_preview(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    actor: str,
+) -> dict[str, Any]:
+    """Generate and save a review-only draft without creating any delivery work."""
+    completed: dict[str, Any] | None = None
+    async for event in stream_handoff_draft_preview(
+        session,
+        handoff_id=handoff_id,
+        actor=actor,
+    ):
+        if event["type"] == "complete":
+            completed = event["preview"]
+    if completed is None:
+        raise RuntimeError("AI draft preview stream ended without a saved result")
+    return completed
 
 
 async def assign_handoff_case(
