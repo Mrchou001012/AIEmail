@@ -9,6 +9,7 @@ from app.api import (
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
+    HandoffCaseRequest,
     _dashboard_headers,
     _suggested_handoff_reply,
     commercial_update_page,
@@ -113,6 +114,8 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "人工处理" in html
     assert "/assign" in html
     assert "/cases" in html
+    assert "/case-product" in html
+    assert "产品待确认 / 产品目录咨询" in html
     assert "/send" in html
     assert "/send-with-attachments" in html
     assert 'id="reply-attachments"' in html
@@ -128,6 +131,12 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/replace-recipient" in html
     assert 'id="replacement-email"' in html
     assert "同公司其他邮箱和其他案例不会被修改" in html
+
+
+def test_handoff_case_request_allows_product_to_remain_pending() -> None:
+    request = HandoffCaseRequest(contact_id=1, product_id=None, currency="INR")
+
+    assert request.product_id is None
 
 
 @pytest.mark.asyncio

@@ -84,6 +84,16 @@
         <article class="card">
           <h2>当前关联案例</h2>
           <div id="case-detail" class="sub">尚未关联案例</div>
+          <div class="hidden" id="case-product-tools">
+            <label for="case-product-select">案例产品</label>
+            <div class="row">
+              <select id="case-product-select"></select>
+              <button id="set-case-product" type="button">设置案例产品</button>
+            </div>
+            <div class="file-help" id="case-product-help">
+              产品目录、泛询盘等可先以“产品待确认”建案；确认具体产品后再在这里补选。待确认期间不会进入自动报价。
+            </div>
+          </div>
           <div id="association-tools">
             <label for="case-select">关联已有案例</label>
             <select id="case-select"></select>
@@ -166,7 +176,8 @@
     function renderCase(data) {
       const node = $("#case-detail");
       if (!data) { node.textContent = "尚未关联案例；发送前必须关联或建立案例。"; return; }
-      node.innerHTML = `<div class="meta"><span class="label">案例</span><strong>#${esc(data.id)} · ${esc(data.company)}</strong><span class="label">联系人</span><span>${esc(data.contact_name)} · ${esc(data.contact_email)}</span><span class="label">产品</span><span>${esc(data.product)} · ${esc(data.currency)}</span><span class="label">状态</span><span>${esc(data.stage)} / ${esc(data.status)}</span><span class="label">最新报价</span><span>${data.latest_quote ? esc(`${data.latest_quote.currency} ${data.latest_quote.unit_price} · ${data.latest_quote.quantity} · 有效至 ${data.latest_quote.valid_until}`) : "无"}</span></div>`;
+      const product = data.product || "产品待确认";
+      node.innerHTML = `<div class="meta"><span class="label">案例</span><strong>#${esc(data.id)} · ${esc(data.company)}</strong><span class="label">联系人</span><span>${esc(data.contact_name)} · ${esc(data.contact_email)}</span><span class="label">产品</span><span>${esc(product)} · ${esc(data.currency)}</span><span class="label">状态</span><span>${esc(data.stage)} / ${esc(data.status)}</span><span class="label">最新报价</span><span>${data.latest_quote ? esc(`${data.latest_quote.currency} ${data.latest_quote.unit_price} · ${data.latest_quote.quantity} · 有效至 ${data.latest_quote.valid_until}`) : "无"}</span></div>`;
     }
     function fileSize(bytes) {
       const value = Number(bytes || 0);
@@ -236,9 +247,21 @@
       $("#handoff-meta").innerHTML = `<span class="label">原因</span><span class="pill">${esc(data.reason)}</span><span class="label">摘要</span><span>${esc(data.summary)}</span><span class="label">通知</span><span>${esc(data.dingtalk_status)}</span><span class="label">处理备注</span><span>${esc(data.resolution_note || "无")}</span>`;
       $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
       renderCase(data.case);
-      options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product} · ${row.status}`);
+      options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product || "产品待确认"} · ${row.status}`);
       options($("#contact-select"), data.matching_contacts || [], (row) => `${row.name} · ${row.email}`);
-      options($("#product-select"), data.products || [], (row) => `${row.code} · ${row.name}`);
+      const productOptions = (data.products || [])
+        .map((row) => `<option value="${esc(row.id)}">${esc(`${row.code} · ${row.name}`)}</option>`)
+        .join("");
+      $("#product-select").innerHTML = `<option value="">产品待确认 / 产品目录咨询</option>${productOptions}`;
+      $("#case-product-select").innerHTML = `<option value="">请选择具体产品</option>${productOptions}`;
+      $("#case-product-tools").classList.toggle("hidden", !data.case);
+      if (data.case) {
+        $("#case-product-select").value = data.case.product_id ? String(data.case.product_id) : "";
+        $("#set-case-product").disabled = data.status !== "OPEN" || Boolean(data.approved_outbox);
+        $("#case-product-help").textContent = data.case.product_pending
+          ? "当前案例为“产品待确认”：可以先生成或编辑人工回复，但不会进入自动报价。收到具体产品后再补选。"
+          : `当前产品：${data.case.product}。如客户更正产品，可在发送前修改。`;
+      }
       if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
       if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
       $("#association-tools").classList.toggle("hidden", Boolean(data.case));
@@ -286,7 +309,30 @@
 
     $("#assign").addEventListener("click", () => post(`/admin/handoffs/${id}/assign`, {case_id:Number($("#case-select").value)}, "案例已关联。"));
     $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
-    $("#create-case").addEventListener("click", () => post(`/admin/handoffs/${id}/cases`, {contact_id:Number($("#contact-select").value), product_id:Number($("#product-select").value), currency:$("#currency").value.trim().toUpperCase()}, "新案例已建立并关联。"));
+    $("#create-case").addEventListener("click", () => {
+      const selectedProduct = $("#product-select").value;
+      post(
+        `/admin/handoffs/${id}/cases`,
+        {
+          contact_id:Number($("#contact-select").value),
+          product_id:selectedProduct ? Number(selectedProduct) : null,
+          currency:$("#currency").value.trim().toUpperCase(),
+        },
+        selectedProduct ? "新案例已建立并关联。" : "产品待确认案例已建立并关联。"
+      );
+    });
+    $("#set-case-product").addEventListener("click", () => {
+      const selectedProduct = Number($("#case-product-select").value);
+      if (!selectedProduct) {
+        notice("请先选择具体产品。", "error");
+        return;
+      }
+      post(
+        `/admin/handoffs/${id}/case-product`,
+        {product_id:selectedProduct},
+        "案例产品已更新。"
+      );
+    });
     $("#load-remote-images").addEventListener("click", () => {
       if (!blockedRemoteImages.length) return;
       if (!confirm("远程图片可能用于追踪邮件是否被打开，并会向对方服务器暴露你的 IP。确认加载吗？")) return;

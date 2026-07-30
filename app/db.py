@@ -202,7 +202,7 @@ class SalesCase(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
     contact_id: Mapped[int] = mapped_column(ForeignKey("contacts.id"))
-    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     stage: Mapped[CaseStage] = mapped_column(Enum(CaseStage, native_enum=False, length=64), default=CaseStage.QUOTING)
     status: Mapped[CaseStatus] = mapped_column(Enum(CaseStatus, native_enum=False, length=64), default=CaseStatus.ACTIVE)
@@ -211,7 +211,7 @@ class SalesCase(Base, TimestampMixin):
     last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     customer: Mapped[Customer] = relationship()
     contact: Mapped[Contact] = relationship()
-    product: Mapped[Product] = relationship()
+    product: Mapped[Product | None] = relationship()
 
 
 class EmailMessage(Base):

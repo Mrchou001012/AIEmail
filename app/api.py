@@ -87,6 +87,7 @@ from app.services import (
     resolve_deliverability_handoff,
     seed_demo_data,
     suppress_contact_endpoint,
+    update_handoff_case_product,
 )
 from app.settings import Settings, get_settings
 
@@ -148,8 +149,12 @@ class HandoffAssignmentRequest(BaseModel):
 
 class HandoffCaseRequest(BaseModel):
     contact_id: int = Field(gt=0)
-    product_id: int = Field(gt=0)
+    product_id: int | None = Field(default=None, gt=0)
     currency: str = Field(min_length=3, max_length=3)
+
+
+class HandoffCaseProductRequest(BaseModel):
+    product_id: int = Field(gt=0)
 
 
 class HandoffReplyRequest(BaseModel):
@@ -2030,7 +2035,7 @@ async def list_cases(_: Admin, session: Session) -> list[dict[str, Any]]:
             "id": row.id,
             "company": row.customer.company_name,
             "contact": row.contact.email,
-            "product": row.product.code,
+            "product": row.product.code if row.product is not None else None,
             "currency": row.currency,
             "stage": row.stage.value,
             "status": row.status.value,
@@ -2050,6 +2055,8 @@ async def queue_case_outreach(
     case = await session.get(SalesCase, case_id)
     if case is None:
         raise HTTPException(404, "Case not found")
+    if case.product_id is None:
+        raise HTTPException(409, "Case product has not been selected")
     policy = await active_policy(session, case.product_id, case.currency)
     if policy is None:
         raise HTTPException(409, "No active price policy exists for this case currency")
@@ -2284,8 +2291,10 @@ async def _handoff_case_payload(session: AsyncSession, case_id: int | None) -> d
         "company": case.customer.company_name,
         "contact_name": case.contact.name,
         "contact_email": case.contact.email,
-        "product": case.product.code,
-        "product_name": case.product.name,
+        "product_id": case.product_id,
+        "product": case.product.code if case.product is not None else None,
+        "product_name": case.product.name if case.product is not None else None,
+        "product_pending": case.product is None,
         "currency": case.currency,
         "stage": case.stage.value,
         "status": case.status.value,
@@ -2531,6 +2540,30 @@ async def create_handoff_case(
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"case_id": case.id, "status": case.status.value}
+
+
+@router.post("/admin/handoffs/{handoff_id}/case-product")
+async def set_handoff_case_product(
+    handoff_id: int,
+    request: HandoffCaseProductRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        case = await update_handoff_case_product(
+            session,
+            handoff_id=handoff_id,
+            product_id=request.product_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "case_id": case.id,
+        "product_id": case.product_id,
+        "stage": case.stage.value,
+        "status": case.status.value,
+    }
 
 
 @router.post("/admin/handoffs/{handoff_id}/replace-recipient")

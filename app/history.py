@@ -103,7 +103,10 @@ def _contact_case(
     explicit_codes = find_product_codes(f"{row.subject}\n{row.body_text}")
     if explicit_codes:
         product_matches = [
-            case for case in candidates if product_codes.get(case.product_id) in explicit_codes
+            case
+            for case in candidates
+            if case.product_id is not None
+            and product_codes.get(case.product_id) in explicit_codes
         ]
         return product_matches[0] if len(product_matches) == 1 else None
 
@@ -173,7 +176,10 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
     case_rows = (
         (
             await session.execute(
-                select(SalesCase, Product.code).join(Product, SalesCase.product_id == Product.id)
+                select(SalesCase, Product.code).outerjoin(
+                    Product,
+                    SalesCase.product_id == Product.id,
+                )
             )
         )
         .all()
@@ -182,7 +188,8 @@ async def reconcile_email_history(session: AsyncSession) -> HistoryReconciliatio
     cases_by_contact: dict[int, list[SalesCase]] = defaultdict(list)
     product_codes: dict[int, str] = {}
     for case, product_code in case_rows:
-        product_codes[case.product_id] = product_code
+        if case.product_id is not None and product_code is not None:
+            product_codes[case.product_id] = product_code
         if case.status not in CLOSED_CASE_STATUSES:
             cases_by_contact[case.contact_id].append(case)
 

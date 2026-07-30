@@ -69,6 +69,7 @@ from app.services import (
     seed_demo_data,
     send_one_outbox,
     suppress_contact_endpoint,
+    update_handoff_case_product,
 )
 from app.settings import Settings, get_settings
 
@@ -479,6 +480,45 @@ async def test_human_can_create_case_for_unmatched_email(db_session: AsyncSessio
     assert case.status == CaseStatus.WAITING_HUMAN
     assert email_row is not None and email_row.case_id == case.id
     assert handoff.case_id == case.id
+
+
+async def test_human_can_create_product_pending_case_then_select_product(
+    db_session: AsyncSession,
+) -> None:
+    ids = await seed_demo_data(db_session)
+    handoff = await _unassigned_handoff(db_session, suffix="human-create-product-pending")
+
+    sales_case = await create_case_for_handoff(
+        db_session,
+        handoff_id=handoff.id,
+        contact_id=ids["contact_id"],
+        product_id=None,
+        currency="inr",
+        actor="reviewer",
+    )
+
+    assert sales_case.product_id is None
+    assert sales_case.currency == "INR"
+    assert sales_case.stage == CaseStage.FOLLOW_UP
+    assert sales_case.status == CaseStatus.WAITING_HUMAN
+
+    updated = await update_handoff_case_product(
+        db_session,
+        handoff_id=handoff.id,
+        product_id=ids["product_id"],
+        actor="reviewer",
+    )
+
+    assert updated.product_id == ids["product_id"]
+    assert updated.stage == CaseStage.QUOTING
+    audit_event = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == "handoff.case_product_updated"
+        )
+    )
+    assert audit_event is not None
+    assert audit_event.data["previous_product_id"] is None
+    assert audit_event.data["product_id"] == ids["product_id"]
 
 
 async def test_human_approved_reply_is_audited_and_sends_with_auto_send_disabled(

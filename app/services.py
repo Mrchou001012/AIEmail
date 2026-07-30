@@ -1019,7 +1019,7 @@ async def generate_handoff_draft_preview(
             "contact_name": sales_case.contact.name,
             "customer_message": source_email.body_text[:12_000],
             "intent": analysis.intent.value,
-            "product_code": sales_case.product.code,
+            "product_code": sales_case.product.code if sales_case.product is not None else None,
             "quantity": analysis.quantity,
             "requested_information": analysis.missing_fields,
             "approved_commercial_facts": {},
@@ -1154,7 +1154,7 @@ async def create_case_for_handoff(
     *,
     handoff_id: int,
     contact_id: int,
-    product_id: int,
+    product_id: int | None,
     currency: str,
     actor: str,
 ) -> SalesCase:
@@ -1165,15 +1165,17 @@ async def create_case_for_handoff(
         raise ValueError("handoff has no source email")
     email_row = await session.get(EmailMessage, handoff.source_email_id)
     contact = await session.get(Contact, contact_id)
-    product = await session.get(Product, product_id)
+    product = await session.get(Product, product_id) if product_id is not None else None
     normalized_currency = currency.strip().upper()
-    if email_row is None or contact is None or product is None:
-        raise ValueError("source email, contact, or product not found")
+    if email_row is None or contact is None:
+        raise ValueError("source email or contact not found")
+    if product_id is not None and product is None:
+        raise ValueError("product not found")
     if email_row.direction != "INBOUND":
         raise ValueError("only inbound email can create a reviewed case")
     if email_row.from_address.casefold() != contact.email.casefold():
         raise ValueError("source sender does not match the selected contact")
-    if not product.active:
+    if product is not None and not product.active:
         raise ValueError("inactive product cannot be selected")
     if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
         raise ValueError("currency must be a three-letter code")
@@ -1183,9 +1185,9 @@ async def create_case_for_handoff(
     sales_case = SalesCase(
         customer_id=contact.customer_id,
         contact_id=contact.id,
-        product_id=product.id,
+        product_id=product.id if product is not None else None,
         currency=normalized_currency,
-        stage=CaseStage.QUOTING,
+        stage=CaseStage.QUOTING if product is not None else CaseStage.FOLLOW_UP,
         status=CaseStatus.WAITING_HUMAN,
         subject_key=normalized_subject(email_row.subject)[:255],
     )
@@ -1204,8 +1206,57 @@ async def create_case_for_handoff(
             "handoff_id": handoff.id,
             "email_id": email_row.id,
             "contact_id": contact.id,
-            "product_id": product.id,
+            "product_id": product.id if product is not None else None,
+            "product_pending": product is None,
             "currency": normalized_currency,
+        },
+    )
+    await session.commit()
+    return sales_case
+
+
+async def update_handoff_case_product(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    product_id: int,
+    actor: str,
+) -> SalesCase:
+    """Set or replace the product for an open, human-reviewed case."""
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("only an open handoff can update its case product")
+    if handoff.case_id is None:
+        raise ValueError("handoff must be associated with a case")
+    if await session.scalar(
+        select(Outbox.id).where(Outbox.approval_handoff_id == handoff.id)
+    ):
+        raise ValueError("handoff already has an approved outbound email")
+
+    sales_case = await session.get(SalesCase, handoff.case_id)
+    product = await session.get(Product, product_id)
+    if sales_case is None or product is None:
+        raise ValueError("case or product not found")
+    if sales_case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        raise ValueError("closed case product cannot be changed")
+    if not product.active:
+        raise ValueError("inactive product cannot be selected")
+
+    previous_product_id = sales_case.product_id
+    sales_case.product_id = product.id
+    sales_case.stage = CaseStage.QUOTING
+    sales_case.status = CaseStatus.WAITING_HUMAN
+    await audit(
+        session,
+        "handoff.case_product_updated",
+        case_id=sales_case.id,
+        actor=actor,
+        data={
+            "handoff_id": handoff.id,
+            "previous_product_id": previous_product_id,
+            "product_id": product.id,
         },
     )
     await session.commit()
@@ -1760,6 +1811,15 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
     )
     if case is None:
         raise RuntimeError(f"case {case_id} not found")
+    if case.product_id is None or case.product is None:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.HUMAN_CONTROL,
+            summary="Case product is still pending human selection",
+            facts={"product_pending": True},
+        )
+        return
     historical_outbound = await session.scalar(
         select(EmailMessage)
         .where(
@@ -2925,6 +2985,16 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
+    if case.product_id is None or case.product is None:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.HUMAN_CONTROL,
+            summary="Case product is still pending human selection",
+            facts={**analysis_facts, "product_pending": True},
+            source_email_id=email_row.id,
+        )
+        return
     # Weekly commercial-data readiness blocks only an autonomous quotation.
     # Unsubscribe, counteroffers, samples, orders, complaints, and all other
     # human-review paths must still be classified and surfaced immediately.
@@ -3513,6 +3583,11 @@ async def send_one_outbox(
         if case is None:
             row.status = DeliveryStatus.CANCELLED
             row.last_error = "commercial gate could not resolve the quote case"
+            await session.commit()
+            return True
+        if case.product_id is None:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = "commercial gate blocked a quote whose case product is pending"
             await session.commit()
             return True
         await lock_commercial_scope(session, settings.commercial_scope)
