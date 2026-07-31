@@ -4,6 +4,15 @@ products:
       - YAC-TEOS-40
       - TEOS40
       - TEOS-40
+      - YAC-TEOS 40
+      - TEOS 40
+  - code: YAC-TEOS28
+    aliases:
+      - YAC-TEOS-28
+      - TEOS28
+      - TEOS-28
+      - YAC-TEOS 28/40
+      - TEOS 28/40
   - code: YAC-TES
     aliases:
       - TES
@@ -19,10 +28,247 @@ products:
   - code: YAC-BSA
     aliases:
       - BSA
+  - code: YAC-BCP
+    aliases:
+      - BCP
+      - 1-BROMO-5-CHLOROPENTANE
+  - code: YAC-BSTFA
+    aliases:
+      - BSTFA
+  - code: YAC-HMDS
+    aliases:
+      - HMDS
+  - code: YAC-TIPS
+    aliases:
+      - TIPS
+  - code: YAC-A110
+    aliases:
+      - YAC A110
+      - A110
+  - code: YAC-A111
+    aliases:
+      - YAC A111
+      - A111
+  - code: YAC-A112
+    aliases:
+      - YAC A112
+      - A112
+  - code: YAC-A160
+    aliases:
+      - YAC A160
+      - A160
+  - code: YAC-A161
+    aliases:
+      - YAC A161
+      - A161
+  - code: YAC-A210
+    aliases:
+      - YAC A210
+      - A210
+  - code: YAC-A212
+    aliases:
+      - YAC A212
+      - A212
+  - code: YAC-N113
+    aliases:
+      - YAC N113
+      - N113
+  - code: YAC-N123
+    aliases:
+      - YAC N123
+      - N123
+  - code: YAC-N813
+    aliases:
+      - YAC N813
+      - N813
+  - code: YAC-N1213
+    aliases:
+      - YAC N1213
+      - N1213
+  - code: YAC-O186
+    aliases:
+      - YAC O186
+      - O186
+  - code: YAC-O1861
+    aliases:
+      - YAC O1861
+      - O1861
+  - code: YAC-O187
+    aliases:
+      - YAC O187
+      - O187
+  - code: YAC-O1871
+    aliases:
+      - YAC O1871
+      - O1871
+  - code: YAC-O1872
+    aliases:
+      - YAC O1872
+      - O1872
+  - code: YAC-O1873
+    aliases:
+      - YAC O1873
+      - O1873
+  - code: YAC-O174
+    aliases:
+      - YAC O174
+      - O174
+  - code: YAC-O1741
+    aliases:
+      - YAC O1741
+      - O1741
+  - code: YAC-O1742
+    aliases:
+      - YAC O1742
+      - O1742
+  - code: YAC-O1743
+    aliases:
+      - YAC O1743
+      - O1743
+  - code: YAC-V151
+    aliases:
+      - YAC V151
+      - V151
+  - code: YAC-V171
+    aliases:
+      - YAC V171
+      - V171
+  - code: YAC-MTAS
+    aliases:
+      - YAC MTAS
+      - MTAS
+  - code: YAC-ETAS
+    aliases:
+      - YAC ETAS
+      - ETAS
+  - code: YAC-PTAS
+    aliases:
+      - YAC PTAS
+      - PTAS
+  - code: YAC-MOS
+    aliases:
+      - YAC MOS
+      - MOS
+  - code: YAC-VOS
+    aliases:
+      - YAC VOS
+      - VOS
+  - code: YAC-S312
+    aliases:
+      - YAC S312
+      - S312
+  - code: YAC-S313
+    aliases:
+      - YAC S313
+      - S313
+  - code: YAC-S319
+    aliases:
+      - YAC S319
+      - S319
+  - code: YAC-S323
+    aliases:
+      - YAC S323
+      - S323
+  - code: YAC-C312
+    aliases:
+      - YAC C312
+      - C312
+  - code: YAC-C313
+    aliases:
+      - YAC C313
+      - C313
+  - code: YAC-C322
+    aliases:
+      - YAC C322
+      - C322
+  - code: YAC-C323
+    aliases:
+      - YAC C323
+      - C323
+  - code: YAC-BDAC
+    aliases:
+      - BDAC
+  - code: YAC-TOS
+    aliases:
+      - TOS
+  - code: YAC-POS
+    aliases:
+      - POS
+  - code: YAC-MTMS
+    aliases:
+      - MTMS
+  - code: YAC-TMOS
+    aliases:
+      - TMOS
   - code: THEIC
     aliases:
       - SUN-THEIC
       - YAC-THEIC
+  - code: SBM-55
+    aliases:
+      - SBM55
+      - SBM 55
+  - code: DBM-83
+    aliases:
+      - DBM83
+      - DBM 83
+  - code: CAA
+    aliases:
+      - CALCIUM ACETYL ACETONATE
+      - CALCIUM ACETYLACETONATE
+  - code: ZAA
+    aliases:
+      - ZINC ACETYL ACETONATE
+      - ZINC ACETYLACETONATE
+  - code: AAA
+    aliases:
+      - ALUMINIUM ACETYL ACETONATE
+      - ALUMINUM ACETYL ACETONATE
+  - code: AO-168
+    aliases:
+      - AO 168
+      - AO168
+      - LANNOX 168
+      - LANNOX-168
+      - LANNOX168
+  - code: AO-1010
+    aliases:
+      - AO 1010
+      - AO1010
+      - LANNOX 1010
+      - LANNOX-1010
+      - LANNOX1010
+  - code: AO-1076
+    aliases:
+      - AO 1076
+      - AO1076
+      - LANNOX 1076
+      - LANNOX-1076
+      - LANNOX1076
+  - code: UV-770
+    aliases:
+      - UV 770
+      - UV770
+  - code: UV-944
+    aliases:
+      - UV 944
+      - UV944
+  - code: UV-783
+    aliases:
+      - UV 783
+      - UV783
+  - code: UV-622
+    aliases:
+      - UV 622
+      - UV622
+  - code: UV-P
+    aliases:
+      - UV P
+      - UVP
+  - code: UV-531
+    aliases:
+      - UV 531
+      - UV531
   - code: OH-Polymer 80K
     aliases:
       - OH-POLYMER-80K

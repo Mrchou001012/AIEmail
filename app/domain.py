@@ -10,6 +10,7 @@ MONEY_QUANTUM = Decimal("0.0001")
 
 class Intent(StrEnum):
     QUOTE_REQUEST = "quote_request"
+    PRODUCT_LIST_REQUEST = "product_list_request"
     COUNTEROFFER = "counteroffer"
     SAMPLE_REQUEST = "sample_request"
     ORDER = "order"

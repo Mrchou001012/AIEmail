@@ -116,6 +116,25 @@ class Product(Base, TimestampMixin):
     approved_text_key: Mapped[str] = mapped_column(String(128))
     margin_class: Mapped[str | None] = mapped_column(String(1))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_categories.id", ondelete="SET NULL"), index=True
+    )
+    brand: Mapped[str | None] = mapped_column(String(64))
+    cas_no: Mapped[str | None] = mapped_column(String(64))
+    content: Mapped[str | None] = mapped_column(String(64))
+    series: Mapped[str | None] = mapped_column(String(128))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ProductCategory(Base, TimestampMixin):
+    __tablename__ = "product_categories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    name_zh: Mapped[str | None] = mapped_column(String(255))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    products: Mapped[list[Product]] = relationship()
 
 
 class CommercialDataCycle(Base, TimestampMixin):
@@ -203,6 +222,9 @@ class SalesCase(Base, TimestampMixin):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
     contact_id: Mapped[int] = mapped_column(ForeignKey("contacts.id"))
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_categories.id", ondelete="SET NULL"), index=True
+    )
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     stage: Mapped[CaseStage] = mapped_column(Enum(CaseStage, native_enum=False, length=64), default=CaseStage.QUOTING)
     status: Mapped[CaseStatus] = mapped_column(Enum(CaseStatus, native_enum=False, length=64), default=CaseStatus.ACTIVE)
@@ -212,6 +234,7 @@ class SalesCase(Base, TimestampMixin):
     customer: Mapped[Customer] = relationship()
     contact: Mapped[Contact] = relationship()
     product: Mapped[Product | None] = relationship()
+    category: Mapped[ProductCategory | None] = relationship()
 
 
 class EmailMessage(Base):

@@ -44,6 +44,7 @@ from app.db import (
     Outbox,
     PricePolicy,
     Product,
+    ProductCategory,
     Quote,
     ReactivationCampaign,
     ReactivationRecipient,
@@ -63,6 +64,7 @@ from app.mail import (
     extract_email_resource,
     parse_mime,
 )
+from app.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
 from app.products import canonical_product_code
 from app.reactivation import (
     ALLOWED_TEMPLATE_FIELDS,
@@ -1405,6 +1407,58 @@ async def prices_import(
         return result.__dict__ | {"ok": result.ok}
     finally:
         path.unlink(missing_ok=True)
+
+
+@router.get("/admin/product-categories")
+async def product_categories(_: Admin, session: Session) -> list[dict[str, Any]]:
+    rows = (
+        (
+            await session.execute(
+                select(ProductCategory)
+                .options(selectinload(ProductCategory.products))
+                .order_by(ProductCategory.sort_order, ProductCategory.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": category.id,
+            "key": category.key,
+            "name": category.name,
+            "name_zh": category.name_zh,
+            "sort_order": category.sort_order,
+            "active": category.active,
+            "product_count": sum(1 for product in category.products if product.active),
+            "products": [
+                {
+                    "code": product.code,
+                    "name": product.name,
+                    "brand": product.brand,
+                    "cas_no": product.cas_no,
+                    "content": product.content,
+                    "series": product.series,
+                    "active": product.active,
+                }
+                for product in sorted(
+                    category.products,
+                    key=lambda item: (item.sort_order or 0, item.id or 0),
+                )
+            ],
+        }
+        for category in rows
+    ]
+
+
+@router.post("/admin/catalog/import")
+async def catalog_import(
+    _: Admin,
+    session: Session,
+    apply: bool = Query(False),
+) -> dict[str, Any]:
+    result = await import_product_catalog(session, path=DEFAULT_CATALOG_PATH, apply=apply)
+    return {"apply": apply, **result}
 
 
 async def _commercial_cycle_payload(

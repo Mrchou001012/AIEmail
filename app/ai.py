@@ -10,6 +10,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain import Intent
+from app.product_catalog import classify_category_interests
 from app.products import canonical_product_code, find_product_code
 from app.settings import Settings, get_settings
 
@@ -82,6 +83,10 @@ quoted prior-message history when deciding intent.
 Normalize currency mentions to three-letter ISO codes; use INR for INR, ₹, Rs, or Rs.
 Return every schema field explicitly: use null for unavailable nullable values, false for absent
 flags, and an empty list when there is no evidence or missing field.
+Classify as product_list_request when the customer asks for a product list, catalog,
+brochure, or full product range, or when they name only a product category (for example
+industrial silanes, pharmaceutical, or rubber and plastics products) without a specific
+product code. Leave product_code null for product-list requests.
 Return only the requested structured result."""
 
 DRAFT_PROMPT = """Create a conservative B2B email language plan. Do not invent prices, currencies,
@@ -183,6 +188,20 @@ def _intent_from_text(text: str) -> Intent:
         (Intent.SAMPLE_REQUEST, ("sample", "trial unit")),
         (Intent.COUNTEROFFER, ("counteroffer", "can you do", "target price", "too high", "discount")),
         (
+            Intent.PRODUCT_LIST_REQUEST,
+            (
+                "product list",
+                "product catalog",
+                "product catalogue",
+                "brochure",
+                "product range",
+                "full range",
+                "range of products",
+                "list of products",
+                "product portfolio",
+            ),
+        ),
+        (
             Intent.QUOTE_REQUEST,
             ("quote", "quotation", "price", "pricing", "lead time", "delivery time", "ready stock"),
         ),
@@ -238,10 +257,24 @@ def _normalize_quantity_revision(
 def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> InboundAnalysis:
     text = f"{subject}\n{body}"
     intent = _intent_from_text(text)
+    category_keys = classify_category_interests(text)
+    if intent == Intent.OTHER and category_keys and not find_product_code(text):
+        # A category-only interest (for example "we are interested in industrial
+        # silane") without a specific product code is a product-list request.
+        intent = Intent.PRODUCT_LIST_REQUEST
     product_match = re.search(r"\b(?:SKU|PRODUCT)[:#\s-]*([A-Z0-9][A-Z0-9_-]{1,31})\b", text, re.I)
     product_code = find_product_code(text)
     if product_code is None and product_match:
-        product_code = canonical_product_code(product_match.group(1))
+        candidate = product_match.group(1)
+        if candidate.upper() not in {
+            "LIST",
+            "CATALOG",
+            "CATALOGUE",
+            "BROCHURE",
+            "RANGE",
+            "PORTFOLIO",
+        }:
+            product_code = canonical_product_code(candidate)
     quantity_match = re.search(
         r"\b(?:qty|quantity)[:\s-]*(\d+(?:\.\d+)?)\s*(kg|kgs|kilograms?|mt|metric\s+tons?|tons?)?\b",
         text,
@@ -289,15 +322,23 @@ def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> 
     )
     delivery_requested = any(term in lowered for term in ("delivery time", "lead time", "ready to ship", "dispatch time"))
     missing: list[str] = []
-    if not product_code:
+    if not product_code and intent != Intent.PRODUCT_LIST_REQUEST:
         missing.append("product_code")
     if intent in {Intent.QUOTE_REQUEST, Intent.COUNTEROFFER} and quantity is None:
         missing.append("quantity")
     return InboundAnalysis(
         intent=intent,
-        intent_confidence=0.97 if intent != Intent.OTHER else 0.45,
+        intent_confidence=(
+            0.95
+            if intent == Intent.PRODUCT_LIST_REQUEST
+            else 0.97 if intent != Intent.OTHER else 0.45
+        ),
         product_code=product_code or None,
-        product_confidence=0.98 if product_code else 0.30,
+        product_confidence=(
+            0.98
+            if product_code
+            else 0.93 if intent == Intent.PRODUCT_LIST_REQUEST else 0.30
+        ),
         quantity=quantity,
         requested_unit_price=price,
         currency=currency,

@@ -27,10 +27,12 @@ from app.db import (
     Outbox,
     PricePolicy,
     Product,
+    ProductCategory,
     Quote,
     SalesCase,
 )
 from app.history import reconcile_email_history
+from app.product_catalog import interest_entry, merge_customer_interests
 from app.products import canonical_product_code, product_text_key
 from app.settings import get_settings
 
@@ -342,6 +344,7 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
         customer_cache: dict[str, Customer] = {}
         contact_cache: dict[tuple[int, str], Contact] = {}
         case_cache: dict[tuple[int, int, str], SalesCase | None] = {}
+        category_cache: dict[int, ProductCategory | None] = {}
         for row in parsed:
             customer = customer_cache.get(row["company"])
             if customer is None:
@@ -406,6 +409,25 @@ async def import_customers(path: Path, session: AsyncSession, apply: bool = Fals
                         if value is not None
                     )
             contact_cache[contact_key] = contact
+            if row["product"] is not None and row["product"].category_id is not None:
+                category_id = row["product"].category_id
+                if category_id not in category_cache:
+                    category_cache[category_id] = await session.get(
+                        ProductCategory, category_id
+                    )
+                category = category_cache[category_id]
+                if category is not None and category.active:
+                    merge_customer_interests(
+                        customer,
+                        [
+                            interest_entry(
+                                category_key=category.key,
+                                category_name=category.name,
+                                source="customer_list_import",
+                                value=row["product_code"],
+                            )
+                        ],
+                    )
             if row["product"] is None:
                 result.applied_rows += 1
                 continue

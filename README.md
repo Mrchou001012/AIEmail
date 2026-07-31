@@ -77,6 +77,48 @@ The demo script reports whether outreach was newly queued or already present, wa
 
 Duplicate raw messages do not create duplicate email-processing jobs. If a recovered worker processes the same inbound email again, the unique source-email constraint reuses the first handoff, audit event, and notification job.
 
+## Categorized product catalog and automatic product-list replies
+
+The categorized product list from `产品们.docx` is stored as `config/product_catalog.yaml`
+(three major categories: Industrial Silanes, Pharmaceutical, Rubber & Plastics; 68
+products with brand, CAS number, content/purity, and series). Migration `0015` adds the
+`product_categories` table plus catalog columns on `products` (`category_id`, `brand`,
+`cas_no`, `content`, `series`, `sort_order`) and a nullable `cases.category_id` used for
+category-level cases.
+
+Load it into PostgreSQL once:
+
+```powershell
+.\scripts\import_product_catalog.py --env-file .env --apply
+```
+
+or from the admin API: `POST /admin/catalog/import?apply=true`. `GET
+/admin/product-categories` lists every category with its products. The import is
+idempotent: it creates missing products and refreshes catalog fields without touching
+price policies, approved-text keys, or margin classes.
+
+Customer interest is captured from the original CRM workbook: the "需要的Lanya产品"
+column of `scripts/import_full_customer_list.py` is classified into category keys and
+stored on `customers.metadata_json["interests"]` (the English `POST /admin/imports/customers`
+does the same from the product's category). For example, `工业硅烷` records an
+`industrial_silanes` interest.
+
+When a new inbound email arrives from a known contact and names no specific product
+code, the resolver creates a category case only when the CRM record has exactly one
+active interest category. The AI then classifies the email (product list/catalog
+requests and category-only mentions such as "we are interested in industrial silane"
+are `product_list_request`); the worker queues a deterministic, price-free reply with
+the full product list for that category (`message_kind=PRODUCT_LIST`) instead of a
+human handoff. If the customer names a specific product code together with a product
+list request, the reply uses that product's category. Risky intents (samples, orders,
+shipping, technical, complaints, counteroffers), suppressed contacts, missing
+`auto_send_allowed`, and low-confidence messages still create a handoff exactly as
+before.
+
+Demo fixture `assets/demo_product_list_request.eml` exercises the flow after the
+catalog import and a customer import that contains `api@ethachem.example` with
+`工业硅烷` and `enable_auto_send`.
+
 ## Excel templates
 
 Generated templates are committed at:
@@ -533,6 +575,8 @@ All `/admin/*` endpoints use HTTP Basic authentication.
 - `POST /admin/demo/inbound`
 - `POST /admin/imports/customers`
 - `POST /admin/imports/prices`
+- `GET /admin/product-categories`
+- `POST /admin/catalog/import`
 - `GET /admin/cases`
 - `GET /admin/cases/{id}`
 - `POST /admin/cases/{id}/outreach`

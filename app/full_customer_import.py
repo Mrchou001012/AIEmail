@@ -16,6 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import AuditEvent, CaseStatus, Contact, Customer, Product, SalesCase
 from app.deliverability import validate_address_format
 from app.history import reconcile_email_history
+from app.product_catalog import (
+    category_interest_entries,
+    category_names_by_key,
+    merge_customer_interests,
+)
 from app.products import canonical_product_code
 
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,63}", re.IGNORECASE)
@@ -463,6 +468,7 @@ async def import_full_customer_workbook(
     for address, endpoint in parsed.endpoints.items():
         company_key = endpoint.preferred_company_name.strip().casefold()
         company = customers_by_name.get(company_key)
+        category_names = await category_names_by_key(session)
         matches = contacts_by_email.get(address, [])
         selected_contact = next(
             (
@@ -531,6 +537,19 @@ async def import_full_customer_workbook(
             _merge_activity(selected_contact, endpoint)
             result.updated_contacts += 1
         _merge_contact_metadata(selected_contact, endpoint, parsed)
+        interest_entries: list[dict[str, Any]] = []
+        for association in endpoint.associations:
+            if not association.product_text.strip():
+                continue
+            interest_entries.extend(
+                category_interest_entries(
+                    text=association.product_text,
+                    category_names=category_names,
+                    source="full_customer_workbook",
+                    source_row=association.source_row,
+                )
+            )
+        merge_customer_interests(company, interest_entries)
 
         resolved_products = (
             _resolved_products(endpoint, products_by_code) if create_cases else []

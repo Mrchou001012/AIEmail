@@ -1,0 +1,464 @@
+# Product catalog by major category, imported from 产品们.docx (2026-07-31).
+# `code` values follow the canonical codes used by the price/customer imports.
+# Run `scripts/import_product_catalog.py --apply` to upsert this into PostgreSQL.
+categories:
+  - key: industrial_silanes
+    name: Industrial Silanes
+    name_zh: 工业硅烷
+    sort_order: 10
+  - key: pharmaceutical
+    name: Pharmaceutical
+    name_zh: 医药
+    sort_order: 20
+  - key: rubber_plastics
+    name: Rubber & Plastics
+    name_zh: 橡塑
+    sort_order: 30
+
+products:
+  # ---------------- Industrial Silanes ----------------
+  - category: industrial_silanes
+    code: YAC-A110
+    name: 3-AMINOPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 919-30-2
+    content: 95%/97%/98%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A111
+    name: 3-AMINOPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 13822-56-5
+    content: 95%/97%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A112
+    name: N-AMINOETHYL-3-AMINOPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 1760-24-3
+    content: 95%/97%/98%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A160
+    name: 3-UREIDOPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 23779-32-0
+    content: 50%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A161
+    name: 3-UREIDOPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 23843-64-3
+    content: 95%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A210
+    name: 3-AMINOPROPYLMETHYLDIETHOXYSILANE
+    brand: YAC
+    cas_no: 3179-76-8
+    content: 95%
+    series: Amine Silane Series (A)
+  - category: industrial_silanes
+    code: YAC-A212
+    name: N-AMINOETHYL-3-AMINOPROPYLMETHYLDIMETHOXYSILANE
+    brand: YAC
+    cas_no: 3069-29-2
+    content: 95%
+    series: Amine Silane Series (A)
+
+  - category: industrial_silanes
+    code: YAC-N113
+    name: METHYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 1185-55-3
+    content: 99%
+    series: Alkyl Silane Series (N)
+  - category: industrial_silanes
+    code: YAC-N123
+    name: METHYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 2031-67-6
+    content: 99%
+    series: Alkyl Silane Series (N)
+  - category: industrial_silanes
+    code: YAC-N813
+    name: N-OCTYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 3069-40-7
+    content: 98%
+    series: Alkyl Silane Series (N)
+  - category: industrial_silanes
+    code: YAC-N823(98%)
+    name: N-OCTYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 2943-75-1
+    content: 98%
+    series: Alkyl Silane Series (N)
+  - category: industrial_silanes
+    code: YAC-N1213
+    name: N-DODECYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 3069-21-4
+    content: 95%
+    series: Alkyl Silane Series (N)
+
+  - category: industrial_silanes
+    code: YAC-O186
+    name: 2-(3,4-EPOXYCYCLOHEXYL)ETHYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 3388-04-3
+    content: 98%
+    series: Epoxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1861
+    name: 2-(3,4-EPOXYCYCLOHEXYL)ETHYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 10217-34-2
+    content: 98%
+    series: Epoxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O187
+    name: 3-GLYCIDOXYPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 2530-83-8
+    content: 97%/98%/99%
+    series: Epoxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1871
+    name: 3-GLYCIDOXYPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 2602-34-8
+    content: 97%
+    series: Epoxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1872
+    name: 3-GLYCIDOXYPROPYLMETHYLDIETHOXYSILANE
+    brand: YAC
+    cas_no: 2897-60-1
+    content: 97%
+    series: Epoxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1873
+    name: 3-GLYCIDOXYPROPYLMETHYLDIMETHOXYSILANE
+    brand: YAC
+    cas_no: 65799-47-5
+    content: 97%
+    series: Epoxy Silane Series (O)
+
+  - category: industrial_silanes
+    code: YAC-O174
+    name: 3-METHACRYLOXYPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 2530-85-0
+    content: 97%/98%/99%
+    series: Methacryloxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1741
+    name: 3-METHACRYLOXYPROPYLMETHYLDIMETHOXYSILANE
+    brand: YAC
+    cas_no: 14513-34-9
+    content: 95%/97%
+    series: Methacryloxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1742
+    name: 3-METHACRYLOXYPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 21142-29-0
+    content: 97%
+    series: Methacryloxy Silane Series (O)
+  - category: industrial_silanes
+    code: YAC-O1743
+    name: 3-METHACRYLOXYPROPYLMETHYLDIETHOXYSILANE
+    brand: YAC
+    cas_no: 65100-04-1
+    content: 95%/97%
+    series: Methacryloxy Silane Series (O)
+
+  - category: industrial_silanes
+    code: YAC-V151
+    name: VINYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 78-08-0
+    content: 98%/99%
+    series: Vinyl Silane Series (V)
+  - category: industrial_silanes
+    code: YAC-V171
+    name: VINYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 2768-02-7
+    content: 98%
+    series: Vinyl Silane Series (V)
+
+  - category: industrial_silanes
+    code: YAC-MTAS
+    name: METHYLTRIACETOXYSILANE
+    brand: YAC
+    cas_no: 4253-34-3
+    content: 90%
+    series: Acetoxy Silane Series (P)
+  - category: industrial_silanes
+    code: YAC-ETAS
+    name: ETHYLTRIACETOXYSILANE
+    brand: YAC
+    cas_no: 17689-77-9
+    content: 95%
+    series: Acetoxy Silane Series (P)
+  - category: industrial_silanes
+    code: YAC-PTAS
+    name: PROPYLTRIACETOXYSILANE
+    brand: YAC
+    cas_no: 17865-07-5
+    content: 95%
+    series: Acetoxy Silane Series (P)
+
+  - category: industrial_silanes
+    code: YAC-MOS
+    name: METHYLTRIS(METHYLETHYLKETOXIME)SILANE
+    brand: YAC
+    cas_no: 22984-54-9
+    content: 95%
+    series: Oxime Silane Series
+  - category: industrial_silanes
+    code: YAC-VOS
+    name: VINYLTRIS(METHYLETHYLKETOXIME)SILANE
+    brand: YAC
+    cas_no: 2224-33-1
+    content: 95%
+    series: Oxime Silane Series
+
+  - category: industrial_silanes
+    code: YAC-S312
+    name: 3-MERCAPTOPROPYLMETHYLDIMETHOXYSILANE
+    brand: YAC
+    cas_no: 31001-77-1
+    content: 98%
+    series: Mercapto Silane Series (S)
+  - category: industrial_silanes
+    code: YAC-S313
+    name: 3-MERCAPTOPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 4420-74-0
+    content: 95%/97%/98%
+    series: Mercapto Silane Series (S)
+  - category: industrial_silanes
+    code: YAC-S319
+    name: BIS-(3-(TRIETHOXYSILYL)PROPYL)TETRASULFIDE
+    brand: YAC
+    cas_no: 40372-72-3
+    content: 95%
+    series: Mercapto Silane Series (S)
+  - category: industrial_silanes
+    code: YAC-S323
+    name: 3-MERCAPTOPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 14814-09-6
+    content: 95%/97%/98%
+    series: Mercapto Silane Series (S)
+
+  - category: industrial_silanes
+    code: YAC-C312
+    name: 3-CHLOROPROPYLMETHYLDIMETHOXYSILANE
+    brand: YAC
+    cas_no: 18171-19-2
+    content: 98%
+    series: Chloropropyl Silane Series (C)
+  - category: industrial_silanes
+    code: YAC-C313
+    name: 3-CHLOROPROPYLTRIMETHOXYSILANE
+    brand: YAC
+    cas_no: 2530-87-2
+    content: 98%/99%
+    series: Chloropropyl Silane Series (C)
+  - category: industrial_silanes
+    code: YAC-C322
+    name: 3-CHLOROPROPYLMETHYLDIETHOXYSILANE
+    brand: YAC
+    cas_no: 13501-76-3
+    content: 95%
+    series: Chloropropyl Silane Series (C)
+  - category: industrial_silanes
+    code: YAC-C323
+    name: 3-CHLOROPROPYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 5089-70-3
+    content: 98%
+    series: Chloropropyl Silane Series (C)
+
+  - category: industrial_silanes
+    code: YAC-TEOS40
+    name: TETRAETHOXY ORTHO SILANE - 40
+    brand: YAC
+    cas_no: 11099-06-2
+    content: "-"
+    series: Other Products
+
+  # Extra entries from the second industrial-silanes summary table.
+  - category: industrial_silanes
+    code: YAC-BDAC
+    name: Di-tert-butoxydiacetoxysilane
+    brand: YAC
+    cas_no: 13170-23-5
+    series: Acetoxy Series
+  - category: industrial_silanes
+    code: YAC-TOS
+    name: Tetra(methylethylketoxime)silane
+    brand: YAC
+    cas_no: 34206-40-1
+    series: Ketoxime Series
+  - category: industrial_silanes
+    code: YAC-POS
+    name: Phenyltris(methylethylketoxime)silane
+    brand: YAC
+    cas_no: 34036-80-1
+    series: Ketoxime Series
+  - category: industrial_silanes
+    code: YAC-MTMS
+    name: Methyltrimethoxysilane
+    brand: YAC
+    cas_no: 1185-55-3
+    series: Alcohol Series
+  - category: industrial_silanes
+    code: YAC-TMOS
+    name: Tetramethoxysilane
+    brand: YAC
+    cas_no: 681-84-5
+    series: Alcohol Series
+  - category: industrial_silanes
+    code: YAC-TEOS28
+    name: Tetraethoxysilane (TEOS 28/40)
+    brand: YAC
+    cas_no: 78-10-4
+    series: Alcohol Series
+
+  # ---------------- Pharmaceutical ----------------
+  - category: pharmaceutical
+    code: YAC-TES
+    name: TRIETHYLSILANE (TES)
+    brand: YAC
+    cas_no: 617-86-7
+  - category: pharmaceutical
+    code: YAC-HMM
+    name: 1,1,3,3-TETRAMETHYLDISILOXANE (HMM)
+    brand: YAC
+    cas_no: 3277-26-7
+  - category: pharmaceutical
+    code: YAC-BSA
+    name: N,O-BIS(TRIMETHYLSILYL)ACETAMIDE (BSA)
+    brand: YAC
+    cas_no: 10416-59-8
+  - category: pharmaceutical
+    code: YAC-BCP
+    name: 1-BROMO-5-CHLOROPENTANE (BCP)
+    brand: YAC
+    cas_no: 54512-75-3
+  - category: pharmaceutical
+    code: YAC-BSTFA
+    name: N,O-BIS(TRIMETHYLSILYL)TRIFLUOROACETAMIDE (BSTFA)
+    brand: YAC
+    cas_no: 25561-30-2
+  - category: pharmaceutical
+    code: YAC-HMDS
+    name: HEXAMETHYL DI SILAZANE (HMDS)
+    brand: YAC
+    cas_no: 999-97-3
+  - category: pharmaceutical
+    code: YAC-TBDMSC
+    name: TERT-BUTYL(CHLORO)DIMETHYLSILANE (TBDMSC)
+    brand: YAC
+    cas_no: 18162-48-6
+  - category: pharmaceutical
+    code: YAC-TMCS
+    name: TRIMETHYL CHLOROSILANE (TMCS)
+    brand: YAC
+    cas_no: 75-77-4
+  - category: pharmaceutical
+    code: YAC-TIPS
+    name: TRIISOPROPYLSILANE (TIPS)
+    brand: YAC
+    cas_no: 6485-79-6
+
+  # ---------------- Rubber & Plastics ----------------
+  - category: rubber_plastics
+    code: SBM-55
+    name: SBM-55
+    brand: Lanya
+    cas_no: 58446-52-9
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: DBM-83
+    name: DBM-83
+    brand: Lanya
+    cas_no: 120-46-7
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: CAA
+    name: CALCIUM ACETYL ACETONATE
+    brand: Lanya
+    cas_no: 19372-44-2
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: ZAA
+    name: ZINC ACETYL ACETONATE
+    brand: Lanya
+    cas_no: 14024-63-6
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: THEIC
+    name: LANYA THEIC
+    brand: Lanya
+    cas_no: 839-90-7
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: AAA
+    name: ALUMINIUM ACETYL ACETONATE
+    brand: Lanya
+    cas_no: 13963-57-0
+    series: PVC Heat Stabilizers
+  - category: rubber_plastics
+    code: AO-168
+    name: LANNOX 168
+    brand: LANNOX
+    cas_no: 31570-04-4
+    series: Antioxidants
+  - category: rubber_plastics
+    code: AO-1010
+    name: LANNOX 1010
+    brand: LANNOX
+    cas_no: 6683-19-8
+    series: Antioxidants
+  - category: rubber_plastics
+    code: AO-1076
+    name: LANNOX 1076
+    brand: LANNOX
+    cas_no: 2082-79-3
+    series: Antioxidants
+  - category: rubber_plastics
+    code: UV-770
+    name: UV 770
+    cas_no: 52829-07-9
+    series: UV Stabilizers
+  - category: rubber_plastics
+    code: UV-944
+    name: UV 944
+    cas_no: 71878-19-8
+    series: UV Stabilizers
+  - category: rubber_plastics
+    code: UV-783
+    name: UV 783
+    series: UV Stabilizers
+  - category: rubber_plastics
+    code: UV-622
+    name: UV 622
+    cas_no: 65447-77-0
+    series: UV Stabilizers
+  - category: rubber_plastics
+    code: UV-P
+    name: UV P
+    cas_no: 2440-22-4
+    series: UV Stabilizers
+  - category: rubber_plastics
+    code: UV-531
+    name: UV 531
+    cas_no: 1843-05-6
+    series: UV Stabilizers

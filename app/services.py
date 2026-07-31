@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.ai import AIClient, render_draft_preview, validate_rendered_email
+from app.ai import AIClient, InboundAnalysis, render_draft_preview, validate_rendered_email
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.bounces import (
     BounceType,
@@ -56,6 +56,7 @@ from app.db import (
     Outbox,
     PricePolicy,
     Product,
+    ProductCategory,
     Quote,
     ReactivationRecipient,
     SalesCase,
@@ -90,6 +91,11 @@ from app.mail import (
     normalized_subject,
     parse_mime,
     transport_for,
+)
+from app.product_catalog import (
+    active_category_keys,
+    customer_interest_keys,
+    render_product_list_email,
 )
 from app.products import canonical_product_code, find_product_codes, product_codes_match
 from app.rag_retrieval import LocalRAGRetriever
@@ -1801,7 +1807,8 @@ async def freeze_outbox(
     session: AsyncSession,
     *,
     case: SalesCase,
-    quote: Quote,
+    quote: Quote | None = None,
+    message_kind: str = "AUTO_QUOTE",
     subject: str,
     text_body: str,
     html_body: str,
@@ -1826,8 +1833,8 @@ async def freeze_outbox(
         async with session.begin_nested():
             row = Outbox(
                 case_id=case.id,
-                quote_id=quote.id,
-                message_kind="AUTO_QUOTE",
+                quote_id=quote.id if quote is not None else None,
+                message_kind=message_kind,
                 business_key=business_key,
                 message_id=message_id,
                 recipient=case.contact.email,
@@ -1858,7 +1865,12 @@ async def freeze_outbox(
             "outbox.frozen",
             case_id=case.id,
             actor="system",
-            data={"outbox_id": row.id, "message_id": message_id, "quote_id": quote.id},
+            data={
+                "outbox_id": row.id,
+                "message_id": message_id,
+                "message_kind": message_kind,
+                **({"quote_id": quote.id} if quote is not None else {}),
+            },
         )
         await session.commit()
         return row
@@ -2235,17 +2247,121 @@ async def _ensure_inbound_follow_up(
 
 def _explicit_product_codes(text: str) -> list[str]:
     codes = find_product_codes(text)
-    explicit = re.findall(
+    explicit = []
+    for value in re.findall(
         r"\b(?:SKU|PRODUCT)\s*[:#-]?\s*([A-Z0-9][A-Z0-9_()%.\-]{1,63})",
         text,
         flags=re.IGNORECASE,
-    )
+    ):
+        # "PRODUCT LIST/CATALOG/BROCHURE/PRODUCTS" are category-catalog
+        # requests, not explicit product codes. Only keep candidates that
+        # look like real product codes (digit-bearing tokens, or brand-style
+        # prefixes from the catalog) so prose fragments such as "LIST" or
+        # "S." (from "PRODUCTS") are not treated as SKUs.
+        candidate = value.rstrip(".,;:!?")
+        if candidate.upper() in {
+            "LIST",
+            "LISTS",
+            "CATALOG",
+            "CATALOGUE",
+            "BROCHURE",
+            "RANGE",
+            "PORTFOLIO",
+        }:
+            continue
+        if re.search(r"\d", candidate) or re.match(
+            r"^(YAC|LANNOX|UV|SBM|DBM|CAA|ZAA|THEIC|AAA)[-_A-Z0-9]*$",
+            candidate,
+            re.I,
+        ):
+            explicit.append(candidate)
     return list(dict.fromkeys([*codes, *(canonical_product_code(value) for value in explicit)]))
 
 
 def _prior_thread_marker(text: str) -> str | None:
     lowered = text.casefold()
     return next((marker for marker in PRIOR_THREAD_MARKERS if marker in lowered), None)
+
+
+async def _resolve_category_inquiry_case(
+    session: AsyncSession,
+    *,
+    contact: Contact,
+    incoming_subject_key: str,
+    facts: dict[str, Any],
+) -> NewInquiryResolution | None:
+    """Create or reuse a category case when the CRM knows exactly one interest."""
+    interest_keys = customer_interest_keys(contact.customer)
+    active_keys = await active_category_keys(session)
+    known = [key for key in interest_keys if key in active_keys]
+    if len(known) != 1:
+        facts.update(
+            {
+                "interest_categories": interest_keys,
+                "active_interest_categories": known,
+            }
+        )
+        return None
+    category_key = known[0]
+    category = await session.scalar(
+        select(ProductCategory).where(
+            ProductCategory.key == category_key,
+            ProductCategory.active.is_(True),
+        )
+    )
+    if category is None:
+        return None
+    customer_currency_rows = await session.execute(
+        select(SalesCase.currency).where(
+            SalesCase.customer_id == contact.customer_id,
+            SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
+        )
+    )
+    customer_currencies = set(customer_currency_rows.scalars().all())
+    currency = next(iter(customer_currencies)) if len(customer_currencies) == 1 else "USD"
+    existing = await session.scalar(
+        select(SalesCase)
+        .where(
+            SalesCase.contact_id == contact.id,
+            SalesCase.category_id == category.id,
+            SalesCase.status == CaseStatus.ACTIVE,
+        )
+        .order_by(SalesCase.id.desc())
+    )
+    if existing is not None:
+        return NewInquiryResolution(
+            existing,
+            facts={
+                **facts,
+                "category_id": category.id,
+                "category_key": category.key,
+                "currency": currency,
+                "match_basis": "customer_interest_category",
+                "reused_category_case": True,
+            },
+        )
+    sales_case = SalesCase(
+        customer_id=contact.customer_id,
+        contact_id=contact.id,
+        product_id=None,
+        category_id=category.id,
+        currency=currency,
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.ACTIVE,
+        subject_key=incoming_subject_key,
+    )
+    session.add(sales_case)
+    await session.flush()
+    return NewInquiryResolution(
+        sales_case,
+        facts={
+            **facts,
+            "category_id": category.id,
+            "category_key": category.key,
+            "currency": currency,
+            "match_basis": "customer_interest_category",
+        },
+    )
 
 
 async def _resolve_new_inquiry_case(
@@ -2319,6 +2435,15 @@ async def _resolve_new_inquiry_case(
         }
     )
     if len(product_codes) != 1:
+        if not product_codes:
+            category_resolution = await _resolve_category_inquiry_case(
+                session,
+                contact=contact,
+                incoming_subject_key=normalized_subject(parsed.subject)[:255],
+                facts=facts,
+            )
+            if category_resolution is not None:
+                return category_resolution
         return NewInquiryResolution(
             None,
             HandoffReason.NEW_INQUIRY_REVIEW,
@@ -3088,6 +3213,178 @@ async def _handle_automated_reply(
     return True
 
 
+async def _maybe_send_product_list(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+) -> bool:
+    """Queue a deterministic category product-list reply when eligible.
+
+    Returns ``True`` when the inbound email was handled (a product-list reply
+    was queued or a handoff was created). Returns ``False`` when the case has
+    no product category at all, so callers can continue the normal pipeline.
+    """
+    category = (
+        await session.get(ProductCategory, case.category_id)
+        if case.category_id is not None
+        else None
+    )
+    if (
+        category is None
+        and case.product_id is not None
+        and case.product is not None
+        and case.product.category_id is not None
+    ):
+        category = await session.get(ProductCategory, case.product.category_id)
+    if category is None or not category.active:
+        if case.category_id is None:
+            return False
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.HUMAN_CONTROL,
+            summary="Case product category is no longer active",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            # The product category comes from the CRM record or the matched
+            # product, so the catalog target is deterministic rather than an
+            # extracted product code.
+            product_confidence=1.0,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            product_known=(
+                analysis.product_code is None
+                or (
+                    case.product is not None
+                    and product_codes_match(analysis.product_code, case.product.code)
+                )
+            ),
+            prebook_requested=analysis.prebook_requested,
+            packaging_requested=analysis.packaging_requested,
+            delivery_requested=analysis.shipping_requested,
+        ),
+        intent_threshold=get_settings().intent_confidence_threshold,
+        product_threshold=get_settings().product_confidence_threshold,
+        numeric_threshold=get_settings().numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await create_handoff(
+            session,
+            case=case,
+            reason=send_decision.reason or HandoffReason.LOW_CONFIDENCE,
+            summary=f"Inbound {analysis.intent.value} requires human review",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    if analysis.product_code is not None and not (
+        case.product is not None
+        and product_codes_match(analysis.product_code, case.product.code)
+    ):
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.NONSTANDARD,
+            summary="Email names a specific product; a category product list is not appropriate",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    products = (
+        (
+            await session.execute(
+                select(Product)
+                .where(
+                    Product.category_id == category.id,
+                    Product.active.is_(True),
+                )
+                .order_by(Product.sort_order, Product.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not products:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.HUMAN_CONTROL,
+            summary=f"Product category {category.key} has no active products",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    bundle = load_content(get_settings().content_dir)
+    try:
+        text, html_body = render_product_list_email(
+            contact_name=case.contact.name,
+            category=category,
+            products=products,
+            subject=email_row.subject,
+            signature_text=bundle.signature_text,
+            signature_html=bundle.signature_html,
+        )
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Product list rendering failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    subject = (
+        f"Re: {email_row.subject}"
+        if email_row.subject.strip()
+        else f"Our {category.name} product list"
+    )
+    outbox = await freeze_outbox(
+        session,
+        case=case,
+        message_kind="PRODUCT_LIST",
+        subject=subject,
+        text_body=text,
+        html_body=html_body,
+        business_key=f"inbound-product-list:{email_row.id}",
+        in_reply_to=email_row.message_id,
+        references=_reply_references(email_row),
+    )
+    if outbox is None:
+        return True
+    await audit(
+        session,
+        "inbound.product_list_queued",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "outbox_id": outbox.id,
+            "category_id": category.id,
+            "category_key": category.key,
+            "product_count": len(products),
+        },
+    )
+    return True
+
+
 async def process_inbound(session: AsyncSession, email_id: int) -> None:
     email_row = await session.get(EmailMessage, email_id)
     if email_row is None:
@@ -3172,6 +3469,15 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await session.commit()
         return
     if case.product_id is None or case.product is None:
+        if case.category_id is not None:
+            if await _maybe_send_product_list(
+                session,
+                case=case,
+                email_row=email_row,
+                analysis=analysis,
+                analysis_facts=analysis_facts,
+            ):
+                return
         await create_handoff(
             session,
             case=case,
@@ -3184,6 +3490,15 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     # Weekly commercial-data readiness blocks only an autonomous quotation.
     # Unsubscribe, counteroffers, samples, orders, complaints, and all other
     # human-review paths must still be classified and surfaced immediately.
+    if analysis.intent == Intent.PRODUCT_LIST_REQUEST:
+        if await _maybe_send_product_list(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=analysis,
+            analysis_facts=analysis_facts,
+        ):
+            return
     if analysis.intent != Intent.QUOTE_REQUEST:
         send_decision = evaluate_send_policy(
             SendContext(
