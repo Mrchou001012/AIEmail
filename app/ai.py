@@ -491,6 +491,7 @@ class AIClient:
                     emitted_paragraph_count += 1
                     yield {"type": "body_block", "kind": "paragraph", "value": paragraph}
             response = await stream.get_final_message()
+            request_id: str | None = getattr(stream, "request_id", None)
 
         if response.stop_reason in {"refusal", "max_tokens"} or response.parsed_output is None:
             raise RuntimeError(f"Anthropic preview drafting did not complete: {response.stop_reason}")
@@ -517,7 +518,7 @@ class AIClient:
                 "provider": "anthropic",
                 "model": response.model,
                 "request_hash": request_hash,
-                "request_id": response._request_id,
+                "request_id": request_id,
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
