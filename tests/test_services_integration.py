@@ -2544,7 +2544,16 @@ async def test_contact_directory_suppresses_only_one_endpoint(
         raw_message="Subject: pending\n\nbody",
         status=DeliveryStatus.PENDING,
     )
-    db_session.add(pending)
+    claimed = Outbox(
+        case_id=case.id,
+        business_key="manual-suppression-claimed",
+        message_id="<manual-suppression-claimed@example.com>",
+        recipient=old_contact.email,
+        raw_message="Subject: claimed\n\nbody",
+        status=DeliveryStatus.CLAIMED,
+        locked_at=datetime.now(UTC),
+    )
+    db_session.add_all([pending, claimed])
     await db_session.commit()
 
     suppressed = await suppress_contact_endpoint(
@@ -2556,6 +2565,7 @@ async def test_contact_directory_suppresses_only_one_endpoint(
     await db_session.refresh(case)
     await db_session.refresh(sibling)
     await db_session.refresh(pending)
+    await db_session.refresh(claimed)
 
     assert created is True
     assert suppressed.id == old_contact.id
@@ -2563,6 +2573,7 @@ async def test_contact_directory_suppresses_only_one_endpoint(
     assert sibling.suppressed is False
     assert case.status == CaseStatus.PAUSED
     assert pending.status == DeliveryStatus.CANCELLED
+    assert claimed.status == DeliveryStatus.CANCELLED
     assert await db_session.get(
         EmailAddressStatus, sibling.email.casefold()
     ) is None
@@ -2664,6 +2675,69 @@ async def test_smtp_preflight_defers_temporary_dns_failure_without_attempt(
     assert pending.status == DeliveryStatus.PENDING
     assert pending.attempts == 0
     assert pending.available_at >= before + timedelta(minutes=29)
+
+
+async def test_smtp_final_gate_rechecks_suppression_after_claim(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    recipient = "late-suppression@example.com"
+
+    async def suppress_after_initial_checks(session, checked_recipient, settings):
+        assert checked_recipient == recipient
+        session.add(
+            EmailAddressStatus(
+                email=recipient,
+                suppressed=True,
+                suppression_reason="MANUAL_CONTACT_ENDPOINT_SUPPRESSION",
+                suppressed_at=datetime.now(UTC),
+            )
+        )
+        await session.flush()
+        return "ALLOW", "initial check passed", {"recipient": recipient}
+
+    monkeypatch.setattr(
+        "app.services._recipient_preflight",
+        suppress_after_initial_checks,
+    )
+    monkeypatch.setattr(
+        "app.services.transport_for",
+        lambda settings: pytest.fail("SMTP must not be called after suppression"),
+    )
+    settings = Settings(
+        _env_file=None,
+        mail_transport="smtp",
+        auto_send_enabled=True,
+        safe_mode=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+    )
+    pending = Outbox(
+        business_key="late-suppression-final-gate",
+        message_id="<late-suppression-final-gate@example.com>",
+        recipient=recipient,
+        raw_message="Subject: final gate\n\nbody",
+        status=DeliveryStatus.PENDING,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    assert await send_one_outbox(db_session, settings) is True
+    await db_session.refresh(pending)
+
+    assert pending.status == DeliveryStatus.CANCELLED
+    assert pending.attempts == 1
+    assert "final delivery gate blocked suppressed recipient" in (
+        pending.last_error or ""
+    )
+    audit_row = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == "outbox.blocked_final_recipient_gate"
+        )
+    )
+    assert audit_row is not None
+    assert audit_row.data["recipient"] == recipient
 
 
 def _integration_dsn(*, original_message_id: str, recipient: str, status: str, diagnostic: str) -> bytes:

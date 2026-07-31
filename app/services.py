@@ -215,6 +215,39 @@ async def _email_address_status(session: AsyncSession, email_address: str) -> Em
     return row
 
 
+def _recipient_delivery_gate_key(email_address: str) -> int:
+    """Return a stable signed bigint key for PostgreSQL advisory locking."""
+    normalized = email_address.strip().casefold()[:320]
+    return int.from_bytes(
+        hashlib.sha256(normalized.encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+
+
+async def _lock_recipient_delivery_gate(
+    session: AsyncSession,
+    email_address: str,
+) -> None:
+    """Serialize final delivery and endpoint suppression for one address.
+
+    The transaction holding this lock is the linearization boundary: a
+    suppression committed before the final delivery transaction acquires the
+    lock blocks the message; a suppression that waits behind an in-progress
+    SMTP transaction is applied only after that already-started delivery.
+    """
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                _recipient_delivery_gate_key(email_address)
+            )
+        )
+    )
+
+
 async def _suppress_email_address(
     session: AsyncSession,
     email_address: str,
@@ -224,6 +257,7 @@ async def _suppress_email_address(
     bounce_type: str | None = None,
     diagnostic: str | None = None,
 ) -> EmailAddressStatus:
+    await _lock_recipient_delivery_gate(session, email_address)
     now = datetime.now(UTC)
     status = await _email_address_status(session, email_address)
     status.suppressed = True
@@ -538,7 +572,8 @@ async def _cancel_pending_recipient_delivery(
     rows = (
         (
             await session.execute(
-                select(Outbox).where(
+                select(Outbox)
+                .where(
                     func.lower(Outbox.recipient) == recipient,
                     Outbox.status.in_(
                         [
@@ -549,6 +584,7 @@ async def _cancel_pending_recipient_delivery(
                         ]
                     ),
                 )
+                .with_for_update()
             )
         )
         .scalars()
@@ -576,6 +612,85 @@ async def _cancel_pending_recipient_delivery(
                 campaign_row.status = "SKIPPED"
                 campaign_row.exclusion_reason = "EMAIL_UNDELIVERABLE"
     return outbox_ids
+
+
+async def _final_recipient_delivery_guard(
+    session: AsyncSession,
+    row: Outbox,
+    *,
+    settings: Settings,
+    at: datetime,
+) -> bool:
+    """Re-check mutable recipient state after claiming and immediately before send.
+
+    The advisory lock remains held by the transaction while the transport is
+    called, so the API cannot commit a conflicting endpoint suppression between
+    this check and SMTP delivery.
+    """
+    await _lock_recipient_delivery_gate(session, row.recipient)
+    current = await session.scalar(
+        select(Outbox)
+        .where(Outbox.id == row.id)
+        .execution_options(populate_existing=True)
+    )
+    if current is None or current.status != DeliveryStatus.CLAIMED:
+        await session.commit()
+        return False
+
+    address_status = await _email_address_status(session, current.recipient)
+    if address_status.suppressed:
+        current.status = DeliveryStatus.CANCELLED
+        current.last_error = (
+            "final delivery gate blocked suppressed recipient: "
+            f"{address_status.suppression_reason or 'unspecified'}"
+        )[:2000]
+        campaign_recipient = await session.scalar(
+            select(ReactivationRecipient).where(
+                ReactivationRecipient.outbox_id == current.id
+            )
+        )
+        if (
+            campaign_recipient is not None
+            and campaign_recipient.status not in {"SENT", "REPLIED"}
+        ):
+            campaign_recipient.status = "SKIPPED"
+            campaign_recipient.exclusion_reason = "CONTACT_SUPPRESSED"
+        await audit(
+            session,
+            "outbox.blocked_final_recipient_gate",
+            case_id=current.case_id,
+            actor="policy",
+            data={
+                "outbox_id": current.id,
+                "recipient": current.recipient.strip().casefold(),
+                "suppression_reason": address_status.suppression_reason,
+            },
+        )
+        await session.commit()
+        return False
+
+    if current.message_kind == "REACTIVATION":
+        guard = await reactivation_send_guard(
+            session,
+            current,
+            settings=settings,
+            at=at,
+        )
+        if guard.action == "DEFER":
+            current.status = DeliveryStatus.PENDING
+            current.attempts = max(0, current.attempts - 1)
+            current.available_at = guard.available_at or (
+                at + timedelta(minutes=15)
+            )
+            current.last_error = guard.reason
+            await session.commit()
+            return False
+        if guard.action == "BLOCK":
+            current.status = DeliveryStatus.CANCELLED
+            current.last_error = guard.reason
+            await session.commit()
+            return False
+    return True
 
 
 async def suppress_contact_endpoint(
@@ -3774,6 +3889,13 @@ async def send_one_outbox(
     row.locked_at = datetime.now(UTC)
     row.attempts += 1
     await session.commit()
+    if not await _final_recipient_delivery_guard(
+        session,
+        row,
+        settings=settings,
+        at=now,
+    ):
+        return True
     try:
         transport_for(settings).send(row.raw_message, row.message_id, row.recipient)
         row.status = DeliveryStatus.SENT
