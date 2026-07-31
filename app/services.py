@@ -1162,6 +1162,11 @@ async def stream_handoff_draft_preview(
         if event["type"] == "complete":
             preview = event["preview"]
             preview_metadata = event["metadata"]
+            logger.error(
+                "AI draft preview final value: type=%s, keys=%s",
+                type(preview).__name__,
+                list(preview.keys()) if isinstance(preview, dict) else None,
+            )
             continue
         yield event
     if preview is None or preview_metadata is None:

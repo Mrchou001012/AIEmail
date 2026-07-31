@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import secrets
 import tempfile
@@ -91,6 +92,8 @@ from app.services import (
     update_handoff_case_product,
 )
 from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 security = HTTPBasic()
@@ -2516,9 +2519,10 @@ async def generate_handoff_preview(
         raise HTTPException(409, str(exc)) from exc
     except Exception as exc:
         await session.rollback()
+        logger.exception("AI draft preview failed for handoff %s", handoff_id)
         raise HTTPException(
             502,
-            f"AI draft preview failed: {type(exc).__name__}",
+            f"AI draft preview failed: {exc}",
         ) from exc
 
 
@@ -2538,7 +2542,8 @@ async def stream_handoff_preview(
                 yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
         except Exception as exc:
             await session.rollback()
-            message = str(exc) if isinstance(exc, ValueError) else f"AI draft preview failed: {type(exc).__name__}"
+            logger.exception("AI draft preview stream failed for handoff %s", handoff_id)
+            message = f"AI draft preview failed: {exc}"
             yield json.dumps(
                 {
                     "type": "error",
