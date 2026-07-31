@@ -2973,3 +2973,51 @@ async def test_uncorrelated_hard_bounce_goes_to_review_without_suppression(
     assert address is not None and address.suppressed is False
     assert address.last_bounce_type == "HARD"
     assert handoff is not None and handoff.reason_code == HandoffReason.BOUNCE_REVIEW.value
+
+
+async def test_soft_bounce_for_suppressed_recipient_skips_review_notification(
+    db_session: AsyncSession,
+) -> None:
+    recipient = "suppressed-late-bounce@example.com"
+    db_session.add(
+        EmailAddressStatus(
+            email=recipient,
+            suppressed=True,
+            suppression_reason="MANUAL_CONTACT_ENDPOINT_SUPPRESSION",
+            suppressed_at=datetime.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    raw = _integration_dsn(
+        original_message_id="<late-soft-bounce@example.com>",
+        recipient=recipient,
+        status="4.2.2",
+        diagnostic="452 4.2.2 The recipient's inbox is out of storage space",
+    )
+    email_row = await ingest_raw_email(db_session, raw, mailbox="integration-test")
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+    await db_session.refresh(email_row)
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    notify_job = await db_session.scalar(
+        select(Job).where(Job.kind == "notify_handoff")
+    )
+    ignored = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == "inbound.bounce_ignored_suppressed"
+        )
+    )
+    address = await db_session.get(EmailAddressStatus, recipient)
+
+    assert email_row.bounce_type == BounceType.SOFT.value
+    assert email_row.bounce_handled_at is not None
+    assert handoff is None
+    assert notify_job is None
+    assert ignored is not None
+    assert ignored.data["recipient"] == recipient
+    assert address is not None and address.suppressed is True
+    assert address.suppression_reason == "MANUAL_CONTACT_ENDPOINT_SUPPRESSION"

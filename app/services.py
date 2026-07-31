@@ -2885,6 +2885,23 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
 
     if recipient:
         status = await _email_address_status(session, recipient)
+        if status.suppressed:
+            # The endpoint is already suppressed, so a late or repeated
+            # delivery report must not create another human-review handoff
+            # or DingTalk notification. Record it and move on.
+            await audit(
+                session,
+                "inbound.bounce_ignored_suppressed",
+                case_id=case.id if case else None,
+                actor="system",
+                data={
+                    "email_id": email_row.id,
+                    "outbox_id": outbox.id if outbox else None,
+                    **metadata,
+                },
+            )
+            await session.commit()
+            return
         status.last_bounce_at = datetime.now(UTC)
         status.last_bounce_type = email_row.bounce_type
         status.last_bounce_diagnostic = diagnostic
