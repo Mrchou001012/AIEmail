@@ -3021,3 +3021,8 @@ async def test_soft_bounce_for_suppressed_recipient_skips_review_notification(
     assert ignored.data["recipient"] == recipient
     assert address is not None and address.suppressed is True
     assert address.suppression_reason == "MANUAL_CONTACT_ENDPOINT_SUPPRESSION"
+    assert address.last_bounce_at is not None
+    assert address.last_bounce_type == BounceType.SOFT.value
+    assert address.last_bounce_diagnostic == (
+        "452 4.2.2 The recipient's inbox is out of storage space"
+    )

@@ -3010,6 +3010,12 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
 
     if recipient:
         status = await _email_address_status(session, recipient)
+        # A late or repeated delivery report is still useful endpoint history.
+        # Preserve the newest bounce facts even when the address was already
+        # suppressed, while avoiding another handoff/notification below.
+        status.last_bounce_at = datetime.now(UTC)
+        status.last_bounce_type = email_row.bounce_type
+        status.last_bounce_diagnostic = diagnostic
         if status.suppressed:
             # The endpoint is already suppressed, so a late or repeated
             # delivery report must not create another human-review handoff
@@ -3027,9 +3033,6 @@ async def _handle_bounce(session: AsyncSession, email_row: EmailMessage) -> None
             )
             await session.commit()
             return
-        status.last_bounce_at = datetime.now(UTC)
-        status.last_bounce_type = email_row.bounce_type
-        status.last_bounce_diagnostic = diagnostic
     await audit(
         session,
         "inbound.bounce_review_required",
