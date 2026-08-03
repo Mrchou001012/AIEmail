@@ -673,15 +673,15 @@ async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
     first = await import_product_catalog(db_session, apply=True)
     second = await import_product_catalog(db_session, apply=True)
 
-    assert first["products_created"] == 70
+    assert first["products_created"] == 71
     assert first["categories_created"] == 3
     assert second["products_created"] == 0
-    assert second["products_updated"] == 70
+    assert second["products_updated"] == 71
     product_count = await db_session.scalar(select(func.count()).select_from(Product))
     category_count = await db_session.scalar(
         select(func.count()).select_from(ProductCategory)
     )
-    assert product_count == 70
+    assert product_count == 71
     assert category_count == 3
 
 

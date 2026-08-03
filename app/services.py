@@ -4339,6 +4339,24 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
                 source_email_id=email_row.id,
             )
             return
+    product_independent_risk = {
+        Intent.COUNTEROFFER: HandoffReason.PRICE_NEGOTIATION,
+        Intent.SAMPLE_REQUEST: HandoffReason.SAMPLE_REQUEST,
+        Intent.ORDER: HandoffReason.ORDER_COMMITMENT,
+        Intent.SHIPPING: HandoffReason.SHIPPING_REQUEST,
+        Intent.TECHNICAL: HandoffReason.TECHNICAL_REQUEST,
+        Intent.COMPLAINT: HandoffReason.COMPLAINT,
+    }.get(analysis.intent)
+    if (case.product_id is None or case.product is None) and product_independent_risk:
+        await create_handoff(
+            session,
+            case=case,
+            reason=product_independent_risk,
+            summary=f"Inbound {analysis.intent.value} requires human review",
+            facts={**analysis_facts, "product_pending": True},
+            source_email_id=email_row.id,
+        )
+        return
     if case.product_id is None or case.product is None:
         if (
             case.category_id is not None
