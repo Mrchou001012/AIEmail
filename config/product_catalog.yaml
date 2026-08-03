@@ -323,7 +323,6 @@ products:
     code: YAC-MTMS
     name: Methyltrimethoxysilane
     brand: YAC
-    cas_no: 1185-55-3
     series: Alcohol Series
   - category: industrial_silanes
     code: YAC-TMOS

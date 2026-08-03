@@ -36,6 +36,10 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     acac = next(item for item in products if item["code"] == "ACAC")
     assert acac["category"] == "pharmaceutical"
     assert acac["cas_no"] == "123-54-6"
+    n113 = next(item for item in products if item["code"] == "YAC-N113")
+    mtms = next(item for item in products if item["code"] == "YAC-MTMS")
+    assert n113["cas_no"] == "1185-55-3"
+    assert "cas_no" not in mtms
     assert any(item["code"] == "UV-531" for item in products)
     assert any(item["code"] == "OH-Polymer 80K" for item in products)
     assert any(item["code"] == "YAC-N823(99%)" for item in products)
