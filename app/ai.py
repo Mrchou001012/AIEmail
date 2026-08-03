@@ -254,6 +254,31 @@ def _normalize_quantity_revision(
     return result
 
 
+def extract_quantity_kg(text: str) -> int | None:
+    """Extract one positive whole-kilogram quantity from trusted thread context."""
+    quantity_match = re.search(
+        r"\b(?:qty|quantity)[:\s-]*(\d+(?:\.\d+)?)\s*"
+        r"(kg|kgs|kilograms?|mt|metric\s+tons?|tons?)?\b",
+        text,
+        re.I,
+    )
+    if quantity_match is None:
+        quantity_match = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*(kg|kgs|kilograms?|mt|metric\s+tons?|tons?)\b",
+            text,
+            re.I,
+        )
+    if quantity_match is None:
+        return None
+    amount = Decimal(quantity_match.group(1))
+    unit = (quantity_match.group(2) or "kg").lower()
+    if unit in {"mt", "ton", "tons", "metric ton", "metric tons"}:
+        amount *= 1000
+    if amount != amount.to_integral_value() or amount <= 0:
+        return None
+    return int(amount)
+
+
 def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> InboundAnalysis:
     text = f"{subject}\n{body}"
     intent = _intent_from_text(text)
@@ -275,25 +300,7 @@ def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> 
             "PORTFOLIO",
         }:
             product_code = canonical_product_code(candidate)
-    quantity_match = re.search(
-        r"\b(?:qty|quantity)[:\s-]*(\d+(?:\.\d+)?)\s*(kg|kgs|kilograms?|mt|metric\s+tons?|tons?)?\b",
-        text,
-        re.I,
-    )
-    if quantity_match is None:
-        quantity_match = re.search(
-            r"\b(\d+(?:\.\d+)?)\s*(kg|kgs|kilograms?|mt|metric\s+tons?|tons?)\b",
-            text,
-            re.I,
-        )
-    quantity = None
-    if quantity_match:
-        amount = Decimal(quantity_match.group(1))
-        unit = (quantity_match.group(2) or "kg").lower()
-        if unit in {"mt", "ton", "tons", "metric ton", "metric tons"}:
-            amount *= 1000
-        if amount == amount.to_integral_value() and amount > 0:
-            quantity = int(amount)
+    quantity = extract_quantity_kg(text)
     price_match = re.search(
         r"(?<![A-Z0-9])(USD|EUR|CNY|INR|₹|RS\.?)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)\b|"
         r"\b([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)\s*(USD|EUR|CNY|INR|₹|RS\.?)(?![A-Z0-9])",

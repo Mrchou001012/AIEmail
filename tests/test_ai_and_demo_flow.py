@@ -14,6 +14,7 @@ from app.ai import (
     _complete_json_string_array_field,
     _complete_json_string_field,
     _normalize_quantity_revision,
+    extract_quantity_kg,
     render_draft_preview,
     stub_analyze,
     validate_draft_preview,
@@ -96,6 +97,23 @@ def test_quantity_only_revision_is_not_a_counteroffer() -> None:
 
     assert normalized.intent == Intent.QUOTE_REQUEST
     assert genuine_counteroffer.intent == Intent.COUNTEROFFER
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Please quote 100 kg.", 100),
+        ("Quantity: 1.5 MT", 1500),
+        ("We need 2 metric tons.", 2000),
+        ("Please quote 1.25 kg.", None),
+        ("Please send your quotation.", None),
+    ],
+)
+def test_extract_quantity_kg_from_trusted_thread_context(
+    text: str,
+    expected: int | None,
+) -> None:
+    assert extract_quantity_kg(text) == expected
 
 
 def test_stub_draft_preview_is_review_only_and_ignores_historical_prices() -> None:

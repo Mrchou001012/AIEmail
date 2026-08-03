@@ -1,6 +1,8 @@
 from datetime import date
 from decimal import Decimal
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 
 import pytest
 from sqlalchemy import func, select
@@ -68,12 +70,23 @@ async def _seed_catalog_and_interest(
     return customer.id, contact.id
 
 
-def _message(subject: str, body: str, message_id: str = "product-list@example.com") -> bytes:
+def _message(
+    subject: str,
+    body: str,
+    message_id: str = "product-list@example.com",
+    *,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+) -> bytes:
     message = EmailMessage()
     message["From"] = "Alice Buyer <api@ethachem.example>"
     message["To"] = "sales-agent@example.com"
     message["Subject"] = subject
     message["Message-ID"] = f"<{message_id}>"
+    if in_reply_to is not None:
+        message["In-Reply-To"] = in_reply_to
+    if references is not None:
+        message["References"] = references
     message.set_content(body)
     return message.as_bytes()
 
@@ -149,7 +162,7 @@ async def test_generic_category_interest_email_auto_replies(
     assert "YAC-S313" in outbox.raw_message
 
 
-async def test_productless_quote_with_category_interest_requires_human(
+async def test_productless_quote_with_category_interest_sends_one_clarification(
     db_session: AsyncSession,
 ) -> None:
     await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
@@ -166,13 +179,101 @@ async def test_productless_quote_with_category_interest_requires_human(
     assert email_row is not None and email_row.case_id is not None
     await process_inbound(db_session, email_row.id)
 
-    assert await _queued_product_list(db_session) is None
+    clarification = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    )
+    assert clarification is not None
+    assert clarification.business_key == (
+        f"inbound-reply:{email_row.id}:clarification"
+    )
+    assert "quotation request for 100 kg" in clarification.raw_message
+    assert "confirm the product name or Lanya product code" in clarification.raw_message
+    assert "Please quote quantity: 100 kg." in clarification.raw_message
+    mime = BytesParser(policy=policy.default).parsebytes(
+        clarification.raw_message.encode("utf-8")
+    )
+    assert mime["In-Reply-To"] == email_row.message_id
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
+
+
+async def test_productless_quote_recovers_product_from_complete_quoted_thread(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Re: Our requirement",
+            (
+                "Please quote 100 kg.\n\n"
+                "On Monday Alice Buyer wrote:\n"
+                "> We are interested in YAC-A110."
+            ),
+            message_id="quoted-product@example.com",
+        ),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    assert "YAC-A110" not in email_row.body_text
+    await process_inbound(db_session, email_row.id)
+
+    case = await db_session.get(SalesCase, email_row.case_id)
+    assert case is not None
+    await db_session.refresh(case, ["product"])
+    assert case.product is not None and case.product.code == "YAC-A110"
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Outbox)
+        .where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    ) == 0
+
+
+async def test_second_productless_quote_after_clarification_routes_to_human(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
+    first = await ingest_raw_email(
+        db_session,
+        _message(
+            "Quotation request",
+            "Please quote quantity: 100 kg.",
+            message_id="clarification-first@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert first is not None and first.case_id is not None
+    await process_inbound(db_session, first.id)
+    clarification = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    )
+    assert clarification is not None
+
+    second = await ingest_raw_email(
+        db_session,
+        _message(
+            f"Re: {first.subject}",
+            "Yes, please quote 100 kg.",
+            message_id="clarification-second@example.com",
+            in_reply_to=clarification.message_id,
+            references=clarification.message_id,
+        ),
+        mailbox="integration-test",
+    )
+    assert second is not None and second.case_id == first.case_id
+    await process_inbound(db_session, second.id)
+
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Outbox)
+        .where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    ) == 1
     handoff = await db_session.scalar(
-        select(Handoff).where(Handoff.source_email_id == email_row.id)
+        select(Handoff).where(Handoff.source_email_id == second.id)
     )
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.HUMAN_CONTROL.value
-    assert handoff.extracted_facts["product_pending"] is True
+    assert "still unclear" in handoff.summary
 
 
 async def test_sample_request_still_requires_human(db_session: AsyncSession) -> None:

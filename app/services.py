@@ -18,7 +18,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.ai import AIClient, InboundAnalysis, render_draft_preview, validate_rendered_email
+from app.ai import (
+    AIClient,
+    InboundAnalysis,
+    extract_quantity_kg,
+    render_draft_preview,
+    validate_rendered_email,
+)
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.bounces import (
     BounceType,
@@ -3216,6 +3222,304 @@ async def _handle_automated_reply(
     return True
 
 
+async def _augment_pending_quote_context(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+) -> tuple[InboundAnalysis, str | None]:
+    """Recover a unique product/quantity from the current thread before asking."""
+    if case.product_id is not None or analysis.intent != Intent.QUOTE_REQUEST:
+        return analysis, None
+
+    current_message = f"{email_row.subject}\n{email_row.body_text}"
+    try:
+        full_source = _reply_source(email_row)
+        complete_thread = f"{email_row.subject}\n{full_source.body_text}"
+    except RuntimeError:
+        complete_thread = current_message
+
+    candidate_code = (
+        canonical_product_code(analysis.product_code)
+        if analysis.product_code
+        else None
+    )
+    candidate_source = "current_analysis" if candidate_code else None
+    current_codes = find_product_codes(current_message)
+    conflict: str | None = None
+    if candidate_code is None:
+        if len(current_codes) == 1:
+            candidate_code = current_codes[0]
+            candidate_source = "current_message"
+        elif len(current_codes) > 1:
+            conflict = "The current customer message contains multiple product codes"
+
+    prior_inbound: list[EmailMessage] = []
+    if candidate_code is None and conflict is None:
+        prior_inbound = list(
+            (
+                await session.scalars(
+                    select(EmailMessage)
+                    .where(
+                        EmailMessage.case_id == case.id,
+                        EmailMessage.id != email_row.id,
+                        EmailMessage.direction == "INBOUND",
+                        EmailMessage.is_bounce.is_(False),
+                        EmailMessage.is_automated_reply.is_(False),
+                    )
+                    .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+                    .limit(20)
+                )
+            ).all()
+        )
+        for prior in prior_inbound:
+            prior_codes = find_product_codes(f"{prior.subject}\n{prior.body_text}")
+            if len(prior_codes) == 1:
+                candidate_code = prior_codes[0]
+                candidate_source = f"prior_inbound:{prior.id}"
+                break
+            if len(prior_codes) > 1:
+                conflict = f"Prior inbound email {prior.id} contains multiple product codes"
+                break
+
+    # The archived MIME keeps the complete quoted conversation and is useful
+    # when an older inbound message was not stored as its own row. It is only a
+    # fallback: prior customer-authored messages take precedence, so quoted
+    # outbound catalogs and quotations cannot overwrite clearer customer
+    # evidence.
+    if candidate_code is None and conflict is None:
+        thread_codes = find_product_codes(complete_thread)
+        if len(thread_codes) == 1:
+            candidate_code = thread_codes[0]
+            candidate_source = "current_complete_thread"
+        elif len(thread_codes) > 1:
+            conflict = "The quoted email thread contains multiple product codes"
+
+    quantity = analysis.quantity or extract_quantity_kg(current_message)
+    if quantity is None:
+        if not prior_inbound:
+            prior_inbound = list(
+                (
+                    await session.scalars(
+                        select(EmailMessage)
+                        .where(
+                            EmailMessage.case_id == case.id,
+                            EmailMessage.id != email_row.id,
+                            EmailMessage.direction == "INBOUND",
+                            EmailMessage.is_bounce.is_(False),
+                            EmailMessage.is_automated_reply.is_(False),
+                        )
+                        .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
+        for prior in prior_inbound:
+            quantity = extract_quantity_kg(f"{prior.subject}\n{prior.body_text}")
+            if quantity is not None:
+                break
+
+    missing_fields = list(analysis.missing_fields)
+    if quantity is not None:
+        missing_fields = [item for item in missing_fields if item != "quantity"]
+    updates: dict[str, Any] = {
+        "quantity": quantity,
+        "numeric_confidence": 1.0 if quantity is not None else analysis.numeric_confidence,
+        "missing_fields": missing_fields,
+    }
+    if conflict is not None:
+        return analysis.model_copy(update=updates), conflict
+    if candidate_code is None:
+        return analysis.model_copy(update=updates), None
+
+    product = await session.scalar(
+        select(Product).where(
+            Product.code == candidate_code,
+            Product.active.is_(True),
+        )
+    )
+    if product is None:
+        return (
+            analysis.model_copy(update=updates),
+            f"Referenced product {candidate_code} is not active in the catalog",
+        )
+    if case.category_id is not None and product.category_id != case.category_id:
+        return (
+            analysis.model_copy(update=updates),
+            f"Referenced product {candidate_code} conflicts with the case product category",
+        )
+
+    case.product_id = product.id
+    case.product = product
+    if case.category_id is None:
+        case.category_id = product.category_id
+    if case.stage == CaseStage.FOLLOW_UP:
+        case.stage = CaseStage.QUOTING
+    updates.update(
+        {
+            "product_code": product.code,
+            "product_confidence": 1.0,
+            "missing_fields": [
+                item for item in missing_fields if item != "product_code"
+            ],
+        }
+    )
+    await audit(
+        session,
+        "case.product_inferred_from_thread",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "product_id": product.id,
+            "product_code": product.code,
+            "source": candidate_source,
+            "recovered_quantity": quantity,
+        },
+    )
+    return analysis.model_copy(update=updates), None
+
+
+async def _maybe_send_quote_clarification(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+) -> bool:
+    """Ask once for a missing product instead of immediately handing off."""
+    if analysis.intent != Intent.QUOTE_REQUEST or case.product_id is not None:
+        return False
+
+    previous_clarification = await session.scalar(
+        select(Outbox.id).where(
+            Outbox.case_id == case.id,
+            Outbox.message_kind == "QUOTE_CLARIFICATION",
+            Outbox.status != DeliveryStatus.CANCELLED,
+        )
+    )
+    if previous_clarification is not None:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.HUMAN_CONTROL,
+            summary="Product is still unclear after one automated clarification",
+            facts={
+                **analysis_facts,
+                "product_pending": True,
+                "previous_clarification_outbox_id": previous_clarification,
+            },
+            source_email_id=email_row.id,
+        )
+        return True
+
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            product_confidence=1.0,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            product_known=True,
+            prebook_requested=analysis.prebook_requested,
+            packaging_requested=analysis.packaging_requested,
+            delivery_requested=analysis.shipping_requested,
+        ),
+        intent_threshold=get_settings().intent_confidence_threshold,
+        product_threshold=get_settings().product_confidence_threshold,
+        numeric_threshold=get_settings().numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await create_handoff(
+            session,
+            case=case,
+            reason=send_decision.reason or HandoffReason.HUMAN_CONTROL,
+            summary="Product clarification requires human review",
+            facts={**analysis_facts, "product_pending": True},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    bundle = load_content(get_settings().content_dir)
+    greeting = f"Dear {case.contact.name.strip() or 'Customer'},"
+    if analysis.quantity is not None:
+        opening = f"Thank you for your quotation request for {analysis.quantity} kg."
+        question = (
+            "Could you please confirm the product name or Lanya product code "
+            "for this requirement?"
+        )
+    else:
+        opening = "Thank you for your quotation request."
+        question = (
+            "Could you please confirm the product name or Lanya product code, "
+            "together with the required quantity?"
+        )
+    closing = "Once confirmed, we will check the current availability and price."
+    business_lines = [greeting, "", opening, "", question, closing]
+    text = "\n".join([*business_lines, "", bundle.signature_text.strip()])
+    html_body = (
+        "<p>"
+        + "</p><p>".join(
+            html.escape(line) if line else "&nbsp;" for line in business_lines
+        )
+        + "</p>"
+        + bundle.signature_html
+    )
+    try:
+        source = _reply_source(email_row)
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=email_row.from_address,
+            source_body=source.body_text,
+            source_html=source.body_html,
+            occurred_at=email_row.received_at,
+        )
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Product clarification rendering failed: {type(exc).__name__}",
+            facts={**analysis_facts, "product_pending": True},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    outbox = await freeze_outbox(
+        session,
+        case=case,
+        message_kind="QUOTE_CLARIFICATION",
+        subject=f"Re: {email_row.subject}",
+        text_body=text,
+        html_body=html_body,
+        business_key=f"inbound-reply:{email_row.id}:clarification",
+        in_reply_to=email_row.message_id,
+        references=_reply_references(email_row),
+        inline_images=source.inline_images,
+    )
+    if outbox is not None:
+        await audit(
+            session,
+            "inbound.quote_clarification_queued",
+            case_id=case.id,
+            actor="system",
+            data={
+                "email_id": email_row.id,
+                "outbox_id": outbox.id,
+                "requested_quantity": analysis.quantity,
+            },
+        )
+    return True
+
+
 async def _maybe_send_product_list(
     session: AsyncSession,
     *,
@@ -3419,7 +3723,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         select(Outbox.id).where(
             or_(
                 Outbox.business_key == reply_key,
-                Outbox.business_key.like(f"{reply_key}:quote:%"),
+                Outbox.business_key.like(f"{reply_key}:%"),
             ),
             Outbox.status != DeliveryStatus.CANCELLED,
         )
@@ -3481,12 +3785,43 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
+    if case.product_id is None and analysis.intent == Intent.QUOTE_REQUEST:
+        analysis, context_conflict = await _augment_pending_quote_context(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=analysis,
+        )
+        analysis_facts = analysis.model_dump(mode="json")
+        if context_conflict is not None:
+            await create_handoff(
+                session,
+                case=case,
+                reason=HandoffReason.NONSTANDARD,
+                summary=context_conflict,
+                facts={
+                    **analysis_facts,
+                    "product_pending": True,
+                    "context_conflict": context_conflict,
+                },
+                source_email_id=email_row.id,
+            )
+            return
     if case.product_id is None or case.product is None:
         if (
             case.category_id is not None
             and analysis.intent == Intent.PRODUCT_LIST_REQUEST
         ):
             if await _maybe_send_product_list(
+                session,
+                case=case,
+                email_row=email_row,
+                analysis=analysis,
+                analysis_facts=analysis_facts,
+            ):
+                return
+        if analysis.intent == Intent.QUOTE_REQUEST:
+            if await _maybe_send_quote_clarification(
                 session,
                 case=case,
                 email_row=email_row,
