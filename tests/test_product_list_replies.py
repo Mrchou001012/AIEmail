@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db import (
     CaseStatus,
@@ -405,6 +406,190 @@ async def test_product_list_backfill_previews_then_queues_old_open_handoff(
     await db_session.refresh(case)
     assert handoff.status == "RESOLVED"
     assert case.status == CaseStatus.ACTIVE
+
+
+async def test_product_list_backfill_creates_case_after_interest_is_mapped(
+    db_session: AsyncSession,
+) -> None:
+    customer_id, _ = await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product catalog",
+            "Please send your product list.",
+            message_id="backfill-new-category-case@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None and handoff.case_id is None
+
+    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+
+    customer = await db_session.get(Customer, customer_id)
+    assert customer is not None
+    names = await category_names_by_key(db_session)
+    merge_customer_interests(
+        customer,
+        [
+            interest_entry(
+                category_key="industrial_silanes",
+                category_name=names["industrial_silanes"],
+                source="test-backfill",
+                value="industrial_silanes",
+            )
+        ],
+    )
+    await db_session.commit()
+
+    result = await backfill_product_list_requests(
+        db_session,
+        apply=True,
+        handoff_ids=(handoff.id,),
+    )
+    assert result["queued_count"] == 1
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    case = await db_session.get(SalesCase, outbox.case_id)
+    assert case is not None
+    assert case.category_id is not None
+    assert case.product_id is None
+    await db_session.refresh(handoff)
+    assert handoff.case_id == case.id
+    assert handoff.status == "RESOLVED"
+
+
+async def test_product_list_backfill_maps_specific_product_in_selected_category(
+    db_session: AsyncSession,
+) -> None:
+    customer_id, _ = await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product catalog",
+            "Please send your product list for ACAC.",
+            message_id="backfill-specific-product@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+
+    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+
+    customer = await db_session.get(Customer, customer_id)
+    assert customer is not None
+    names = await category_names_by_key(db_session)
+    merge_customer_interests(
+        customer,
+        [
+            interest_entry(
+                category_key="pharmaceutical",
+                category_name=names["pharmaceutical"],
+                source="test-backfill",
+                value="Acetyl Acetone",
+            )
+        ],
+    )
+    await db_session.commit()
+
+    preview = await backfill_product_list_requests(
+        db_session,
+        apply=False,
+        handoff_ids=(handoff.id,),
+    )
+    assert preview["candidate_count"] == 1
+    assert preview["candidates"][0]["detected_product_code"] == "ACAC"
+    assert preview["candidates"][0]["matched_product_id"] is not None
+
+    result = await backfill_product_list_requests(
+        db_session,
+        apply=True,
+        handoff_ids=(handoff.id,),
+    )
+    assert result["queued_count"] == 1
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    case = await db_session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.product))
+        .where(SalesCase.id == outbox.case_id)
+    )
+    assert case is not None and case.product is not None
+    assert case.product.code == "ACAC"
+
+
+async def test_product_list_backfill_preflight_failure_does_not_create_case(
+    db_session: AsyncSession,
+) -> None:
+    customer_id, _ = await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product catalog",
+            "Please send your product list.",
+            message_id="backfill-missing-mime@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None and handoff.case_id is None
+
+    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+
+    customer = await db_session.get(Customer, customer_id)
+    assert customer is not None
+    names = await category_names_by_key(db_session)
+    merge_customer_interests(
+        customer,
+        [
+            interest_entry(
+                category_key="industrial_silanes",
+                category_name=names["industrial_silanes"],
+                source="test-backfill",
+                value="industrial_silanes",
+            )
+        ],
+    )
+    email_row.body_html = '<p>Please send your product list.</p><img src="cid:missing-logo">'
+    archive_path = (
+        get_settings().runtime_dir
+        / "inbound_archive"
+        / f"{email_row.raw_sha256}.eml"
+    )
+    archive_path.unlink()
+    await db_session.commit()
+
+    preview = await backfill_product_list_requests(
+        db_session,
+        apply=False,
+        handoff_ids=(handoff.id,),
+    )
+    assert preview["candidate_count"] == 0
+    assert preview["exclusion_counts"] == {"REPLY_SOURCE_OR_RENDER_UNAVAILABLE": 1}
+
+    result = await backfill_product_list_requests(
+        db_session,
+        apply=True,
+        handoff_ids=(handoff.id,),
+    )
+    assert result["candidate_count"] == 0
+    assert result["queued_count"] == 0
+    assert await _queued_product_list(db_session) is None
+    await db_session.refresh(email_row)
+    await db_session.refresh(handoff)
+    assert email_row.case_id is None
+    assert handoff.case_id is None
+    assert handoff.status == "OPEN"
 
 
 async def test_product_list_backfill_excludes_non_unique_excel_interests(

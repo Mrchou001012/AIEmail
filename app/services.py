@@ -3751,10 +3751,12 @@ async def backfill_product_list_requests(
     )
     categories_by_id = {category.id: category for category in active_categories}
     categories_by_key = {category.key: category for category in active_categories}
+    settings = get_settings()
     cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
     candidates: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
     queued: list[dict[str, Any]] = []
+    prepared_replies: dict[int, dict[str, Any]] = {}
 
     def exclude(handoff: Handoff, reason: str, **details: Any) -> None:
         exclusions.append(
@@ -3878,9 +3880,18 @@ async def backfill_product_list_requests(
         existing_product_list = await session.scalar(
             select(Outbox).where(
                 Outbox.business_key == f"inbound-product-list:{source.id}",
-                Outbox.status != DeliveryStatus.CANCELLED,
             )
         )
+        if (
+            existing_product_list is not None
+            and existing_product_list.status == DeliveryStatus.CANCELLED
+        ):
+            exclude(
+                handoff,
+                "PREVIOUS_PRODUCT_LIST_CANCELLED",
+                outbox_id=existing_product_list.id,
+            )
+            continue
         approved_reply = await session.scalar(
             select(Outbox.id).where(Outbox.approval_handoff_id == handoff.id)
         )
@@ -3931,6 +3942,161 @@ async def backfill_product_list_requests(
                 )
                 continue
 
+        analysis = stub_analyze(
+            source.subject,
+            source.body_text,
+            source.attachment_metadata,
+        ).model_copy(update={"risky_attachment": False})
+        matched_product = None
+        if existing_product_list is None:
+            if analysis.intent != Intent.PRODUCT_LIST_REQUEST:
+                exclude(
+                    handoff,
+                    "UNSAFE_PRODUCT_LIST_INTENT",
+                    detected_intent=analysis.intent.value,
+                )
+                continue
+            if analysis.product_code is not None:
+                canonical_code = canonical_product_code(analysis.product_code)
+                matched_product = await session.scalar(
+                    select(Product).where(
+                        Product.code == canonical_code,
+                        Product.active.is_(True),
+                    )
+                )
+                if matched_product is None:
+                    exclude(
+                        handoff,
+                        "SPECIFIC_PRODUCT_NOT_ACTIVE",
+                        detected_product_code=canonical_code,
+                    )
+                    continue
+                if matched_product.category_id != category.id:
+                    exclude(
+                        handoff,
+                        "SPECIFIC_PRODUCT_CATEGORY_MISMATCH",
+                        detected_product_code=matched_product.code,
+                        product_category_id=matched_product.category_id,
+                        selected_category_id=category.id,
+                    )
+                    continue
+                if (
+                    sales_case is not None
+                    and sales_case.product is not None
+                    and not product_codes_match(
+                        matched_product.code,
+                        sales_case.product.code,
+                    )
+                ):
+                    exclude(
+                        handoff,
+                        "CASE_PRODUCT_MISMATCH",
+                        detected_product_code=matched_product.code,
+                        case_product_code=sales_case.product.code,
+                    )
+                    continue
+
+            planned_status = (
+                CaseStatus.ACTIVE
+                if sales_case is None or sales_case.status == CaseStatus.WAITING_HUMAN
+                else sales_case.status
+            )
+            send_decision = evaluate_send_policy(
+                SendContext(
+                    intent=analysis.intent,
+                    stage=(
+                        sales_case.stage
+                        if sales_case is not None
+                        else CaseStage.QUOTING
+                    ),
+                    status=planned_status,
+                    intent_confidence=analysis.intent_confidence,
+                    product_confidence=1.0,
+                    numeric_confidence=1.0,
+                    auto_send_allowed=customer.auto_send_allowed,
+                    contact_suppressed=contact.suppressed,
+                    do_not_contact=customer.do_not_contact,
+                    has_risky_attachment=analysis.risky_attachment,
+                    product_known=(
+                        analysis.product_code is None
+                        or matched_product is not None
+                    ),
+                    prebook_requested=analysis.prebook_requested,
+                    packaging_requested=analysis.packaging_requested,
+                    delivery_requested=analysis.shipping_requested,
+                ),
+                intent_threshold=settings.intent_confidence_threshold,
+                product_threshold=settings.product_confidence_threshold,
+                numeric_threshold=settings.numeric_confidence_threshold,
+            )
+            if not send_decision.allow_send:
+                exclude(
+                    handoff,
+                    "SEND_POLICY_BLOCKED",
+                    policy_reason=(
+                        send_decision.reason.value
+                        if send_decision.reason is not None
+                        else None
+                    ),
+                )
+                continue
+
+            products = list(
+                (
+                    await session.scalars(
+                        select(Product)
+                        .where(
+                            Product.category_id == category.id,
+                            Product.active.is_(True),
+                        )
+                        .order_by(Product.sort_order, Product.id)
+                    )
+                ).all()
+            )
+            if not products:
+                exclude(handoff, "CATEGORY_HAS_NO_ACTIVE_PRODUCTS")
+                continue
+            try:
+                bundle = load_content(settings.content_dir)
+                text_body, html_body = render_product_list_email(
+                    contact_name=contact.name,
+                    category=category,
+                    products=products,
+                    subject=source.subject,
+                    signature_text=bundle.signature_text,
+                    signature_html=bundle.signature_html,
+                )
+                reply_source = _reply_source(source)
+                text_body, html_body = append_quoted_reply(
+                    text_body,
+                    html_body,
+                    from_address=source.from_address,
+                    source_body=reply_source.body_text,
+                    source_html=reply_source.body_html,
+                    occurred_at=source.received_at,
+                )
+            except Exception as exc:
+                exclude(
+                    handoff,
+                    "REPLY_SOURCE_OR_RENDER_UNAVAILABLE",
+                    error_type=type(exc).__name__,
+                    detail=str(exc)[:500],
+                )
+                continue
+            prepared_replies[handoff.id] = {
+                "analysis": analysis,
+                "matched_product": matched_product,
+                "subject": (
+                    f"Re: {source.subject}"
+                    if source.subject.strip()
+                    else f"Our {category.name} product list"
+                ),
+                "text_body": text_body,
+                "html_body": html_body,
+                "inline_images": reply_source.inline_images,
+                "product_count": len(products),
+            }
+
         candidate = {
             "handoff_id": handoff.id,
             "email_id": source.id,
@@ -3942,6 +4108,11 @@ async def backfill_product_list_requests(
             "received_at": source.received_at.isoformat(),
             "category_id": category.id,
             "category_key": category.key,
+            "detected_intent": analysis.intent.value,
+            "detected_product_code": analysis.product_code,
+            "matched_product_id": (
+                matched_product.id if matched_product is not None else None
+            ),
             "existing_outbox_id": (
                 existing_product_list.id if existing_product_list is not None else None
             ),
@@ -3951,58 +4122,67 @@ async def backfill_product_list_requests(
             continue
 
         if existing_product_list is None:
+            prepared = prepared_replies[handoff.id]
+            matched_product = prepared["matched_product"]
             if sales_case is None:
                 sales_case = SalesCase(
                     customer_id=customer.id,
                     contact_id=contact.id,
-                    product_id=None,
+                    product_id=(
+                        matched_product.id if matched_product is not None else None
+                    ),
                     category_id=category.id,
                     currency="INR",
                     stage=CaseStage.QUOTING,
                     status=CaseStatus.ACTIVE,
                     subject_key=normalized_subject(source.subject)[:255],
+                    customer=customer,
+                    contact=contact,
+                    product=matched_product,
+                    category=category,
                 )
                 session.add(sales_case)
                 await session.flush()
             else:
                 sales_case.category_id = category.id
                 sales_case.category = category
+                if sales_case.product is None and matched_product is not None:
+                    sales_case.product_id = matched_product.id
+                    sales_case.product = matched_product
                 if sales_case.status == CaseStatus.WAITING_HUMAN:
                     sales_case.status = CaseStatus.ACTIVE
             source.case_id = sales_case.id
             source.customer_id = customer.id
             source.contact_id = contact.id
             handoff.case_id = sales_case.id
-            analysis = stub_analyze(
-                source.subject,
-                source.body_text,
-                source.attachment_metadata,
-            ).model_copy(update={"risky_attachment": False})
-            handled = await _maybe_send_product_list(
+            existing_product_list = await freeze_outbox(
                 session,
                 case=sales_case,
-                email_row=source,
-                analysis=analysis,
-                analysis_facts={
-                    **analysis.model_dump(mode="json"),
-                    "backfill": True,
-                    "source_handoff_id": handoff.id,
-                },
-            )
-            if not handled:
-                raise RuntimeError(
-                    f"product-list backfill did not handle handoff {handoff.id}"
-                )
-            existing_product_list = await session.scalar(
-                select(Outbox).where(
-                    Outbox.business_key == f"inbound-product-list:{source.id}",
-                    Outbox.status != DeliveryStatus.CANCELLED,
-                )
+                message_kind="PRODUCT_LIST",
+                subject=prepared["subject"],
+                text_body=prepared["text_body"],
+                html_body=prepared["html_body"],
+                business_key=f"inbound-product-list:{source.id}",
+                in_reply_to=source.message_id,
+                references=_reply_references(source),
+                inline_images=prepared["inline_images"],
             )
             if existing_product_list is None:
-                raise RuntimeError(
-                    f"product-list backfill created no outbox for handoff {handoff.id}"
+                existing_product_list = await session.scalar(
+                    select(Outbox).where(
+                        Outbox.business_key == f"inbound-product-list:{source.id}",
+                        Outbox.status != DeliveryStatus.CANCELLED,
+                    )
                 )
+            if existing_product_list is None:
+                exclusions.append(
+                    {
+                        "handoff_id": candidate["handoff_id"],
+                        "email_id": candidate["email_id"],
+                        "reason": "OUTBOX_IDEMPOTENCY_CONFLICT",
+                    }
+                )
+                continue
 
         if sales_case is not None and sales_case.status == CaseStatus.WAITING_HUMAN:
             sales_case.status = CaseStatus.ACTIVE
