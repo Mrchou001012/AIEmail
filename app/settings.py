@@ -20,6 +20,19 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
     rag_min_similarity: float = 0.25
 
+    # Optional, bounded web research used only when a known customer explicitly
+    # requests a product list and neither CRM nor imported Excel data identifies
+    # one catalog category.  Research and autonomous use are separate switches
+    # so production can run in observation mode first.
+    company_research_enabled: bool = False
+    company_research_auto_send_enabled: bool = False
+    company_research_cache_days: int = 90
+    company_research_max_searches: int = 2
+    company_research_min_sources: int = 2
+    company_research_min_identity_confidence: float = 0.90
+    company_research_min_category_confidence: float = 0.85
+    company_research_min_score_gap: float = 0.15
+
     mail_transport: Literal["file", "smtp"] = "file"
     mail_from: str = "sales-agent@example.com"
     gmail_address: str | None = None
@@ -131,6 +144,31 @@ class Settings(BaseSettings):
             raise ValueError("RAG_MIN_SIMILARITY must be between -1 and 1")
         return value
 
+    @field_validator(
+        "company_research_min_identity_confidence",
+        "company_research_min_category_confidence",
+        "company_research_min_score_gap",
+    )
+    @classmethod
+    def valid_company_research_confidence(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("company research confidence thresholds must be between 0 and 1")
+        return value
+
+    @field_validator("company_research_max_searches")
+    @classmethod
+    def valid_company_research_max_searches(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("COMPANY_RESEARCH_MAX_SEARCHES must be between 1 and 5")
+        return value
+
+    @field_validator("company_research_min_sources")
+    @classmethod
+    def valid_company_research_min_sources(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("COMPANY_RESEARCH_MIN_SOURCES must be between 1 and 5")
+        return value
+
     @field_validator("business_timezone")
     @classmethod
     def valid_business_timezone(cls, value: str) -> str:
@@ -187,6 +225,7 @@ class Settings(BaseSettings):
         "reactivation_max_sends_per_day",
         "reactivation_default_inactive_days",
         "reactivation_default_second_days",
+        "company_research_cache_days",
     )
     @classmethod
     def positive_limit(cls, value: int) -> int:

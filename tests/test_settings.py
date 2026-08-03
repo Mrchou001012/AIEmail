@@ -15,3 +15,12 @@ def test_imap_batch_size_is_configurable(monkeypatch) -> None:
     settings = Settings(_env_file=None)
 
     assert settings.imap_batch_size == 250
+
+
+def test_company_research_defaults_to_disabled_observation_mode() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.company_research_enabled is False
+    assert settings.company_research_auto_send_enabled is False
+    assert settings.company_research_cache_days == 90
+    assert settings.company_research_max_searches == 2

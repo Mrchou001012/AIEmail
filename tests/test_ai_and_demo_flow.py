@@ -8,6 +8,8 @@ import pytest
 
 from app.ai import (
     AIClient,
+    CompanyCategoryDecision,
+    CompanyResearchSource,
     EmailDraftPreview,
     InboundAnalysis,
     _anthropic_inference_options,
@@ -15,6 +17,7 @@ from app.ai import (
     _complete_json_string_field,
     _normalize_quantity_revision,
     explicit_product_list_requested,
+    extract_company_research_evidence,
     extract_quantity_kg,
     render_draft_preview,
     stub_analyze,
@@ -24,7 +27,7 @@ from app.ai import (
 from app.domain import Intent, PricingPolicy, counteroffer
 from app.imports import load_content
 from app.mail import build_message, parse_mime
-from app.services import render_quote
+from app.services import _company_research_gate, render_quote
 from app.settings import Settings
 
 
@@ -51,6 +54,207 @@ def test_anthropic_inference_options_enable_supported_adaptive_thinking() -> Non
 def test_inbound_analysis_schema_has_no_optional_properties() -> None:
     schema = InboundAnalysis.model_json_schema()
     assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_company_category_schema_has_no_optional_properties() -> None:
+    schema = CompanyCategoryDecision.model_json_schema()
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_company_research_extracts_only_cited_sources() -> None:
+    text, sources, errors = extract_company_research_evidence(
+        [
+            {
+                "type": "text",
+                "text": "The exact company distributes specialty chemicals.",
+                "citations": [
+                    {
+                        "type": "web_search_result_location",
+                        "url": "https://example.com/company",
+                        "title": "Company profile",
+                        "cited_text": "Specialty chemical distributor",
+                    }
+                ],
+            },
+            {
+                "type": "web_search_tool_result",
+                "content": {
+                    "type": "web_search_tool_result_error",
+                    "error_code": "max_uses_exceeded",
+                },
+            },
+        ]
+    )
+
+    assert "specialty chemicals" in text
+    assert [source.url for source in sources] == ["https://example.com/company"]
+    assert errors == ["max_uses_exceeded"]
+
+
+def test_company_research_gate_requires_confidence_gap_and_sources() -> None:
+    settings = Settings(
+        _env_file=None,
+        company_research_min_sources=2,
+        company_research_min_identity_confidence=0.9,
+        company_research_min_category_confidence=0.85,
+        company_research_min_score_gap=0.15,
+    )
+    decision = CompanyCategoryDecision(
+        identity_confidence=0.97,
+        recommended_category_key="industrial_silanes",
+        category_confidence=0.93,
+        runner_up_category_key="rubber_plastics",
+        runner_up_confidence=0.4,
+        conflicting_evidence=False,
+        rationale="Two independent sources identify a silane distributor.",
+    )
+    sources = [
+        CompanyResearchSource(url="https://one.example/profile"),
+        CompanyResearchSource(url="https://two.example/company"),
+    ]
+
+    gate = _company_research_gate(
+        decision,
+        sources,
+        company_domain=None,
+        active_category_keys={"industrial_silanes", "rubber_plastics"},
+        settings=settings,
+    )
+
+    assert gate["eligible"] is True
+    assert gate["reasons"] == []
+
+
+def test_company_research_gate_rejects_ambiguous_company() -> None:
+    settings = Settings(_env_file=None)
+    decision = CompanyCategoryDecision(
+        identity_confidence=0.65,
+        recommended_category_key="pharmaceutical",
+        category_confidence=0.86,
+        runner_up_category_key="industrial_silanes",
+        runner_up_confidence=0.78,
+        conflicting_evidence=True,
+        rationale="Search results may describe similarly named companies.",
+    )
+
+    gate = _company_research_gate(
+        decision,
+        [CompanyResearchSource(url="https://directory.example/company")],
+        company_domain=None,
+        active_category_keys={"pharmaceutical", "industrial_silanes"},
+        settings=settings,
+    )
+
+    assert gate["eligible"] is False
+    assert "LOW_IDENTITY_CONFIDENCE" in gate["reasons"]
+    assert "CATEGORY_SCORE_GAP_TOO_SMALL" in gate["reasons"]
+    assert "CONFLICTING_EVIDENCE" in gate["reasons"]
+
+
+def test_company_research_continues_paused_server_tool_turn() -> None:
+    paused_content = [
+        {
+            "type": "text",
+            "text": "The exact company distributes specialty chemicals.",
+            "citations": [
+                {
+                    "type": "web_search_result_location",
+                    "url": "https://company.example/about",
+                    "title": "Company profile",
+                    "cited_text": "Specialty chemical distributor",
+                }
+            ],
+        }
+    ]
+    completed_content = [
+        {
+            "type": "text",
+            "text": "A trade directory independently lists its silane business.",
+            "citations": [
+                {
+                    "type": "web_search_result_location",
+                    "url": "https://directory.example/company",
+                    "title": "Trade directory",
+                    "cited_text": "Silane supplier",
+                }
+            ],
+        }
+    ]
+    responses = [
+        SimpleNamespace(
+            stop_reason="pause_turn",
+            content=paused_content,
+            model="claude-test",
+            _request_id="req_search_1",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=2),
+        ),
+        SimpleNamespace(
+            stop_reason="end_turn",
+            content=completed_content,
+            model="claude-test",
+            _request_id="req_search_2",
+            usage=SimpleNamespace(input_tokens=15, output_tokens=3),
+        ),
+    ]
+    decision = CompanyCategoryDecision(
+        identity_confidence=0.98,
+        recommended_category_key="industrial_silanes",
+        category_confidence=0.94,
+        runner_up_category_key=None,
+        runner_up_confidence=0,
+        conflicting_evidence=False,
+        rationale="Two sources identify the same specialty chemical supplier.",
+    )
+
+    class FakeMessages:
+        def __init__(self) -> None:
+            self.create_calls: list[dict[str, object]] = []
+
+        async def create(self, **kwargs):
+            self.create_calls.append(kwargs)
+            return responses[len(self.create_calls) - 1]
+
+        async def parse(self, **kwargs):
+            return SimpleNamespace(
+                stop_reason="end_turn",
+                parsed_output=decision,
+                model="claude-test",
+                _request_id="req_classify",
+                usage=SimpleNamespace(input_tokens=5, output_tokens=1),
+            )
+
+    messages = FakeMessages()
+    ai = AIClient(Settings(_env_file=None, ai_provider="stub"))
+    ai._client = SimpleNamespace(messages=messages)
+
+    result, sources, metadata = asyncio.run(
+        ai.research_company_category(
+            company_name="Example Chemicals",
+            company_domain="company.example",
+            categories=[
+                {
+                    "key": "industrial_silanes",
+                    "name": "Industrial silanes",
+                    "examples": ["YAC-TEOS40"],
+                }
+            ],
+        )
+    )
+
+    assert result == decision
+    assert len(messages.create_calls) == 2
+    assert messages.create_calls[1]["messages"][-1] == {
+        "role": "assistant",
+        "content": paused_content,
+    }
+    assert [source.url for source in sources] == [
+        "https://company.example/about",
+        "https://directory.example/company",
+    ]
+    assert metadata["search_request_ids"] == ["req_search_1", "req_search_2"]
+    assert metadata["search_continuations"] == 1
+    assert metadata["input_tokens"] == 30
+    assert metadata["output_tokens"] == 6
 
 
 def test_stub_detects_prompt_injection_as_customer_data() -> None:
