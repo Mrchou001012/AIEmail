@@ -264,6 +264,8 @@ def _anthropic_inference_options(model: str) -> dict[str, Any]:
 
 def _intent_from_text(text: str) -> Intent:
     lowered = text.lower()
+    if explicit_product_list_requested(text):
+        return Intent.PRODUCT_LIST_REQUEST
     patterns = [
         (Intent.UNSUBSCRIBE, ("unsubscribe", "remove me", "do not contact")),
         (Intent.COMPLAINT, ("complaint", "defect", "damaged", "quality issue", "refund")),
@@ -321,11 +323,37 @@ PRODUCT_LIST_MARKERS = (
     "product portfolio",
 )
 
+PRODUCT_LIST_FILE_REQUEST_PATTERN = re.compile(
+    r"\b(?:send|share|provide|forward|email)\b.{0,120}"
+    r"\b(?:your\s+)?products?\b.{0,120}"
+    r"\b(?:cas(?:\s*(?:no\.?|number|#))?|excel|spreadsheet|csv)\b",
+    re.I | re.S,
+)
+
 
 def explicit_product_list_requested(text: str) -> bool:
     """Return whether the customer explicitly asked to see a product catalog."""
     lowered = (text or "").casefold()
-    return any(marker in lowered for marker in PRODUCT_LIST_MARKERS)
+    return any(marker in lowered for marker in PRODUCT_LIST_MARKERS) or bool(
+        PRODUCT_LIST_FILE_REQUEST_PATTERN.search(text or "")
+    )
+
+
+def requested_product_list_file_format(text: str) -> str | None:
+    """Return the explicitly requested catalog file format, if any.
+
+    A file is generated only for an unambiguous product-list request. Merely
+    mentioning Excel, CSV, or a CAS number in an unrelated inquiry is not
+    enough to create an attachment.
+    """
+    if not explicit_product_list_requested(text):
+        return None
+    lowered = (text or "").casefold()
+    if re.search(r"\b(?:csv|comma[-\s]?separated)\b", lowered):
+        return "csv"
+    if re.search(r"\b(?:excel|spreadsheet|xlsx)\b", lowered):
+        return "xlsx"
+    return None
 
 
 def _normalize_quantity_revision(
@@ -391,6 +419,12 @@ def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> 
             "BROCHURE",
             "RANGE",
             "PORTFOLIO",
+            "DATA",
+            "DETAIL",
+            "DETAILS",
+            "INFORMATION",
+            "INFO",
+            "SHEET",
         }:
             product_code = canonical_product_code(candidate)
     quantity = extract_quantity_kg(text)

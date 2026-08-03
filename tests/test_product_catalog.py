@@ -1,8 +1,12 @@
+from io import BytesIO
+
 import pytest
+from openpyxl import load_workbook
 
 from app.ai import stub_analyze
 from app.db import Customer, Product, ProductCategory
 from app.product_catalog import (
+    build_product_list_attachment,
     classify_category_interests,
     customer_interest_keys,
     load_catalog_yaml,
@@ -186,6 +190,72 @@ def test_product_list_email_rejects_money_and_commitments() -> None:
         validate_product_list_email("The price is USD 12.50 per kg.")
     with pytest.raises(ValueError, match="commitment"):
         validate_product_list_email("We guarantee delivery.")
+
+
+def test_product_list_workbook_uses_only_curated_values_and_keeps_missing_cas_blank() -> None:
+    category = ProductCategory(key="pharmaceutical", name="Pharmaceuticals")
+    products = [
+        Product(
+            code="ACAC",
+            name="ACETYL ACETONE",
+            cas_no=None,
+            content="99%",
+            series="Pharmaceutical Intermediates",
+            sort_order=1,
+            id=1,
+        ),
+        Product(
+            code="YAC-N113",
+            name="METHYLTRIMETHOXYSILANE",
+            cas_no="1185-55-3",
+            content="99%",
+            series="Alkyl Silane Series (N)",
+            sort_order=2,
+            id=2,
+        ),
+    ]
+
+    attachment = build_product_list_attachment(
+        category=category,
+        products=products,
+        file_format="xlsx",
+    )
+    workbook = load_workbook(BytesIO(attachment.payload), data_only=False)
+    sheet = workbook["Product List"]
+
+    assert attachment.filename == "Lanya_Chem_pharmaceutical_product_list.xlsx"
+    assert sheet["A1"].value == "No."
+    assert sheet["E1"].value == "CAS No."
+    assert sheet["C2"].value == "ACAC"
+    assert sheet["E2"].value is None
+    assert sheet["C3"].value == "YAC-N113"
+    assert sheet["E3"].value == "1185-55-3"
+
+
+def test_attached_product_list_email_requires_a_real_attachment_context() -> None:
+    category = ProductCategory(key="pharmaceutical", name="Pharmaceuticals")
+    product = Product(
+        code="ACAC",
+        name="ACETYL ACETONE",
+        cas_no=None,
+        content="99%",
+        sort_order=1,
+        id=1,
+    )
+
+    text, _ = render_product_list_email(
+        contact_name="Alice",
+        category=category,
+        products=[product],
+        subject="Product list in Excel",
+        signature_text="Best regards,\nLanya Sales Team",
+        signature_html="<p>Best regards,</p><p>Lanya Sales Team</p>",
+        attachment_filename="Lanya_Chem_pharmaceutical_product_list.xlsx",
+    )
+
+    assert "Please find attached" in text
+    with pytest.raises(ValueError, match="attachment claim"):
+        validate_product_list_email("Please find attached our product list.")
 
 
 def test_stub_analysis_classifies_category_only_inquiries_as_product_list() -> None:

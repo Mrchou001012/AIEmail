@@ -326,12 +326,40 @@ def test_extract_quantity_kg_from_trusted_thread_context(
     [
         ("Please send your product list.", True),
         ("Could you share the full product range?", True),
+        ("Please share your product with CAS# in excel sheet.", True),
         ("We are interested in industrial silanes.", False),
+        ("Please quote YAC-A110 and include the CAS number.", False),
         ("Please quote 100 kg.", False),
     ],
 )
 def test_explicit_product_list_request_markers(text: str, expected: bool) -> None:
     assert explicit_product_list_requested(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Please share your product with CAS# in excel sheet.", "xlsx"),
+        ("Please provide your product list as CSV.", "csv"),
+        ("Please send your product list.", None),
+        ("We maintain prices in Excel.", None),
+    ],
+)
+def test_requested_product_list_file_format(text: str, expected: str | None) -> None:
+    from app.ai import requested_product_list_file_format
+
+    assert requested_product_list_file_format(text) == expected
+
+
+def test_stub_does_not_treat_product_data_as_a_product_code() -> None:
+    analysis = stub_analyze(
+        "Product data request",
+        "Please share your product with CAS# in excel sheet.",
+        [],
+    )
+
+    assert analysis.intent == Intent.PRODUCT_LIST_REQUEST
+    assert analysis.product_code is None
 
 
 def test_stub_draft_preview_is_review_only_and_ignores_historical_prices() -> None:

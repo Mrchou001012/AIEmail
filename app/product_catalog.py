@@ -9,14 +9,19 @@ matching category product list without a human handoff.
 
 from __future__ import annotations
 
+import csv
 import html
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
 import yaml
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +71,13 @@ CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 INTEREST_METADATA_KEY = "interests"
+
+
+@dataclass(frozen=True)
+class ProductListAttachment:
+    filename: str
+    content_type: str
+    payload: bytes
 
 
 def classify_category_interests(text: str) -> list[str]:
@@ -338,7 +350,11 @@ def _value(value: str | None) -> str:
     return value.strip() if value and value.strip() else "-"
 
 
-def validate_product_list_email(text: str) -> None:
+def validate_product_list_email(
+    text: str,
+    *,
+    attachment_expected: bool = False,
+) -> None:
     if re.search(
         r"(?i)(?<![A-Z0-9])(?:USD|EUR|CNY|INR|Rs\.?|€|£)\s*"
         r"\d+(?:,[0-9]{3})*(?:\.\d+)?|"
@@ -351,11 +367,90 @@ def validate_product_list_email(text: str) -> None:
         "binding commitment",
         "we accept your order",
         "shipment confirmed",
-        "please find attached",
         "quotation attached",
     )
     if any(term in text.casefold() for term in forbidden):
         raise ValueError("product list email contains an unsupported commitment or attachment claim")
+    if not attachment_expected and "please find attached" in text.casefold():
+        raise ValueError("product list email contains an unsupported attachment claim")
+
+
+def _safe_file_cell(value: str | None) -> str:
+    """Keep curated catalog values literal in spreadsheet applications."""
+    clean = value.strip() if value and value.strip() else ""
+    if clean.startswith(("=", "+", "-", "@")):
+        return f"'{clean}"
+    return clean
+
+
+def _safe_catalog_filename(category: ProductCategory, suffix: str) -> str:
+    category_token = re.sub(r"[^a-zA-Z0-9_-]+", "_", category.key).strip("_")
+    category_token = category_token or "products"
+    return f"Lanya_Chem_{category_token}_product_list.{suffix}"
+
+
+def build_product_list_attachment(
+    *,
+    category: ProductCategory,
+    products: Iterable[Product],
+    file_format: str,
+) -> ProductListAttachment:
+    """Build a price-free catalog file exclusively from curated DB fields.
+
+    Missing fields, including CAS numbers, remain blank. No values are inferred
+    or completed by the AI layer.
+    """
+    rows = _product_rows(products)
+    headers = ("No.", "Series", "Code", "Product Name", "CAS No.", "Content")
+    values = [
+        (
+            index,
+            _safe_file_cell(product.series),
+            _safe_file_cell(product.code),
+            _safe_file_cell(product.name),
+            _safe_file_cell(product.cas_no),
+            _safe_file_cell(product.content),
+        )
+        for index, product in enumerate(rows, start=1)
+    ]
+    normalized_format = file_format.strip().casefold()
+    if normalized_format == "csv":
+        output = StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\r\n")
+        writer.writerow(headers)
+        writer.writerows(values)
+        return ProductListAttachment(
+            filename=_safe_catalog_filename(category, "csv"),
+            content_type="text/csv",
+            payload=output.getvalue().encode("utf-8-sig"),
+        )
+    if normalized_format != "xlsx":
+        raise ValueError(f"unsupported product-list file format: {file_format}")
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Product List"
+    sheet.append(headers)
+    for row in values:
+        sheet.append(row)
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:F{max(1, sheet.max_row)}"
+    widths = (8, 32, 22, 44, 20, 18)
+    for column, width in zip("ABCDEF", widths, strict=True):
+        sheet.column_dimensions[column].width = width
+    output = BytesIO()
+    workbook.save(output)
+    return ProductListAttachment(
+        filename=_safe_catalog_filename(category, "xlsx"),
+        content_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        payload=output.getvalue(),
+    )
 
 
 def render_product_list_email(
@@ -366,14 +461,21 @@ def render_product_list_email(
     subject: str,
     signature_text: str,
     signature_html: str,
+    attachment_filename: str | None = None,
 ) -> tuple[str, str]:
     """Render a deterministic, price-free product-list reply for one category."""
     rows = _product_rows(products)
     greeting = f"Dear {contact_name.strip() or 'Customer'},"
     opening = f"Thank you for your interest in our {category.name}."
     lead_in = (
-        "Please find below our current product list. For pricing, availability, "
-        "or samples, please reply and our team will assist you."
+        f"Please find attached our current product list ({attachment_filename}). "
+        "The same verified catalog details are also shown below. For pricing, "
+        "availability, or samples, please reply and our team will assist you."
+        if attachment_filename
+        else (
+            "Please find below our current product list. For pricing, availability, "
+            "or samples, please reply and our team will assist you."
+        )
     )
     body_lines: list[str] = [greeting, "", opening, lead_in]
     groups = _grouped_products(rows)
@@ -394,7 +496,10 @@ def render_product_list_email(
                 )
             )
     business_text = "\n".join(body_lines)
-    validate_product_list_email(business_text)
+    validate_product_list_email(
+        business_text,
+        attachment_expected=attachment_filename is not None,
+    )
     text = "\n".join([business_text, "", signature_text.strip()])
 
     html_parts = [

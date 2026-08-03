@@ -3,8 +3,10 @@ from decimal import Decimal
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
+from io import BytesIO
 
 import pytest
+from openpyxl import load_workbook
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -23,6 +25,9 @@ from app.db import (
     Product,
     ProductCategory,
     SalesCase,
+)
+from app.db import (
+    EmailMessage as DBEmailMessage,
 )
 from app.domain import HandoffReason
 from app.product_catalog import import_product_catalog
@@ -148,6 +153,81 @@ async def test_crm_interest_triggers_automatic_product_list_reply(
     assert outbox.status == DeliveryStatus.SENT
     outbox_dir = get_settings().runtime_dir / "demo_outbox"
     assert any(outbox_dir.glob("*.eml"))
+
+
+async def test_excel_cas_request_attaches_verified_catalog_workbook(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["pharmaceutical"])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product data request",
+            "Please share your product with CAS# in excel sheet.",
+            message_id="excel-cas-list@example.com",
+        ),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await _queued_product_list(db_session)
+    if outbox is None:
+        invocation = await db_session.scalar(
+            select(AIInvocation)
+            .where(AIInvocation.case_id == email_row.case_id)
+            .order_by(AIInvocation.id.desc())
+        )
+        handoffs = (
+            (
+                await db_session.execute(
+                    select(Handoff).where(Handoff.case_id == email_row.case_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pytest.fail(
+            "catalog workbook was not queued: "
+            f"analysis={invocation.parsed_output if invocation else None}; "
+            f"handoffs={[(item.reason_code, item.summary) for item in handoffs]}"
+        )
+    assert outbox.business_key == f"inbound-product-list:{email_row.id}"
+    mime = BytesParser(policy=policy.default).parsebytes(
+        outbox.raw_message.encode("utf-8")
+    )
+    attachments = [
+        part
+        for part in mime.walk()
+        if part.get_content_disposition() == "attachment"
+    ]
+    assert len(attachments) == 1
+    attachment = attachments[0]
+    assert attachment.get_filename() == (
+        "Lanya_Chem_pharmaceutical_product_list.xlsx"
+    )
+    workbook = load_workbook(
+        BytesIO(attachment.get_payload(decode=True)),
+        data_only=False,
+    )
+    sheet = workbook["Product List"]
+    acac_row = next(
+        row
+        for row in sheet.iter_rows(min_row=2, values_only=True)
+        if row[2] == "ACAC"
+    )
+    assert acac_row[4] is None
+    outbound_email = await db_session.scalar(
+        select(DBEmailMessage).where(
+            DBEmailMessage.direction == "OUTBOUND",
+            DBEmailMessage.message_id == outbox.message_id,
+        )
+    )
+    assert outbound_email is not None
+    assert outbound_email.attachment_metadata[0]["filename"] == (
+        "Lanya_Chem_pharmaceutical_product_list.xlsx"
+    )
 
 
 async def test_generic_category_interest_email_auto_replies(

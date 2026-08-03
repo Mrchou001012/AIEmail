@@ -1006,6 +1006,171 @@ async def test_reply_to_case_less_reactivation_can_create_product_case(
     assert await db_session.scalar(select(func.count()).select_from(SalesCase)) == 1
 
 
+async def _seed_changed_sender_reactivation(
+    db_session: AsyncSession,
+    *,
+    original_email: str,
+    token: str,
+) -> tuple[dict[str, int], Outbox, ReactivationRecipient, Contact]:
+    ids = await seed_demo_data(db_session)
+    original_contact = await db_session.get(Contact, ids["contact_id"])
+    assert original_contact is not None
+    original_contact.email = original_email
+    sent_at = datetime.now(UTC) - timedelta(minutes=5)
+    parent = Outbox(
+        case_id=None,
+        quote_id=None,
+        message_kind="REACTIVATION",
+        business_key=f"reactivation:test:{token}",
+        message_id=f"<case-less-{token}@example.com>",
+        recipient=original_email,
+        raw_message=(
+            f"From: sales-agent@example.com\nTo: {original_email}\n\nChecking in"
+        ),
+        status=DeliveryStatus.SENT,
+        sent_at=sent_at,
+        sent_via="smtp",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    campaign = ReactivationCampaign(
+        name=f"Changed sender {token}",
+        status="RUNNING",
+        subject_template="Checking in",
+        body_template="Hello",
+        start_date=date.today(),
+        created_by="test",
+    )
+    db_session.add(campaign)
+    await db_session.flush()
+    recipient = ReactivationRecipient(
+        campaign_id=campaign.id,
+        customer_id=ids["customer_id"],
+        contact_id=original_contact.id,
+        outbox_id=parent.id,
+        status="SENT",
+        eligible=True,
+        selected=True,
+        sent_at=sent_at,
+    )
+    db_session.add_all(
+        [
+            recipient,
+            EmailMessage(
+                case_id=None,
+                customer_id=ids["customer_id"],
+                contact_id=original_contact.id,
+                direction="OUTBOUND",
+                message_id=parent.message_id,
+                from_address="sales-agent@example.com",
+                to_addresses=[original_email],
+                subject="Checking in from Lanya Chem",
+                body_text="Checking in",
+                raw_sha256=hashlib.sha256(token.encode()).hexdigest(),
+                received_at=sent_at,
+            ),
+        ]
+    )
+    await db_session.commit()
+    return ids, parent, recipient, original_contact
+
+
+async def test_case_less_reactivation_reply_from_same_company_domain_creates_endpoint(
+    db_session: AsyncSession,
+) -> None:
+    ids, parent, recipient, original_contact = await _seed_changed_sender_reactivation(
+        db_session,
+        original_email="anuradha@chempure.in",
+        token="same-company-domain",
+    )
+    message = MIMEMessage()
+    message["From"] = "sales@chempure.in"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Checking in from Lanya Chem"
+    message["Message-ID"] = "<same-company-domain-reply@example.com>"
+    message["In-Reply-To"] = parent.message_id
+    message["References"] = parent.message_id
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(
+        db_session,
+        message.as_bytes(),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    sales_case = await db_session.get(SalesCase, email_row.case_id)
+    assert sales_case is not None
+    reply_contact = await db_session.get(Contact, sales_case.contact_id)
+    assert reply_contact is not None
+    assert reply_contact.email == "sales@chempure.in"
+    assert reply_contact.customer_id == ids["customer_id"]
+    assert reply_contact.id != original_contact.id
+    assert original_contact.email == "anuradha@chempure.in"
+    assert original_contact.suppressed is False
+    links = reply_contact.metadata_json["reactivation_thread_links"]
+    assert links[-1]["original_contact_id"] == original_contact.id
+    assert links[-1]["matched_domain"] == "chempure.in"
+    await db_session.refresh(parent)
+    await db_session.refresh(recipient)
+    assert parent.case_id == sales_case.id
+    assert recipient.case_id == sales_case.id
+    assert recipient.status == "REPLIED"
+    linked = await db_session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.case_id == sales_case.id,
+            AuditEvent.event_type == "reactivation.sender_endpoint_linked",
+        )
+    )
+    assert linked is not None
+    assert linked.data["reply_contact_id"] == reply_contact.id
+    assert linked.data["reply_contact_created"] is True
+
+
+@pytest.mark.parametrize(
+    ("original_email", "reply_email", "token"),
+    [
+        ("buyer@company-one.in", "sales@company-two.in", "cross-domain"),
+        ("buyer@gmail.com", "sales@gmail.com", "free-mail-domain"),
+    ],
+)
+async def test_case_less_reactivation_changed_sender_without_corporate_domain_match_is_manual(
+    db_session: AsyncSession,
+    original_email: str,
+    reply_email: str,
+    token: str,
+) -> None:
+    _, parent, _, _ = await _seed_changed_sender_reactivation(
+        db_session,
+        original_email=original_email,
+        token=token,
+    )
+    message = MIMEMessage()
+    message["From"] = reply_email
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Checking in from Lanya Chem"
+    message["Message-ID"] = f"<{token}-reply@example.com>"
+    message["In-Reply-To"] = parent.message_id
+    message["References"] = parent.message_id
+    message.set_content("Please quote PRODUCT WIDGET-100 quantity 100 kg.")
+
+    email_row = await ingest_raw_email(
+        db_session,
+        message.as_bytes(),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert await db_session.scalar(
+        select(func.count()).select_from(Contact).where(Contact.email == reply_email)
+    ) == 0
+
+
 async def test_case_less_reactivation_reply_with_prior_terms_requires_human_review(
     db_session: AsyncSession,
 ) -> None:

@@ -115,6 +115,13 @@ shipping, technical, complaints, counteroffers), suppressed contacts, missing
 `auto_send_allowed`, and low-confidence messages still create a handoff exactly as
 before.
 
+An explicit request such as "share your products with CAS# in Excel" attaches an
+`.xlsx` workbook; an explicit CSV request attaches UTF-8 CSV. The file contains only
+active products from the selected category and only curated database fields (series,
+code, product name, CAS number, and content). Missing CAS numbers remain blank: neither
+the model nor the renderer infers catalog facts. The same catalog remains visible in
+the message body, and the attachment metadata is persisted with the outbound email.
+
 ### Optional public company research for unknown product interests
 
 When a known contact explicitly asks for a product list but CRM/Excel contains
@@ -552,6 +559,14 @@ The history status endpoint reports customer-unmatched messages separately from 
 ### Live new-thread safety
 
 Live human-authored inbound mail primarily inherits an existing case when `In-Reply-To` or `References` resolves to a stored Message-ID and the sender matches that case's contact. Some clients, including observed Enterprise WeChat reply paths, omit both standard thread headers and prepend a localized reply marker such as `回复：`. In that narrow fallback, the application links only when the localized reply marker, normalized subject, sender/contact, product, currency, and one recent open case all match uniquely. Any ambiguity still creates a handoff instead of inheriting quotation or negotiation history.
+
+A reply to a case-less reactivation may come from a different mailbox after a company
+changes its purchasing address. The resolver accepts that changed sender automatically
+only when `In-Reply-To` identifies exactly one sent reactivation and the old recipient,
+stored contact, and new sender share the same non-free corporate domain. It creates a
+separate contact endpoint under the same customer and preserves the old address as
+history. Free-mail domains, cross-domain changes, missing thread headers, suppressed
+addresses, and non-unique matches still require human review.
 
 An inbound message without thread headers that does not satisfy the narrow reply fallback is treated as a new inquiry. A fresh case is created only when the sender maps to one customer contact, exactly one active catalog product is identified, and the market currency is unambiguous. The fresh case starts at quotation round zero and does not inherit earlier prices or negotiation state. Possible same-contact/product cases are recorded in the audit event for visibility, but are not linked automatically.
 

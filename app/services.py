@@ -28,6 +28,7 @@ from app.ai import (
     explicit_product_list_requested,
     extract_quantity_kg,
     render_draft_preview,
+    requested_product_list_file_format,
     stub_analyze,
     validate_rendered_email,
 )
@@ -106,6 +107,7 @@ from app.mail import (
 )
 from app.product_catalog import (
     active_category_keys,
+    build_product_list_attachment,
     customer_interest_keys,
     render_product_list_email,
 )
@@ -200,6 +202,11 @@ class NewInquiryResolution:
 class CaseLessReactivationParent:
     outbox: Outbox
     recipient: ReactivationRecipient
+    original_contact: Contact
+    reply_contact: Contact
+    sender_changed: bool = False
+    reply_contact_created: bool = False
+    matched_domain: str | None = None
 
 
 class JobDeferred(RuntimeError):
@@ -1979,6 +1986,7 @@ async def freeze_outbox(
     in_reply_to: str | None = None,
     references: list[str] | None = None,
     inline_images: tuple[InlineImageAsset, ...] = (),
+    attachments: tuple[OutboundAttachment, ...] = (),
 ) -> Outbox | None:
     message_id, raw = build_message(
         from_address=get_settings().mail_from,
@@ -1990,6 +1998,7 @@ async def freeze_outbox(
         in_reply_to=in_reply_to,
         references=references,
         inline_images=inline_images,
+        attachments=attachments,
     )
     parsed_outbound = parse_mime(raw.encode("utf-8"))
     try:
@@ -2019,7 +2028,7 @@ async def freeze_outbox(
                     subject=subject,
                     body_text=text_body,
                     body_html=html_body,
-                    attachment_metadata=[],
+                    attachment_metadata=parsed_outbound.attachments,
                     raw_sha256=parsed_outbound.raw_sha256,
                 )
             )
@@ -2032,6 +2041,16 @@ async def freeze_outbox(
                 "outbox_id": row.id,
                 "message_id": message_id,
                 "message_kind": message_kind,
+                "attachments": [
+                    {
+                        "filename": item["filename"],
+                        "content_type": item["content_type"],
+                        "size": item["size"],
+                        "sha256": item["sha256"],
+                    }
+                    for item in parsed_outbound.attachments
+                    if item.get("disposition") == "attachment"
+                ],
                 **({"quote_id": quote.id} if quote is not None else {}),
             },
         )
@@ -2544,7 +2563,20 @@ async def _resolve_new_inquiry_case(
             {
                 "reactivation_outbox_id": trusted_reactivation_parent.outbox.id,
                 "reactivation_recipient_id": trusted_reactivation_parent.recipient.id,
-                "match_basis": "exact_case_less_reactivation_thread",
+                "match_basis": (
+                    "exact_case_less_reactivation_thread_same_company_domain"
+                    if trusted_reactivation_parent.sender_changed
+                    else "exact_case_less_reactivation_thread"
+                ),
+                "sender_changed": trusted_reactivation_parent.sender_changed,
+                "original_contact_id": (
+                    trusted_reactivation_parent.original_contact.id
+                ),
+                "reply_contact_id": trusted_reactivation_parent.reply_contact.id,
+                "reply_contact_created": (
+                    trusted_reactivation_parent.reply_contact_created
+                ),
+                "matched_domain": trusted_reactivation_parent.matched_domain,
             }
         )
     if not sender:
@@ -2827,7 +2859,13 @@ async def _case_less_reactivation_parent(
     session: AsyncSession,
     parsed: ParsedEmail,
 ) -> CaseLessReactivationParent | None:
-    """Find a verified case-less reactivation message referenced by this reply."""
+    """Find a verified case-less reactivation message referenced by this reply.
+
+    Exact sender matching remains the primary path. A changed sender address is
+    accepted only when one exact ``In-Reply-To`` parent exists and both old and
+    new addresses share the same non-free corporate domain. The new endpoint is
+    stored as a separate contact; the historical recipient is never overwritten.
+    """
 
     sender = parsed.from_address.strip().casefold()
     ordered_ids = list(dict.fromkeys(item for item in parsed.references if item))
@@ -2856,15 +2894,77 @@ async def _case_less_reactivation_parent(
                 .with_for_update()
         )
     ).all()
-    matches = [
-        CaseLessReactivationParent(outbox=outbox, recipient=recipient)
+    exact_matches = [
+        CaseLessReactivationParent(
+            outbox=outbox,
+            recipient=recipient,
+            original_contact=contact,
+            reply_contact=contact,
+        )
         for outbox, recipient, contact in rows
         if outbox.recipient.strip().casefold() == sender
         and contact.email.strip().casefold() == sender
     ]
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if exact_matches or parsed.in_reply_to is None or len(rows) != 1:
+        return None
+
+    outbox, recipient, original_contact = rows[0]
+    original_recipient = outbox.recipient.strip().casefold()
+    original_contact_email = original_contact.email.strip().casefold()
+    sender_domain = _nonfree_email_domain(sender)
+    if (
+        sender_domain is None
+        or sender_domain != _nonfree_email_domain(original_recipient)
+        or sender_domain != _nonfree_email_domain(original_contact_email)
+        or original_recipient != original_contact_email
+    ):
+        return None
+    customer = await session.get(Customer, recipient.customer_id)
+    if customer is None or customer.id != original_contact.customer_id:
+        return None
+    try:
+        reply_contact, created = await _ensure_customer_contact(
+            session,
+            customer=customer,
+            email=sender,
+            name="Customer",
+            actor="thread_resolver",
+            source="exact_reactivation_message_id_same_company_domain",
+        )
+    except ValueError:
+        # A suppressed or cross-customer identity is never silently reassigned.
+        return None
+
+    metadata = dict(reply_contact.metadata_json or {})
+    thread_links = list(metadata.get("reactivation_thread_links") or [])
+    link = {
+        "source": "exact_reactivation_message_id_same_company_domain",
+        "original_contact_id": original_contact.id,
+        "original_email": original_contact_email,
+        "parent_outbox_id": outbox.id,
+        "parent_message_id": outbox.message_id,
+        "matched_domain": sender_domain,
+        "linked_at": datetime.now(UTC).isoformat(),
+    }
+    if not any(
+        item.get("parent_outbox_id") == outbox.id
+        for item in thread_links
+        if isinstance(item, dict)
+    ):
+        thread_links.append(link)
+    metadata["reactivation_thread_links"] = thread_links[-20:]
+    reply_contact.metadata_json = metadata
+    return CaseLessReactivationParent(
+        outbox=outbox,
+        recipient=recipient,
+        original_contact=original_contact,
+        reply_contact=reply_contact,
+        sender_changed=True,
+        reply_contact_created=created,
+        matched_domain=sender_domain,
+    )
 
 
 async def ingest_raw_email(
@@ -2995,6 +3095,30 @@ async def ingest_raw_email(
                 },
             )
         )
+        if reactivation_parent.sender_changed:
+            session.add(
+                AuditEvent(
+                    case_id=case.id,
+                    actor="thread_resolver",
+                    event_type="reactivation.sender_endpoint_linked",
+                    data={
+                        "outbox_id": reactivation_parent.outbox.id,
+                        "recipient_id": reactivation_parent.recipient.id,
+                        "original_contact_id": (
+                            reactivation_parent.original_contact.id
+                        ),
+                        "original_email": (
+                            reactivation_parent.original_contact.email
+                        ),
+                        "reply_contact_id": reactivation_parent.reply_contact.id,
+                        "reply_email": reactivation_parent.reply_contact.email,
+                        "reply_contact_created": (
+                            reactivation_parent.reply_contact_created
+                        ),
+                        "matched_domain": reactivation_parent.matched_domain,
+                    },
+                )
+            )
     matched_outbox = None
     if bounce and bounce.is_bounce and bounce.original_message_id:
         matched_outbox = await session.scalar(
@@ -3112,6 +3236,7 @@ async def ingest_raw_email(
             session,
             row,
             recipient_id=reactivation_parent.recipient.id,
+            allow_changed_contact=reactivation_parent.sender_changed,
             commit=False,
         )
     await session.commit()
@@ -4053,6 +4178,32 @@ async def _maybe_research_and_send_product_list(
     )
 
 
+def _product_list_outbound_attachments(
+    *,
+    category: ProductCategory,
+    products: list[Product],
+    request_text: str,
+) -> tuple[tuple[OutboundAttachment, ...], str | None]:
+    file_format = requested_product_list_file_format(request_text)
+    if file_format is None:
+        return (), None
+    catalog_file = build_product_list_attachment(
+        category=category,
+        products=products,
+        file_format=file_format,
+    )
+    return (
+        (
+            OutboundAttachment(
+                filename=catalog_file.filename,
+                content_type=catalog_file.content_type,
+                payload=catalog_file.payload,
+            ),
+        ),
+        catalog_file.filename,
+    )
+
+
 async def _maybe_send_product_list(
     session: AsyncSession,
     *,
@@ -4173,6 +4324,11 @@ async def _maybe_send_product_list(
 
     bundle = load_content(get_settings().content_dir)
     try:
+        attachments, attachment_filename = _product_list_outbound_attachments(
+            category=category,
+            products=products,
+            request_text=f"{email_row.subject}\n{email_row.body_text}",
+        )
         text, html_body = render_product_list_email(
             contact_name=case.contact.name,
             category=category,
@@ -4180,6 +4336,7 @@ async def _maybe_send_product_list(
             subject=email_row.subject,
             signature_text=bundle.signature_text,
             signature_html=bundle.signature_html,
+            attachment_filename=attachment_filename,
         )
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
@@ -4216,6 +4373,7 @@ async def _maybe_send_product_list(
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
         inline_images=source.inline_images,
+        attachments=attachments,
     )
     if outbox is None:
         return True
@@ -4230,6 +4388,7 @@ async def _maybe_send_product_list(
             "category_id": category.id,
             "category_key": category.key,
             "product_count": len(products),
+            "attachment_filename": attachment_filename,
         },
     )
     return True
@@ -4621,6 +4780,13 @@ async def backfill_product_list_requests(
                 continue
             try:
                 bundle = load_content(settings.content_dir)
+                attachments, attachment_filename = (
+                    _product_list_outbound_attachments(
+                        category=category,
+                        products=products,
+                        request_text=request_text,
+                    )
+                )
                 text_body, html_body = render_product_list_email(
                     contact_name=contact.name,
                     category=category,
@@ -4628,6 +4794,7 @@ async def backfill_product_list_requests(
                     subject=source.subject,
                     signature_text=bundle.signature_text,
                     signature_html=bundle.signature_html,
+                    attachment_filename=attachment_filename,
                 )
                 reply_source = _reply_source(source)
                 text_body, html_body = append_quoted_reply(
@@ -4657,6 +4824,8 @@ async def backfill_product_list_requests(
                 "text_body": text_body,
                 "html_body": html_body,
                 "inline_images": reply_source.inline_images,
+                "attachments": attachments,
+                "attachment_filename": attachment_filename,
                 "product_count": len(products),
             }
 
@@ -4676,6 +4845,9 @@ async def backfill_product_list_requests(
             "detected_product_code": analysis.product_code,
             "matched_product_id": (
                 matched_product.id if matched_product is not None else None
+            ),
+            "requested_file_format": requested_product_list_file_format(
+                request_text
             ),
             "existing_outbox_id": (
                 existing_product_list.id if existing_product_list is not None else None
@@ -4781,6 +4953,7 @@ async def backfill_product_list_requests(
                 in_reply_to=source.message_id,
                 references=_reply_references(source),
                 inline_images=prepared["inline_images"],
+                attachments=prepared["attachments"],
             )
             if existing_product_list is None:
                 existing_product_list = await session.scalar(
@@ -4819,6 +4992,11 @@ async def backfill_product_list_requests(
                 "outbox_id": existing_product_list.id,
                 "category_id": category.id,
                 "category_key": category.key,
+                "attachment_filename": (
+                    prepared_replies.get(handoff.id, {}).get(
+                        "attachment_filename"
+                    )
+                ),
             },
         )
         await session.commit()

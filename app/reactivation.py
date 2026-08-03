@@ -1164,6 +1164,7 @@ async def record_reactivation_reply(
     email_row: EmailMessage,
     *,
     recipient_id: int | None = None,
+    allow_changed_contact: bool = False,
     commit: bool = True,
 ) -> bool:
     if email_row.direction != "INBOUND" or email_row.is_bounce or email_row.is_automated_reply:
@@ -1180,11 +1181,20 @@ async def record_reactivation_reply(
             select(ReactivationRecipient)
             .where(
                 ReactivationRecipient.id == recipient_id,
-                ReactivationRecipient.contact_id == contact_id,
                 ReactivationRecipient.status.in_(["QUEUED", "SENT"]),
             )
             .with_for_update()
         )
+        if sent is not None and sent.contact_id != contact_id:
+            # Only the exact, already-verified reactivation parent path may
+            # record a reply from a newly discovered mailbox at the same
+            # customer. Normal sender-based reply matching remains strict.
+            if not (
+                allow_changed_contact
+                and email_row.customer_id is not None
+                and sent.customer_id == email_row.customer_id
+            ):
+                sent = None
         if sent is not None and sent.sent_at is None and sent.outbox_id is not None:
             sent_outbox = await session.get(Outbox, sent.outbox_id)
             sent.sent_at = sent_outbox.sent_at if sent_outbox else None
