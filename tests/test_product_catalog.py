@@ -29,11 +29,13 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     ]
     keys = {item["key"] for item in categories}
     codes = [item["code"] for item in products]
-    assert len(codes) == len(set(codes)) == 68
+    assert len(codes) == len(set(codes)) == 70
     assert all(item["category"] in keys for item in products)
     assert any(item["code"] == "YAC-A110" for item in products)
     assert any(item["code"] == "YAC-HMDS" for item in products)
     assert any(item["code"] == "UV-531" for item in products)
+    assert any(item["code"] == "OH-Polymer 80K" for item in products)
+    assert any(item["code"] == "YAC-N823(99%)" for item in products)
 
 
 def test_category_keyword_classification() -> None:
@@ -128,8 +130,8 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
         category=category,
         products=products,
         subject="Re: product list",
-        signature_text="Lanya Sales Team",
-        signature_html="<p>Lanya Sales Team</p>",
+        signature_text="Best regards,\nLanya Sales Team",
+        signature_html="<p>Best regards,</p><p>Lanya Sales Team</p>",
     )
 
     assert "Dear Alice Buyer," in text
@@ -140,6 +142,8 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
     assert "US$" not in text and "USD" not in text
     assert "<table" in html_body
     assert "YAC-N113" in html_body
+    assert text.count("Best regards,") == 1
+    assert html_body.count("Best regards,") == 1
 
 
 def test_product_list_email_rejects_money_and_commitments() -> None:

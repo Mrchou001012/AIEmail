@@ -80,7 +80,7 @@ Duplicate raw messages do not create duplicate email-processing jobs. If a recov
 ## Categorized product catalog and automatic product-list replies
 
 The categorized product list from `产品们.docx` is stored as `config/product_catalog.yaml`
-(three major categories: Industrial Silanes, Pharmaceutical, Rubber & Plastics; 68
+(three major categories: Industrial Silanes, Pharmaceutical, Rubber & Plastics; 70
 products with brand, CAS number, content/purity, and series). Migration `0015` adds the
 `product_categories` table plus catalog columns on `products` (`category_id`, `brand`,
 `cas_no`, `content`, `series`, `sort_order`) and a nullable `cases.category_id` used for

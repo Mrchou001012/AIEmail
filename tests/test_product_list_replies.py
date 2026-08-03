@@ -114,6 +114,10 @@ async def test_crm_interest_triggers_automatic_product_list_reply(
     assert "YAC-A110" in outbox.raw_message
     assert "919-30-2" in outbox.raw_message
     assert "USD" not in outbox.raw_message
+    assert "Please send us your product list for industrial silane." in outbox.raw_message
+    # One copy in the plain part and one in the HTML part; neither part should
+    # duplicate the sign-off already supplied by the configured signature.
+    assert outbox.raw_message.count("Best regards,") == 2
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
     assert await send_one_outbox(db_session) is True
@@ -143,6 +147,32 @@ async def test_generic_category_interest_email_auto_replies(
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
     assert "YAC-S313" in outbox.raw_message
+
+
+async def test_productless_quote_with_category_interest_requires_human(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Quotation request",
+            "Please quote quantity: 100 kg.",
+            message_id="productless-quote@example.com",
+        ),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
+
+    assert await _queued_product_list(db_session) is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.HUMAN_CONTROL.value
+    assert handoff.extracted_facts["product_pending"] is True
 
 
 async def test_sample_request_still_requires_human(db_session: AsyncSession) -> None:
@@ -274,15 +304,15 @@ async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
     first = await import_product_catalog(db_session, apply=True)
     second = await import_product_catalog(db_session, apply=True)
 
-    assert first["products_created"] == 68
+    assert first["products_created"] == 70
     assert first["categories_created"] == 3
     assert second["products_created"] == 0
-    assert second["products_updated"] == 68
+    assert second["products_updated"] == 70
     product_count = await db_session.scalar(select(func.count()).select_from(Product))
     category_count = await db_session.scalar(
         select(func.count()).select_from(ProductCategory)
     )
-    assert product_count == 68
+    assert product_count == 70
     assert category_count == 3
 
 

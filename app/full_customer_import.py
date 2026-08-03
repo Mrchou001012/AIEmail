@@ -465,10 +465,10 @@ async def import_full_customer_workbook(
             )
         ).all()
     }
+    category_names = await category_names_by_key(session)
     for address, endpoint in parsed.endpoints.items():
         company_key = endpoint.preferred_company_name.strip().casefold()
         company = customers_by_name.get(company_key)
-        category_names = await category_names_by_key(session)
         matches = contacts_by_email.get(address, [])
         selected_contact = next(
             (

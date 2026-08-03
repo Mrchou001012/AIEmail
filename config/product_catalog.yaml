@@ -96,6 +96,13 @@ products:
     content: 98%
     series: Alkyl Silane Series (N)
   - category: industrial_silanes
+    code: YAC-N823(99%)
+    name: N-OCTYLTRIETHOXYSILANE
+    brand: YAC
+    cas_no: 2943-75-1
+    content: 99%
+    series: Alkyl Silane Series (N)
+  - category: industrial_silanes
     code: YAC-N1213
     name: N-DODECYLTRIMETHOXYSILANE
     brand: YAC
@@ -379,6 +386,10 @@ products:
     cas_no: 6485-79-6
 
   # ---------------- Rubber & Plastics ----------------
+  - category: rubber_plastics
+    code: OH-Polymer 80K
+    name: OH-Polymer 80K
+    series: OH Polymer
   - category: rubber_plastics
     code: SBM-55
     name: SBM-55

@@ -382,7 +382,6 @@ def render_product_list_email(
                     ]
                 )
             )
-    body_lines.extend(["", "Best regards,"])
     business_text = "\n".join(body_lines)
     validate_product_list_email(business_text)
     text = "\n".join([business_text, "", signature_text.strip()])
@@ -422,7 +421,6 @@ def render_product_list_email(
             )
         rows_html.append("</table>")
         html_parts.append("".join(rows_html))
-    html_parts.append("<p>Best regards,</p>")
     html_body = "".join(html_parts) + signature_html
     return text, html_body
 

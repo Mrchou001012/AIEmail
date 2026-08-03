@@ -3344,6 +3344,15 @@ async def _maybe_send_product_list(
             signature_text=bundle.signature_text,
             signature_html=bundle.signature_html,
         )
+        source = _reply_source(email_row)
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=email_row.from_address,
+            source_body=source.body_text,
+            source_html=source.body_html,
+            occurred_at=email_row.received_at,
+        )
     except Exception as exc:
         await create_handoff(
             session,
@@ -3369,6 +3378,7 @@ async def _maybe_send_product_list(
         business_key=f"inbound-product-list:{email_row.id}",
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
+        inline_images=source.inline_images,
     )
     if outbox is None:
         return True
@@ -3472,7 +3482,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await session.commit()
         return
     if case.product_id is None or case.product is None:
-        if case.category_id is not None:
+        if (
+            case.category_id is not None
+            and analysis.intent == Intent.PRODUCT_LIST_REQUEST
+        ):
             if await _maybe_send_product_list(
                 session,
                 case=case,
