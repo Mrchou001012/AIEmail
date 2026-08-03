@@ -132,6 +132,16 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/replace-recipient" in html
     assert 'id="replacement-email"' in html
     assert "同公司其他邮箱和其他案例不会被修改" in html
+    assert 'id="sender-contact-review"' in html
+    assert 'id="contact-search"' in html
+    assert 'id="customer-match-select"' in html
+    assert 'id="add-sender-contact"' in html
+    assert "/admin/contact-directory?query=" in html
+    assert "/admin/customers/${customerId}/contacts" in html
+    assert "旧邮箱和历史记录会保留" in html
+    assert "formatApiError" in html
+    assert "payload.detail ?? payload" in html
+    assert "当前发件地址尚未登记。请先确认客户归属并新增联系人。" in html
     assert "/draft-preview/stream" in html
     assert "response.body.getReader()" in html
     assert 'new TextDecoder("utf-8")' in html

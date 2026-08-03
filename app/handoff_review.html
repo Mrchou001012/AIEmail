@@ -50,6 +50,9 @@
     .check input { width:auto; }
     .file-help { color:var(--muted); font-size:12px; margin-top:6px; }
     .file-list { margin-top:8px; padding:9px 11px; border-radius:9px; background:#f8fafc; color:var(--muted); overflow-wrap:anywhere; }
+    .identity-review { margin:12px 0; padding:12px; border:1px solid #f7d394; border-radius:10px; background:#fffaeb; }
+    .identity-review strong { color:#7a2e0e; }
+    .row.compact { grid-template-columns:minmax(0,1fr) auto; }
     #notice { display:none; margin-bottom:16px; border-radius:10px; padding:11px 13px; background:#eef4ff; }
     #notice.error { display:block; background:#fff1f0; color:var(--red); }
     #notice.ok { display:block; background:#ecfdf3; color:var(--green); }
@@ -100,6 +103,26 @@
             <button id="assign" type="button">确认关联</button>
             <div id="new-case-tools">
               <label>或建立新案例</label>
+              <div class="identity-review hidden" id="sender-contact-review">
+                <strong>当前发件地址尚未登记，不能直接建案</strong>
+                <div class="file-help">
+                  如果客户更换了邮箱，请先搜索原公司或旧邮箱，人工确认归属后把
+                  <span id="current-sender-email"></span> 作为同一客户下的新联系人加入。旧邮箱和历史邮件都会保留。
+                </div>
+                <label for="contact-search">搜索原公司、联系人或旧邮箱</label>
+                <div class="row compact">
+                  <input id="contact-search" maxlength="320" placeholder="例如：公司名或旧邮箱">
+                  <button id="contact-search-button" type="button">搜索客户</button>
+                </div>
+                <div class="file-help" id="contact-search-state">请核对搜索结果后再确认，系统不会根据引用邮件自动认领客户。</div>
+                <label for="customer-match-select">确认所属客户</label>
+                <select id="customer-match-select"><option value="">暂无搜索结果</option></select>
+                <label for="new-sender-name">新联系人称呼</label>
+                <input id="new-sender-name" maxlength="255" value="Customer">
+                <div class="actions">
+                  <button class="primary" id="add-sender-contact" type="button" disabled>确认归属并新增联系人</button>
+                </div>
+              </div>
               <div class="row"><select id="contact-select"></select><select id="product-select"></select></div>
               <div class="row"><input id="currency" value="INR" maxlength="3" aria-label="币种"><button id="create-case" type="button">建立并关联</button></div>
             </div>
@@ -159,21 +182,48 @@
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     let state = null;
     let blockedRemoteImages = [];
+    let directoryCustomers = [];
+    let automaticContactLookupKey = "";
+
+    function formatApiError(detail, fallback) {
+      if (typeof detail === "string" && detail.trim()) return detail;
+      if (Array.isArray(detail)) {
+        const messages = detail.map((item) => {
+          if (typeof item === "string") return item;
+          if (!item || typeof item !== "object") return String(item ?? "");
+          const path = Array.isArray(item.loc)
+            ? item.loc.filter((part) => part !== "body").join(".")
+            : "";
+          return [path, item.msg || item.message].filter(Boolean).join(": ") || JSON.stringify(item);
+        }).filter(Boolean);
+        if (messages.length) return messages.join("；");
+      }
+      if (detail && typeof detail === "object") {
+        return detail.message || detail.error || JSON.stringify(detail);
+      }
+      return fallback;
+    }
+
+    async function responseError(response) {
+      const fallback = `${response.status} ${response.statusText}`;
+      try {
+        const payload = await response.json();
+        return formatApiError(payload.detail ?? payload, fallback);
+      } catch (_) {
+        return fallback;
+      }
+    }
 
     async function api(path, options = {}) {
       const response = await fetch(path, {headers:{"Content-Type":"application/json", ...(options.headers || {})}, ...options});
       if (!response.ok) {
-        let message = `${response.status} ${response.statusText}`;
-        try { message = (await response.json()).detail || message; } catch (_) {}
-        throw new Error(message);
+        throw new Error(await responseError(response));
       }
       return response.json();
     }
     async function readNdjson(response, onEvent) {
       if (!response.ok) {
-        let message = `${response.status} ${response.statusText}`;
-        try { message = (await response.json()).detail || message; } catch (_) {}
-        throw new Error(message);
+        throw new Error(await responseError(response));
       }
       if (!response.body) throw new Error("当前浏览器不支持流式响应");
       const reader = response.body.getReader();
@@ -201,6 +251,50 @@
     function notice(message, kind = "ok") { const node = $("#notice"); node.className = kind; node.textContent = message; }
     function options(select, rows, label) {
       select.innerHTML = rows.length ? rows.map((row) => `<option value="${esc(row.id)}">${esc(label(row))}</option>`).join("") : '<option value="">暂无可选项</option>';
+    }
+    function defaultContactSearch(email) {
+      const [localPart = "", domain = ""] = String(email || "").toLowerCase().split("@");
+      const domainLabel = domain.split(".")[0] || "";
+      const publicMailDomains = new Set(["gmail", "googlemail", "outlook", "hotmail", "yahoo", "qq", "163", "126"]);
+      if (domainLabel && !publicMailDomains.has(domainLabel)) return domainLabel;
+      return localPart.replace(/[+._-]+/g, " ").trim();
+    }
+    function renderDirectoryCustomers(contacts) {
+      const seen = new Set();
+      directoryCustomers = [];
+      for (const row of contacts || []) {
+        if (seen.has(row.customer_id)) continue;
+        seen.add(row.customer_id);
+        directoryCustomers.push(row);
+      }
+      const select = $("#customer-match-select");
+      select.innerHTML = directoryCustomers.length
+        ? '<option value="">请选择并核对客户</option>' + directoryCustomers.map((row) =>
+            `<option value="${esc(row.customer_id)}">${esc(`${row.company_name} · 依据：${row.name} / ${row.email}`)}</option>`
+          ).join("")
+        : '<option value="">没有匹配客户，请修改关键词后重试</option>';
+      $("#add-sender-contact").disabled = true;
+      $("#contact-search-state").textContent = directoryCustomers.length
+        ? `找到 ${directoryCustomers.length} 个客户候选；请人工核对公司和旧邮箱。`
+        : "没有找到候选客户；可改用公司名、联系人名或旧邮箱搜索。";
+    }
+    async function searchContactDirectory({silent = false} = {}) {
+      const query = $("#contact-search").value.trim();
+      if (!query) {
+        if (!silent) notice("请输入原公司、联系人或旧邮箱。", "error");
+        return;
+      }
+      $("#contact-search-button").disabled = true;
+      $("#contact-search-state").textContent = "正在查询联系人目录…";
+      try {
+        const result = await api(`/admin/contact-directory?query=${encodeURIComponent(query)}`);
+        renderDirectoryCustomers(result.contacts || []);
+      } catch (error) {
+        $("#contact-search-state").textContent = `查询失败：${error.message}`;
+        if (!silent) notice(error.message, "error");
+      } finally {
+        $("#contact-search-button").disabled = false;
+      }
     }
     function renderCase(data) {
       const node = $("#case-detail");
@@ -277,7 +371,8 @@
       $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
       renderCase(data.case);
       options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product || "产品待确认"} · ${row.status}`);
-      options($("#contact-select"), data.matching_contacts || [], (row) => `${row.name} · ${row.email}`);
+      const matchingContacts = data.matching_contacts || [];
+      options($("#contact-select"), matchingContacts, (row) => `${row.name} · ${row.email}`);
       const productOptions = (data.products || [])
         .map((row) => `<option value="${esc(row.id)}">${esc(`${row.code} · ${row.name}`)}</option>`)
         .join("");
@@ -294,6 +389,14 @@
       if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
       if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
       $("#association-tools").classList.toggle("hidden", Boolean(data.case));
+      const senderNeedsReview = Boolean(mail) && !data.case && matchingContacts.length === 0;
+      $("#sender-contact-review").classList.toggle("hidden", !senderNeedsReview);
+      $("#current-sender-email").textContent = mail?.from || "";
+      $("#create-case").disabled = data.status !== "OPEN" || matchingContacts.length === 0;
+      $("#assign").disabled = data.status !== "OPEN" || !(data.candidate_cases || []).length;
+      if (senderNeedsReview && !$("#contact-search").value) {
+        $("#contact-search").value = defaultContactSearch(mail.from);
+      }
       const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
       $("#generate-draft").disabled = blocked;
       $("#send").disabled = blocked;
@@ -323,6 +426,13 @@
         const data = await api(`/admin/handoffs/${id}`);
         render(data);
         await renderSourceEmail(data.source_email);
+        const lookupKey = data.source_email && !(data.matching_contacts || []).length && !data.case
+          ? `${data.id}:${String(data.source_email.from).toLowerCase()}`
+          : "";
+        if (lookupKey && lookupKey !== automaticContactLookupKey) {
+          automaticContactLookupKey = lookupKey;
+          await searchContactDirectory({silent:true});
+        }
       } catch (error) {
         notice(error.message, "error");
       }
@@ -336,14 +446,63 @@
         : "未选择附件";
     }
 
-    $("#assign").addEventListener("click", () => post(`/admin/handoffs/${id}/assign`, {case_id:Number($("#case-select").value)}, "案例已关联。"));
+    $("#assign").addEventListener("click", () => {
+      const caseId = Number($("#case-select").value);
+      if (!caseId) {
+        notice("请先选择可关联的案例。", "error");
+        return;
+      }
+      post(`/admin/handoffs/${id}/assign`, {case_id:caseId}, "案例已关联。");
+    });
+    $("#contact-search-button").addEventListener("click", () => searchContactDirectory());
+    $("#contact-search").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") searchContactDirectory();
+    });
+    $("#customer-match-select").addEventListener("change", () => {
+      $("#add-sender-contact").disabled = !Number($("#customer-match-select").value) || state?.status !== "OPEN";
+    });
+    $("#add-sender-contact").addEventListener("click", async () => {
+      const customerId = Number($("#customer-match-select").value);
+      const selected = directoryCustomers.find((row) => row.customer_id === customerId);
+      const sender = String(state?.source_email?.from || "").trim();
+      const name = $("#new-sender-name").value.trim() || "Customer";
+      if (!customerId || !selected || !sender) {
+        notice("请先选择并核对所属客户。", "error");
+        return;
+      }
+      if (!confirm(`确认把 ${sender} 作为“${selected.company_name}”的新联系人加入？旧邮箱和历史记录会保留。`)) return;
+      $("#add-sender-contact").disabled = true;
+      try {
+        const result = await api(`/admin/customers/${customerId}/contacts`, {
+          method:"POST",
+          body:JSON.stringify({
+            email:sender,
+            name,
+            note:`Handoff #${id}: 人工确认客户更换或新增发件地址`,
+          }),
+        });
+        await load();
+        notice(result.created
+          ? `已将 ${result.email} 添加为“${selected.company_name}”的新联系人。现在可建立“产品待确认”案例。`
+          : `${result.email} 已属于该客户。现在可建立或关联案例。`);
+      } catch (error) {
+        notice(error.message, "error");
+      } finally {
+        $("#add-sender-contact").disabled = false;
+      }
+    });
     $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
     $("#create-case").addEventListener("click", () => {
+      const contactId = Number($("#contact-select").value);
+      if (!contactId) {
+        notice("当前发件地址尚未登记。请先确认客户归属并新增联系人。", "error");
+        return;
+      }
       const selectedProduct = $("#product-select").value;
       post(
         `/admin/handoffs/${id}/cases`,
         {
-          contact_id:Number($("#contact-select").value),
+          contact_id:contactId,
           product_id:selectedProduct ? Number(selectedProduct) : null,
           currency:$("#currency").value.trim().toUpperCase(),
         },
@@ -449,9 +608,7 @@
       try {
         const response = await fetch(`/admin/handoffs/${id}/send-with-attachments`, {method:"POST", body:form});
         if (!response.ok) {
-          let message = `${response.status} ${response.statusText}`;
-          try { message = (await response.json()).detail || message; } catch (_) {}
-          throw new Error(message);
+          throw new Error(await responseError(response));
         }
         notice("人工回复已加入发件队列。");
         await load();
