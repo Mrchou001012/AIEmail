@@ -136,7 +136,7 @@
           <td><span class="product">${esc(row.product_code)}<small>${esc(row.product_name)} · ${esc(row.currency)}/${esc(row.unit)}</small></span></td>
           <td>${esc(row.margin_class || "—")}</td>
           <td><div class="rule">${ruleText(row)}</div></td>
-          <td><input class="price" type="number" min="0.0001" max="1000000000" step="0.0001" value="${esc(current || "")}" placeholder="请输入本周价格" required><div class="previous">上次：${esc(row.previous_price)} ${esc(row.currency)}</div></td>
+          <td><input class="price" type="number" min="0.0001" max="1000000000" step="0.0001" value="${esc(current || row.previous_price || "")}" placeholder="请输入本周价格" required><div class="previous">上次：${esc(row.previous_price)} ${esc(row.currency)}</div></td>
           <td><select class="availability" required><option value="">请选择</option><option value="AVAILABLE" ${stock.availability === "AVAILABLE" ? "selected" : ""}>有现货</option><option value="OUT_OF_STOCK" ${stock.availability === "OUT_OF_STOCK" ? "selected" : ""}>无现货</option></select></td>
           <td><input class="quantity" type="number" min="0" max="1000000000" step="0.0001" value="${esc(stock.quantity || "")}" placeholder="有现货时必填"></td>
           <td><input class="warehouse" maxlength="128" value="${esc(stock.warehouse || "")}" placeholder="例如：India warehouse"></td>
