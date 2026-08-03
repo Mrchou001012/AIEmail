@@ -13,12 +13,20 @@ from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import AuditEvent, CaseStatus, Contact, Customer, Product, SalesCase
+from app.db import (
+    AuditEvent,
+    CaseStatus,
+    Contact,
+    Customer,
+    Product,
+    ProductCategory,
+    SalesCase,
+)
 from app.deliverability import validate_address_format
 from app.history import reconcile_email_history
 from app.product_catalog import (
     category_interest_entries,
-    category_names_by_key,
+    interest_entry,
     merge_customer_interests,
 )
 from app.products import canonical_product_code
@@ -353,21 +361,34 @@ def _merge_activity(contact: Contact, endpoint: ParsedEmailEndpoint) -> None:
     contact.last_contact_at = max(last_values) if last_values else None
 
 
+def _resolved_products_from_text(
+    text: str,
+    products_by_code: dict[str, Product],
+) -> list[Product]:
+    resolved: dict[int, Product] = {}
+    stripped = text.strip()
+    if not stripped:
+        return []
+    candidates = [stripped, *SPLIT_PRODUCT_PATTERN.split(stripped)]
+    for candidate in candidates:
+        code = canonical_product_code(candidate)
+        product = products_by_code.get(code.casefold())
+        if product is not None:
+            resolved[product.id] = product
+    return list(resolved.values())
+
+
 def _resolved_products(
     endpoint: ParsedEmailEndpoint,
     products_by_code: dict[str, Product],
 ) -> list[Product]:
     resolved: dict[int, Product] = {}
     for association in endpoint.associations:
-        text = association.product_text.strip()
-        if not text:
-            continue
-        candidates = [text, *SPLIT_PRODUCT_PATTERN.split(text)]
-        for candidate in candidates:
-            code = canonical_product_code(candidate)
-            product = products_by_code.get(code.casefold())
-            if product is not None:
-                resolved[product.id] = product
+        for product in _resolved_products_from_text(
+            association.product_text,
+            products_by_code,
+        ):
+            resolved[product.id] = product
     return list(resolved.values())
 
 
@@ -408,6 +429,21 @@ async def import_full_customer_workbook(
         .scalars()
         .all()
     )
+    product_categories = (
+        (
+            await session.execute(
+                select(ProductCategory)
+                .where(ProductCategory.active.is_(True))
+                .order_by(ProductCategory.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    categories_by_id = {category.id: category for category in product_categories}
+    category_names = {
+        category.key: category.name for category in product_categories
+    }
     customers_by_name = {
         customer.company_name.strip().casefold(): customer for customer in customers
     }
@@ -465,7 +501,6 @@ async def import_full_customer_workbook(
             )
         ).all()
     }
-    category_names = await category_names_by_key(session)
     for address, endpoint in parsed.endpoints.items():
         company_key = endpoint.preferred_company_name.strip().casefold()
         company = customers_by_name.get(company_key)
@@ -549,6 +584,22 @@ async def import_full_customer_workbook(
                     source_row=association.source_row,
                 )
             )
+            for product in _resolved_products_from_text(
+                association.product_text,
+                products_by_code,
+            ):
+                category = categories_by_id.get(product.category_id)
+                if category is None:
+                    continue
+                interest_entries.append(
+                    interest_entry(
+                        category_key=category.key,
+                        category_name=category.name,
+                        source="full_customer_workbook",
+                        value=association.product_text,
+                        source_row=association.source_row,
+                    )
+                )
         merge_customer_interests(company, interest_entries)
 
         resolved_products = (
@@ -565,6 +616,7 @@ async def import_full_customer_workbook(
                     customer_id=selected_contact.customer_id,
                     contact_id=selected_contact.id,
                     product_id=product.id,
+                    category_id=product.category_id,
                     currency="INR",
                     status=CaseStatus.ACTIVE,
                     subject_key=f"{product.name} quotation".casefold(),

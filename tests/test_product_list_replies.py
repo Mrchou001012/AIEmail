@@ -575,6 +575,18 @@ async def test_full_customer_workbook_stores_interest_category(
             "",
         ]
     )
+    sheet.append(
+        [
+            "Brisben CHEM",
+            "Bijesh Shah",
+            "brisbenchem@example.com",
+            "",
+            "Acetyl Acetone",
+            date(2023, 9, 22),
+            date(2023, 9, 22),
+            "",
+        ]
+    )
     path = tmp_path / "customers.xlsx"
     workbook.save(path)
 
@@ -594,6 +606,29 @@ async def test_full_customer_workbook_stores_interest_category(
     assert interests[0]["category_key"] == "industrial_silanes"
     assert interests[0]["value"] == "工业硅烷"
     assert customer.auto_send_allowed is True
+
+    brisben = await db_session.scalar(
+        select(Customer).where(Customer.company_name == "Brisben CHEM")
+    )
+    assert brisben is not None
+    brisben_interests = (brisben.metadata_json or {}).get("interests")
+    assert brisben_interests is not None
+    assert brisben_interests[0]["category_key"] == "pharmaceutical"
+    assert brisben_interests[0]["value"] == "Acetyl Acetone"
+    brisben_contact = await db_session.scalar(
+        select(Contact).where(Contact.email == "brisbenchem@example.com")
+    )
+    acac = await db_session.scalar(select(Product).where(Product.code == "ACAC"))
+    assert brisben_contact is not None
+    assert acac is not None and acac.category_id is not None
+    acac_case = await db_session.scalar(
+        select(SalesCase).where(
+            SalesCase.contact_id == brisben_contact.id,
+            SalesCase.product_id == acac.id,
+        )
+    )
+    assert acac_case is not None
+    assert acac_case.category_id == acac.category_id
 
     # The stored interest now drives an automatic product-list reply.
     contact = await db_session.scalar(

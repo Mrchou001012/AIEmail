@@ -29,10 +29,13 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     ]
     keys = {item["key"] for item in categories}
     codes = [item["code"] for item in products]
-    assert len(codes) == len(set(codes)) == 70
+    assert len(codes) == len(set(codes)) == 71
     assert all(item["category"] in keys for item in products)
     assert any(item["code"] == "YAC-A110" for item in products)
     assert any(item["code"] == "YAC-HMDS" for item in products)
+    acac = next(item for item in products if item["code"] == "ACAC")
+    assert acac["category"] == "pharmaceutical"
+    assert acac["cas_no"] == "123-54-6"
     assert any(item["code"] == "UV-531" for item in products)
     assert any(item["code"] == "OH-Polymer 80K" for item in products)
     assert any(item["code"] == "YAC-N823(99%)" for item in products)
@@ -92,6 +95,8 @@ def test_new_aliases_resolve_product_codes() -> None:
         assert canonical_product_code("A110") == "YAC-A110"
         assert canonical_product_code("BCP") == "YAC-BCP"
         assert canonical_product_code("HMDS") == "YAC-HMDS"
+        assert canonical_product_code("Acetyl Acetone") == "ACAC"
+        assert canonical_product_code("2,4-Pentanedione") == "ACAC"
         assert canonical_product_code("LANNOX 168") == "AO-168"
         assert canonical_product_code("UV 770") == "UV-770"
         assert canonical_product_code("YAC-N823") == "YAC-N823(98%)"

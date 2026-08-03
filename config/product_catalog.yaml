@@ -340,6 +340,11 @@ products:
 
   # ---------------- Pharmaceutical ----------------
   - category: pharmaceutical
+    code: ACAC
+    name: Acetylacetone (2,4-Pentanedione)
+    cas_no: 123-54-6
+    series: Fine Chemical Intermediates
+  - category: pharmaceutical
     code: YAC-TES
     name: TRIETHYLSILANE (TES)
     brand: YAC

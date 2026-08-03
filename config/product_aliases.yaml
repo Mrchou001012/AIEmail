@@ -25,6 +25,12 @@ products:
   - code: YAC-HMM
     aliases:
       - HMM
+  - code: ACAC
+    aliases:
+      - Acetyl Acetone
+      - Acetylacetone
+      - 2,4-Pentanedione
+      - Pentane-2,4-dione
   - code: YAC-BSA
     aliases:
       - BSA
