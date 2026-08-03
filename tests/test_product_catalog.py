@@ -35,11 +35,37 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     assert any(item["code"] == "YAC-HMDS" for item in products)
     acac = next(item for item in products if item["code"] == "ACAC")
     assert acac["category"] == "pharmaceutical"
-    assert acac["cas_no"] == "123-54-6"
     n113 = next(item for item in products if item["code"] == "YAC-N113")
-    mtms = next(item for item in products if item["code"] == "YAC-MTMS")
     assert n113["cas_no"] == "1185-55-3"
-    assert mtms["cas_no"] is None
+    source_blank_cas_codes = {
+        "YAC-BDAC",
+        "YAC-TOS",
+        "YAC-POS",
+        "YAC-MTMS",
+        "YAC-TMOS",
+        "YAC-TEOS28",
+        "ACAC",
+        "OH-Polymer 80K",
+        "SBM-55",
+        "DBM-83",
+        "CAA",
+        "ZAA",
+        "THEIC",
+        "AAA",
+        "AO-168",
+        "AO-1010",
+        "AO-1076",
+        "UV-770",
+        "UV-944",
+        "UV-783",
+        "UV-622",
+        "UV-P",
+        "UV-531",
+    }
+    actual_blank_cas_codes = {
+        item["code"] for item in products if item.get("cas_no") is None
+    }
+    assert actual_blank_cas_codes == source_blank_cas_codes
     assert any(item["code"] == "UV-531" for item in products)
     assert any(item["code"] == "OH-Polymer 80K" for item in products)
     assert any(item["code"] == "YAC-N823(99%)" for item in products)

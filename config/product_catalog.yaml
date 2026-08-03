@@ -301,23 +301,24 @@ products:
     series: Other Products
 
   # Extra entries from the second industrial-silanes summary table.
+  # That source does not provide CAS numbers for these products.
   - category: industrial_silanes
     code: YAC-BDAC
     name: Di-tert-butoxydiacetoxysilane
     brand: YAC
-    cas_no: 13170-23-5
+    cas_no: null
     series: Acetoxy Series
   - category: industrial_silanes
     code: YAC-TOS
     name: Tetra(methylethylketoxime)silane
     brand: YAC
-    cas_no: 34206-40-1
+    cas_no: null
     series: Ketoxime Series
   - category: industrial_silanes
     code: YAC-POS
     name: Phenyltris(methylethylketoxime)silane
     brand: YAC
-    cas_no: 34036-80-1
+    cas_no: null
     series: Ketoxime Series
   - category: industrial_silanes
     code: YAC-MTMS
@@ -329,20 +330,20 @@ products:
     code: YAC-TMOS
     name: Tetramethoxysilane
     brand: YAC
-    cas_no: 681-84-5
+    cas_no: null
     series: Alcohol Series
   - category: industrial_silanes
     code: YAC-TEOS28
     name: Tetraethoxysilane (TEOS 28/40)
     brand: YAC
-    cas_no: 78-10-4
+    cas_no: null
     series: Alcohol Series
 
   # ---------------- Pharmaceutical ----------------
   - category: pharmaceutical
     code: ACAC
     name: Acetylacetone (2,4-Pentanedione)
-    cas_no: 123-54-6
+    cas_no: null
     series: Fine Chemical Intermediates
   - category: pharmaceutical
     code: YAC-TES
@@ -394,87 +395,90 @@ products:
   - category: rubber_plastics
     code: OH-Polymer 80K
     name: OH-Polymer 80K
+    cas_no: null
     series: OH Polymer
+  # The source table lists product names only and does not provide CAS numbers.
   - category: rubber_plastics
     code: SBM-55
     name: SBM-55
     brand: Lanya
-    cas_no: 58446-52-9
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: DBM-83
     name: DBM-83
     brand: Lanya
-    cas_no: 120-46-7
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: CAA
     name: CALCIUM ACETYL ACETONATE
     brand: Lanya
-    cas_no: 19372-44-2
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: ZAA
     name: ZINC ACETYL ACETONATE
     brand: Lanya
-    cas_no: 14024-63-6
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: THEIC
     name: LANYA THEIC
     brand: Lanya
-    cas_no: 839-90-7
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: AAA
     name: ALUMINIUM ACETYL ACETONATE
     brand: Lanya
-    cas_no: 13963-57-0
+    cas_no: null
     series: PVC Heat Stabilizers
   - category: rubber_plastics
     code: AO-168
     name: LANNOX 168
     brand: LANNOX
-    cas_no: 31570-04-4
+    cas_no: null
     series: Antioxidants
   - category: rubber_plastics
     code: AO-1010
     name: LANNOX 1010
     brand: LANNOX
-    cas_no: 6683-19-8
+    cas_no: null
     series: Antioxidants
   - category: rubber_plastics
     code: AO-1076
     name: LANNOX 1076
     brand: LANNOX
-    cas_no: 2082-79-3
+    cas_no: null
     series: Antioxidants
   - category: rubber_plastics
     code: UV-770
     name: UV 770
-    cas_no: 52829-07-9
+    cas_no: null
     series: UV Stabilizers
   - category: rubber_plastics
     code: UV-944
     name: UV 944
-    cas_no: 71878-19-8
+    cas_no: null
     series: UV Stabilizers
   - category: rubber_plastics
     code: UV-783
     name: UV 783
+    cas_no: null
     series: UV Stabilizers
   - category: rubber_plastics
     code: UV-622
     name: UV 622
-    cas_no: 65447-77-0
+    cas_no: null
     series: UV Stabilizers
   - category: rubber_plastics
     code: UV-P
     name: UV P
-    cas_no: 2440-22-4
+    cas_no: null
     series: UV Stabilizers
   - category: rubber_plastics
     code: UV-531
     name: UV 531
-    cas_no: 1843-05-6
+    cas_no: null
     series: UV Stabilizers
