@@ -164,8 +164,11 @@
         const quantity = row.querySelector(".quantity").value.trim();
         if (!standardPrice || Number(standardPrice) <= 0) throw new Error(`${code}：请输入有效的本周价格`);
         if (!availability) throw new Error(`${code}：请选择库存状态`);
-        if (availability === "AVAILABLE" && (!quantity || Number(quantity) <= 0)) throw new Error(`${code}：有现货时必须填写大于 0 的库存数量`);
-        items.push({template_policy_id:Number(row.dataset.templateId), product_code:code, currency:row.dataset.currency, standard_price:standardPrice, availability, quantity:availability === "OUT_OF_STOCK" ? "0" : quantity, warehouse:row.querySelector(".warehouse").value.trim() || null});
+        let finalAvailability = availability;
+        if (finalAvailability === "AVAILABLE" && (!quantity || Number(quantity) <= 0)) {
+          finalAvailability = "OUT_OF_STOCK";
+        }
+        items.push({template_policy_id:Number(row.dataset.templateId), product_code:code, currency:row.dataset.currency, standard_price:standardPrice, availability:finalAvailability, quantity:finalAvailability === "OUT_OF_STOCK" ? "0" : quantity, warehouse:row.querySelector(".warehouse").value.trim() || null});
       }
       const sourceRef = $("#source-ref").value.trim();
       if (!sourceRef) throw new Error("请填写本次更新说明");
