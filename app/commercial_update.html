@@ -61,7 +61,7 @@
   <main class="shell">
     <header class="top">
       <div><h1>本周价格与库存</h1><p class="sub">一次确认整周基础价格和现货数量；全部成功后才恢复 AI 自动报价。</p></div>
-      <div class="top-links"><a href="/dashboard">运行看板</a><button class="secondary" id="reload" type="button">重新读取</button></div>
+      <div class="top-links"><span id="draft-indicator" style="display:none;color:var(--amber);font-weight:700;font-size:12px">📝 有未提交草稿</span><button class="secondary" id="save-draft" type="button" style="display:none">保存草稿</button><button class="secondary" id="clear-draft" type="button" style="display:none">清除草稿</button><a href="/dashboard">运行看板</a><button class="secondary" id="reload" type="button">重新读取</button></div>
     </header>
     <div id="notice" class="notice" role="status"></div>
 
@@ -113,6 +113,44 @@
       return response.json();
     }
     function notice(message, kind = "ok") { const node = $("#notice"); node.className = `notice ${kind}`; node.textContent = message; window.scrollTo({top:0, behavior:"smooth"}); }
+    function draftKey() { return state?.cycle_id ? `commercial_draft_${state.cycle_id}` : null; }
+    function saveDraft() {
+      const key = draftKey(); if (!key) return;
+      const data = { source_ref: $("#source-ref").value, items: [] };
+      for (const row of document.querySelectorAll("#products tr[data-template-id]")) {
+        data.items.push({
+          template_policy_id: Number(row.dataset.templateId),
+          price: row.querySelector(".price").value,
+          availability: row.querySelector(".availability").value,
+          quantity: row.querySelector(".quantity").value,
+          warehouse: row.querySelector(".warehouse").value
+        });
+      }
+      try { localStorage.setItem(key, JSON.stringify(data)); $("#draft-indicator").style.display = ""; } catch (_) {}
+    }
+    function restoreDraft() {
+      const key = draftKey(); if (!key) return;
+      let data; try { data = JSON.parse(localStorage.getItem(key)); } catch (_) { return; }
+      if (!data?.items?.length) return;
+      $("#source-ref").value = data.source_ref || $("#source-ref").value;
+      const rows = document.querySelectorAll("#products tr[data-template-id]");
+      const savedByTid = {};
+      for (const item of data.items) savedByTid[item.template_policy_id] = item;
+      for (const row of rows) {
+        const tid = Number(row.dataset.templateId);
+        const saved = savedByTid[tid]; if (!saved) continue;
+        if (saved.price) row.querySelector(".price").value = saved.price;
+        if (saved.availability) { row.querySelector(".availability").value = saved.availability; row.querySelector(".availability").dispatchEvent(new Event("change")); }
+        if (saved.quantity !== undefined) row.querySelector(".quantity").value = saved.quantity;
+        if (saved.warehouse !== undefined) row.querySelector(".warehouse").value = saved.warehouse;
+      }
+      $("#draft-indicator").style.display = "";
+    }
+    function clearDraft() {
+      const key = draftKey(); if (!key) return;
+      try { localStorage.removeItem(key); } catch (_) {}
+      $("#draft-indicator").style.display = "none";
+    }
     function pct(value) { return value == null ? "—" : `${(Number(value) * 100).toFixed(0)}%`; }
     function ruleText(row) {
       const max = row.max_quantity == null ? "无上限" : `${row.max_quantity} kg`;
@@ -137,7 +175,7 @@
           <td>${esc(row.margin_class || "—")}</td>
           <td><div class="rule">${ruleText(row)}</div></td>
           <td><input class="price" type="number" min="0.0001" max="1000000000" step="0.0001" value="${esc(current || row.previous_price || "")}" placeholder="请输入本周价格" required><div class="previous">上次：${esc(row.previous_price)} ${esc(row.currency)}</div></td>
-          <td><select class="availability" required><option value="">请选择</option><option value="AVAILABLE" ${stock.availability === "AVAILABLE" ? "selected" : ""}>有现货</option><option value="OUT_OF_STOCK" ${stock.availability === "OUT_OF_STOCK" ? "selected" : ""}>无现货</option></select></td>
+          <td><select class="availability"><option value="AVAILABLE">有现货</option><option value="OUT_OF_STOCK">无现货</option></select></td>
           <td><input class="quantity" type="number" min="0" max="1000000000" step="0.0001" value="${esc(stock.quantity || "")}" placeholder="有现货时必填"></td>
           <td><input class="warehouse" maxlength="128" value="${esc(stock.warehouse || "")}" placeholder="例如：India warehouse"></td>
         </tr>`;
@@ -148,12 +186,22 @@
       $("#manual-products").innerHTML = manual.map((row) => `<span class="manual-item" title="${esc(row.reason)}">${esc(row.product_code)} · ${esc(row.product_name)}</span>`).join("");
       $("#confirm").disabled = !data.editor_products.length;
       if (!$("#source-ref").value) $("#source-ref").value = `${data.week_start} 本周价格和库存人工确认`;
+      $("#save-draft").style.display = data.editor_products.length ? "" : "none";
+      $("#clear-draft").style.display = data.editor_products.length ? "" : "none";
+      restoreDraft();
     }
     function bindAvailability(select) {
       const row = select.closest("tr");
       const quantity = row.querySelector(".quantity");
-      const sync = () => { const empty = select.value === "OUT_OF_STOCK"; quantity.disabled = empty; if (empty) quantity.value = "0"; };
-      select.addEventListener("change", sync); sync();
+      const sync = () => {
+        const qty = Number(quantity.value);
+        select.value = (qty > 0) ? "AVAILABLE" : "OUT_OF_STOCK";
+      };
+      quantity.addEventListener("input", sync);
+      select.addEventListener("change", () => {
+        if (select.value === "OUT_OF_STOCK") quantity.value = "0";
+      });
+      sync();
     }
     function collect() {
       const items = [];
@@ -163,11 +211,7 @@
         const availability = row.querySelector(".availability").value;
         const quantity = row.querySelector(".quantity").value.trim();
         if (!standardPrice || Number(standardPrice) <= 0) throw new Error(`${code}：请输入有效的本周价格`);
-        if (!availability) throw new Error(`${code}：请选择库存状态`);
-        let finalAvailability = availability;
-        if (finalAvailability === "AVAILABLE" && (!quantity || Number(quantity) <= 0)) {
-          finalAvailability = "OUT_OF_STOCK";
-        }
+        const finalAvailability = (quantity && Number(quantity) > 0) ? "AVAILABLE" : "OUT_OF_STOCK";
         items.push({template_policy_id:Number(row.dataset.templateId), product_code:code, currency:row.dataset.currency, standard_price:standardPrice, availability:finalAvailability, quantity:finalAvailability === "OUT_OF_STOCK" ? "0" : quantity, warehouse:row.querySelector(".warehouse").value.trim() || null});
       }
       const sourceRef = $("#source-ref").value.trim();
@@ -181,16 +225,23 @@
       finally { $("#reload").disabled = false; }
     }
     $("#reload").addEventListener("click", load);
+    $("#save-draft").addEventListener("click", () => { saveDraft(); notice("草稿已保存到浏览器缓存。", "ok"); });
+    $("#clear-draft").addEventListener("click", () => { if (confirm("确认清除缓存的草稿？")) { clearDraft(); notice("草稿已清除。", "ok"); } });
     $("#confirm").addEventListener("click", async () => {
       try {
         const payload = collect();
         if (!confirm(`确认提交 ${payload.items.length} 个产品的本周价格和库存？\n提交成功后，等待中的自动报价将恢复处理。`)) return;
         $("#confirm").disabled = true;
         render(await api("/admin/commercial/current/confirm", {method:"POST", body:JSON.stringify(payload)}));
+        clearDraft();
         notice("本周价格和库存已确认，AI 自动报价已恢复。请留意发件队列。", "ok");
       } catch (error) { notice(`提交失败：${error.message}`, "error"); }
       finally { $("#confirm").disabled = !state?.editor_products?.length; }
     });
+    // 自动保存：表格内容变化时自动存草稿
+    $("#products").addEventListener("input", () => saveDraft());
+    $("#products").addEventListener("change", () => saveDraft());
+    $("#source-ref").addEventListener("input", () => saveDraft());
     load();
   </script>
 </body>
