@@ -154,6 +154,17 @@ def load_catalog_yaml(path: Path = DEFAULT_CATALOG_PATH) -> dict[str, Any]:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
 
 
+def _optional_catalog_value(
+    item: dict[str, Any],
+    key: str,
+    current: str | None = None,
+) -> str | None:
+    """Apply explicit catalog values while preserving fields that are omitted."""
+    if key not in item:
+        return current
+    return str(item.get(key) or "").strip() or None
+
+
 def _catalog_categories(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     categories: dict[str, dict[str, Any]] = {}
     for item in payload.get("categories") or []:
@@ -279,10 +290,10 @@ async def import_product_catalog(
         else:
             product.name = name
             product.category_id = category.id
-            product.brand = str(item.get("brand") or "").strip() or product.brand
-            product.cas_no = str(item.get("cas_no") or "").strip() or product.cas_no
-            product.content = str(item.get("content") or "").strip() or product.content
-            product.series = str(item.get("series") or "").strip() or product.series
+            product.brand = _optional_catalog_value(item, "brand", product.brand)
+            product.cas_no = _optional_catalog_value(item, "cas_no", product.cas_no)
+            product.content = _optional_catalog_value(item, "content", product.content)
+            product.series = _optional_catalog_value(item, "series", product.series)
             product.sort_order = sort_order
             product.active = True
             result["products_updated"] += 1

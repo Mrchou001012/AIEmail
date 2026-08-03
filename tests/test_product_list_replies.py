@@ -671,6 +671,10 @@ async def test_product_specific_list_request_sends_product_category(
 
 async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
     first = await import_product_catalog(db_session, apply=True)
+    mtms = await db_session.scalar(select(Product).where(Product.code == "YAC-MTMS"))
+    assert mtms is not None
+    mtms.cas_no = "1185-55-3"
+    await db_session.flush()
     second = await import_product_catalog(db_session, apply=True)
 
     assert first["products_created"] == 71
@@ -683,6 +687,7 @@ async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
     )
     assert product_count == 71
     assert category_count == 3
+    assert mtms.cas_no is None
 
 
 async def test_suppressed_customer_never_auto_sends(db_session: AsyncSession) -> None:
