@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import (
+    CaseStatus,
     Contact,
     Customer,
     DeliveryStatus,
@@ -21,7 +22,12 @@ from app.db import (
 )
 from app.domain import HandoffReason
 from app.product_catalog import import_product_catalog
-from app.services import ingest_raw_email, process_inbound, send_one_outbox
+from app.services import (
+    backfill_product_list_requests,
+    ingest_raw_email,
+    process_inbound,
+    send_one_outbox,
+)
 from app.settings import get_settings
 
 pytestmark = pytest.mark.integration
@@ -346,6 +352,83 @@ async def test_multiple_interests_route_to_human(db_session: AsyncSession) -> No
         "industrial_silanes",
         "pharmaceutical",
     ]
+
+
+async def test_product_list_backfill_previews_then_queues_old_open_handoff(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product catalog",
+            "Please send your product list.",
+            message_id="backfill-product-list@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+    case = await db_session.get(SalesCase, email_row.case_id)
+    assert case is not None
+    case.status = CaseStatus.WAITING_HUMAN
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.HUMAN_CONTROL.value,
+        summary="Legacy product-list request requires review",
+        extracted_facts={"product_pending": True},
+        status="OPEN",
+        dingtalk_status="SENT",
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+
+    preview = await backfill_product_list_requests(db_session, apply=False)
+    assert preview["candidate_count"] == 1
+    assert preview["queued_count"] == 0
+    assert preview["candidates"][0]["category_key"] == "industrial_silanes"
+    assert await _queued_product_list(db_session) is None
+    await db_session.refresh(handoff)
+    assert handoff.status == "OPEN"
+
+    result = await backfill_product_list_requests(
+        db_session,
+        apply=True,
+        handoff_ids=(handoff.id,),
+    )
+    assert result["candidate_count"] == 1
+    assert result["queued_count"] == 1
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    assert "YAC-A110" in outbox.raw_message
+    await db_session.refresh(handoff)
+    await db_session.refresh(case)
+    assert handoff.status == "RESOLVED"
+    assert case.status == CaseStatus.ACTIVE
+
+
+async def test_product_list_backfill_excludes_non_unique_excel_interests(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_catalog_and_interest(
+        db_session,
+        interests=["industrial_silanes", "pharmaceutical"],
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product catalog",
+            "Please send your product list.",
+            message_id="backfill-ambiguous@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None
+
+    result = await backfill_product_list_requests(db_session, apply=False)
+    assert result["candidate_count"] == 0
+    assert result["exclusion_counts"]["INTEREST_CATEGORY_NOT_UNIQUE"] == 1
+    assert await _queued_product_list(db_session) is None
 
 
 async def test_product_specific_list_request_sends_product_category(

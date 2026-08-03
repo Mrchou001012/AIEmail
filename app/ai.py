@@ -189,17 +189,7 @@ def _intent_from_text(text: str) -> Intent:
         (Intent.COUNTEROFFER, ("counteroffer", "can you do", "target price", "too high", "discount")),
         (
             Intent.PRODUCT_LIST_REQUEST,
-            (
-                "product list",
-                "product catalog",
-                "product catalogue",
-                "brochure",
-                "product range",
-                "full range",
-                "range of products",
-                "list of products",
-                "product portfolio",
-            ),
+            PRODUCT_LIST_MARKERS,
         ),
         (
             Intent.QUOTE_REQUEST,
@@ -233,6 +223,24 @@ PRICE_NEGOTIATION_MARKERS = (
     "price reduction",
     "price concession",
 )
+
+PRODUCT_LIST_MARKERS = (
+    "product list",
+    "product catalog",
+    "product catalogue",
+    "brochure",
+    "product range",
+    "full range",
+    "range of products",
+    "list of products",
+    "product portfolio",
+)
+
+
+def explicit_product_list_requested(text: str) -> bool:
+    """Return whether the customer explicitly asked to see a product catalog."""
+    lowered = (text or "").casefold()
+    return any(marker in lowered for marker in PRODUCT_LIST_MARKERS)
 
 
 def _normalize_quantity_revision(

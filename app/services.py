@@ -21,8 +21,10 @@ from sqlalchemy.orm import selectinload
 from app.ai import (
     AIClient,
     InboundAnalysis,
+    explicit_product_list_requested,
     extract_quantity_kg,
     render_draft_preview,
+    stub_analyze,
     validate_rendered_email,
 )
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
@@ -3700,6 +3702,356 @@ async def _maybe_send_product_list(
         },
     )
     return True
+
+
+async def backfill_product_list_requests(
+    session: AsyncSession,
+    *,
+    apply: bool = False,
+    limit: int = 500,
+    max_age_days: int = 30,
+    handoff_ids: tuple[int, ...] = (),
+    include_history: bool = False,
+) -> dict[str, Any]:
+    """Safely queue replies for explicit, unresolved product-list requests.
+
+    Preview mode is strictly read-only. Apply mode revalidates every delivery
+    guard, requires a unique active catalog category, preserves the original
+    reply thread, and resolves the obsolete handoff only after an idempotent
+    PRODUCT_LIST outbox row exists.
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if max_age_days <= 0:
+        raise ValueError("max_age_days must be positive")
+    if apply and not handoff_ids:
+        raise ValueError("apply mode requires explicitly selected handoff_ids")
+
+    query = (
+        select(Handoff)
+        .where(
+            Handoff.status == "OPEN",
+            Handoff.source_email_id.is_not(None),
+        )
+        .order_by(Handoff.id)
+        .limit(limit)
+    )
+    if handoff_ids:
+        query = query.where(Handoff.id.in_(handoff_ids))
+    if apply:
+        query = query.with_for_update(skip_locked=True)
+    handoffs = list((await session.scalars(query)).all())
+
+    active_categories = list(
+        (
+            await session.scalars(
+                select(ProductCategory).where(ProductCategory.active.is_(True))
+            )
+        ).all()
+    )
+    categories_by_id = {category.id: category for category in active_categories}
+    categories_by_key = {category.key: category for category in active_categories}
+    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+    candidates: list[dict[str, Any]] = []
+    exclusions: list[dict[str, Any]] = []
+    queued: list[dict[str, Any]] = []
+
+    def exclude(handoff: Handoff, reason: str, **details: Any) -> None:
+        exclusions.append(
+            {
+                "handoff_id": handoff.id,
+                "email_id": handoff.source_email_id,
+                "reason": reason,
+                **details,
+            }
+        )
+
+    for handoff in handoffs:
+        source = await session.get(EmailMessage, handoff.source_email_id)
+        if source is None:
+            exclude(handoff, "SOURCE_EMAIL_MISSING")
+            continue
+        if source.direction != "INBOUND" or (source.is_history and not include_history):
+            exclude(handoff, "NOT_LIVE_INBOUND")
+            continue
+        if source.received_at < cutoff:
+            exclude(
+                handoff,
+                "OLDER_THAN_MAX_AGE",
+                received_at=source.received_at.isoformat(),
+            )
+            continue
+        if source.is_bounce or source.is_automated_reply:
+            exclude(handoff, "NON_CUSTOMER_MESSAGE")
+            continue
+        request_text = f"{source.subject}\n{source.body_text}"
+        if not explicit_product_list_requested(request_text):
+            exclude(handoff, "NOT_EXPLICIT_PRODUCT_LIST_REQUEST")
+            continue
+        if attachments_require_review(source.attachment_metadata, source.body_html):
+            exclude(handoff, "RISKY_ATTACHMENT")
+            continue
+        if not source.message_id:
+            exclude(handoff, "SOURCE_MESSAGE_ID_MISSING")
+            continue
+
+        case_id = handoff.case_id or source.case_id
+        sales_case = (
+            await session.scalar(
+                select(SalesCase)
+                .options(
+                    selectinload(SalesCase.customer),
+                    selectinload(SalesCase.contact),
+                    selectinload(SalesCase.product),
+                    selectinload(SalesCase.category),
+                )
+                .where(SalesCase.id == case_id)
+            )
+            if case_id is not None
+            else None
+        )
+        facts = dict(handoff.extracted_facts or {})
+        contact_id = (
+            sales_case.contact_id
+            if sales_case is not None
+            else source.contact_id or facts.get("contact_id")
+        )
+        contact = (
+            sales_case.contact
+            if sales_case is not None
+            else await session.scalar(
+                select(Contact)
+                .options(selectinload(Contact.customer))
+                .where(Contact.id == contact_id)
+            )
+        )
+        if contact is None:
+            exclude(handoff, "CONTACT_NOT_UNIQUE_OR_MISSING")
+            continue
+        customer = sales_case.customer if sales_case is not None else contact.customer
+        if source.from_address.strip().casefold() != contact.email.strip().casefold():
+            exclude(handoff, "SOURCE_CONTACT_MISMATCH")
+            continue
+        address_status = await session.get(
+            EmailAddressStatus,
+            contact.email.strip().casefold(),
+        )
+        if (
+            contact.suppressed
+            or customer.do_not_contact
+            or not customer.auto_send_allowed
+            or (address_status is not None and address_status.suppressed)
+        ):
+            exclude(handoff, "RECIPIENT_NOT_AUTHORIZED")
+            continue
+
+        category = None
+        if sales_case is not None:
+            category = sales_case.category
+            if (
+                category is None
+                and sales_case.product is not None
+                and sales_case.product.category_id is not None
+            ):
+                category = categories_by_id.get(sales_case.product.category_id)
+        if category is None:
+            interest_categories = [
+                categories_by_key[key]
+                for key in customer_interest_keys(customer)
+                if key in categories_by_key
+            ]
+            interest_categories = list(
+                {item.id: item for item in interest_categories}.values()
+            )
+            if len(interest_categories) != 1:
+                exclude(
+                    handoff,
+                    "INTEREST_CATEGORY_NOT_UNIQUE",
+                    category_keys=[item.key for item in interest_categories],
+                )
+                continue
+            category = interest_categories[0]
+        if category.id not in categories_by_id:
+            exclude(handoff, "CATEGORY_INACTIVE")
+            continue
+
+        existing_product_list = await session.scalar(
+            select(Outbox).where(
+                Outbox.business_key == f"inbound-product-list:{source.id}",
+                Outbox.status != DeliveryStatus.CANCELLED,
+            )
+        )
+        approved_reply = await session.scalar(
+            select(Outbox.id).where(Outbox.approval_handoff_id == handoff.id)
+        )
+        exact_thread_reply = await session.scalar(
+            select(EmailMessage.id).where(
+                EmailMessage.direction == "OUTBOUND",
+                EmailMessage.in_reply_to == source.message_id,
+            )
+        )
+        if approved_reply is not None or (
+            exact_thread_reply is not None and existing_product_list is None
+        ):
+            exclude(handoff, "ALREADY_REPLIED")
+            continue
+
+        if sales_case is not None:
+            if sales_case.status not in {CaseStatus.ACTIVE, CaseStatus.WAITING_HUMAN}:
+                exclude(
+                    handoff,
+                    "CASE_STATUS_UNSAFE",
+                    case_id=sales_case.id,
+                    case_status=sales_case.status.value,
+                )
+                continue
+            if sales_case.stage not in {CaseStage.QUOTING, CaseStage.FOLLOW_UP}:
+                exclude(
+                    handoff,
+                    "CASE_STAGE_UNSAFE",
+                    case_id=sales_case.id,
+                    case_stage=sales_case.stage.value,
+                )
+                continue
+            other_open_handoffs = await session.scalar(
+                select(func.count())
+                .select_from(Handoff)
+                .where(
+                    Handoff.case_id == sales_case.id,
+                    Handoff.status == "OPEN",
+                    Handoff.id != handoff.id,
+                )
+            )
+            if other_open_handoffs:
+                exclude(
+                    handoff,
+                    "CASE_HAS_OTHER_OPEN_HANDOFFS",
+                    case_id=sales_case.id,
+                    count=other_open_handoffs,
+                )
+                continue
+
+        candidate = {
+            "handoff_id": handoff.id,
+            "email_id": source.id,
+            "case_id": sales_case.id if sales_case is not None else None,
+            "customer_id": customer.id,
+            "contact_id": contact.id,
+            "recipient": contact.email,
+            "subject": source.subject,
+            "received_at": source.received_at.isoformat(),
+            "category_id": category.id,
+            "category_key": category.key,
+            "existing_outbox_id": (
+                existing_product_list.id if existing_product_list is not None else None
+            ),
+        }
+        candidates.append(candidate)
+        if not apply:
+            continue
+
+        if existing_product_list is None:
+            if sales_case is None:
+                sales_case = SalesCase(
+                    customer_id=customer.id,
+                    contact_id=contact.id,
+                    product_id=None,
+                    category_id=category.id,
+                    currency="INR",
+                    stage=CaseStage.QUOTING,
+                    status=CaseStatus.ACTIVE,
+                    subject_key=normalized_subject(source.subject)[:255],
+                )
+                session.add(sales_case)
+                await session.flush()
+            else:
+                sales_case.category_id = category.id
+                sales_case.category = category
+                if sales_case.status == CaseStatus.WAITING_HUMAN:
+                    sales_case.status = CaseStatus.ACTIVE
+            source.case_id = sales_case.id
+            source.customer_id = customer.id
+            source.contact_id = contact.id
+            handoff.case_id = sales_case.id
+            analysis = stub_analyze(
+                source.subject,
+                source.body_text,
+                source.attachment_metadata,
+            ).model_copy(update={"risky_attachment": False})
+            handled = await _maybe_send_product_list(
+                session,
+                case=sales_case,
+                email_row=source,
+                analysis=analysis,
+                analysis_facts={
+                    **analysis.model_dump(mode="json"),
+                    "backfill": True,
+                    "source_handoff_id": handoff.id,
+                },
+            )
+            if not handled:
+                raise RuntimeError(
+                    f"product-list backfill did not handle handoff {handoff.id}"
+                )
+            existing_product_list = await session.scalar(
+                select(Outbox).where(
+                    Outbox.business_key == f"inbound-product-list:{source.id}",
+                    Outbox.status != DeliveryStatus.CANCELLED,
+                )
+            )
+            if existing_product_list is None:
+                raise RuntimeError(
+                    f"product-list backfill created no outbox for handoff {handoff.id}"
+                )
+
+        if sales_case is not None and sales_case.status == CaseStatus.WAITING_HUMAN:
+            sales_case.status = CaseStatus.ACTIVE
+        handoff.status = "RESOLVED"
+        handoff.resolution_note = (
+            f"Automatically backfilled product list for {category.key}; "
+            f"outbox_id={existing_product_list.id}"
+        )
+        if handoff.dingtalk_status != "SENT":
+            handoff.dingtalk_status = "CANCELLED"
+        await audit(
+            session,
+            "handoff.product_list_backfilled",
+            case_id=existing_product_list.case_id,
+            actor="product-list-backfill",
+            data={
+                "handoff_id": handoff.id,
+                "email_id": source.id,
+                "outbox_id": existing_product_list.id,
+                "category_id": category.id,
+                "category_key": category.key,
+            },
+        )
+        await session.commit()
+        queued.append(
+            {
+                **candidate,
+                "case_id": existing_product_list.case_id,
+                "outbox_id": existing_product_list.id,
+                "outbox_status": existing_product_list.status.value,
+            }
+        )
+
+    exclusion_counts: dict[str, int] = {}
+    for item in exclusions:
+        reason = str(item["reason"])
+        exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+    return {
+        "apply": apply,
+        "include_history": include_history,
+        "max_age_days": max_age_days,
+        "scanned": len(handoffs),
+        "candidate_count": len(candidates),
+        "queued_count": len(queued),
+        "exclusion_counts": exclusion_counts,
+        "candidates": candidates,
+        "queued": queued,
+        "exclusions": exclusions,
+    }
 
 
 async def process_inbound(session: AsyncSession, email_id: int) -> None:

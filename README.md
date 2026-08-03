@@ -119,6 +119,39 @@ Demo fixture `assets/demo_product_list_request.eml` exercises the flow after the
 catalog import and a customer import that contains `api@ethachem.example` with
 `工业硅烷` and `enable_auto_send`.
 
+### Safe backfill for pending product-list requests
+
+Recent explicit product-list requests that became handoffs before this feature
+was deployed are never replayed merely by restarting a worker. Preview the guarded
+one-time backfill first:
+
+```bash
+sudo -u aiemail /opt/aiemail-env/bin/python \
+  /opt/aiemail/scripts/backfill_product_list_requests.py \
+  --env-file /etc/aiemail/aiemail.env
+```
+
+The preview is read-only and reports every candidate and exclusion. It considers
+only live inbound mail from the last 30 days that explicitly asks for a product
+list/catalog/range, has no risky attachment or existing reply, maps to an authorized
+unsuppressed contact, and resolves to exactly one active category from the case or
+imported CRM/Excel interests. To queue only reviewed handoffs, repeat `--handoff-id`
+and add `--apply`:
+
+```bash
+sudo -u aiemail /opt/aiemail-env/bin/python \
+  /opt/aiemail/scripts/backfill_product_list_requests.py \
+  --env-file /etc/aiemail/aiemail.env \
+  --handoff-id 1234 --handoff-id 1235 --apply
+```
+
+Apply mode creates an idempotent `PRODUCT_LIST` outbox reply in the original RFC
+thread, then resolves the obsolete handoff. Normal recipient/MX checks, SMTP spacing,
+hourly/daily limits, safe mode, and the global mail transport still run at delivery.
+Imported Gmail-history messages are excluded by default. A reviewed historical item
+can be selected explicitly with `--handoff-id ID --include-history`; increase
+`--max-age-days` deliberately if it is older than 30 days.
+
 ## Excel templates
 
 Generated templates are committed at:

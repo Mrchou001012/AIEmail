@@ -14,6 +14,7 @@ from app.ai import (
     _complete_json_string_array_field,
     _complete_json_string_field,
     _normalize_quantity_revision,
+    explicit_product_list_requested,
     extract_quantity_kg,
     render_draft_preview,
     stub_analyze,
@@ -114,6 +115,19 @@ def test_extract_quantity_kg_from_trusted_thread_context(
     expected: int | None,
 ) -> None:
     assert extract_quantity_kg(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Please send your product list.", True),
+        ("Could you share the full product range?", True),
+        ("We are interested in industrial silanes.", False),
+        ("Please quote 100 kg.", False),
+    ],
+)
+def test_explicit_product_list_request_markers(text: str, expected: bool) -> None:
+    assert explicit_product_list_requested(text) is expected
 
 
 def test_stub_draft_preview_is_review_only_and_ignores_historical_prices() -> None:
