@@ -115,6 +115,42 @@ shipping, technical, complaints, counteroffers), suppressed contacts, missing
 `auto_send_allowed`, and low-confidence messages still create a handoff exactly as
 before.
 
+### Optional public company research for unknown product interests
+
+When a known contact explicitly asks for a product list but CRM/Excel contains
+no active interest category, the application can perform a bounded Anthropic
+web search before deciding which catalog series is relevant. Internal
+CRM/Excel interests always win: research is skipped when there is one known
+category, and multiple internal categories still require a human decision.
+
+Research and autonomous use have separate switches. Start in observation mode:
+
+```dotenv
+COMPANY_RESEARCH_ENABLED=true
+COMPANY_RESEARCH_AUTO_SEND_ENABLED=false
+```
+
+The search sends only the company name and, for non-free email providers, its
+email domain. Website text is treated as untrusted evidence. A second,
+tool-free structured call can select only an active local catalog category.
+Automatic use additionally requires the configured identity confidence,
+category confidence, score gap, non-conflicting evidence, and independent
+source count. Evidence URLs, the decision, gate result, token counts, and audit
+events are stored; the result is cached for 90 days by default. Research never
+writes a permanent CRM interest, price, recipient, or customer-facing prose.
+
+After reviewing observation-mode handoffs, autonomous category-list replies can
+be enabled separately:
+
+```dotenv
+COMPANY_RESEARCH_AUTO_SEND_ENABLED=true
+```
+
+Global recipient suppression, attachment review, auto-send authorization,
+SMTP safe mode, MX checks, rate limits, and idempotent outbox checks still run.
+Any search/API failure or uncertain result becomes a
+`PRODUCT_CATEGORY_REVIEW` handoff; it never falls through to a guessed list.
+
 Demo fixture `assets/demo_product_list_request.eml` exercises the flow after the
 catalog import and a customer import that contains `api@ethachem.example` with
 `工业硅烷` and `enable_auto_send`.
@@ -151,6 +187,21 @@ hourly/daily limits, safe mode, and the global mail transport still run at deliv
 Imported Gmail-history messages are excluded by default. A reviewed historical item
 can be selected explicitly with `--handoff-id ID --include-history`; increase
 `--max-age-days` deliberately if it is older than 30 days.
+
+For an explicitly reviewed, category-less live handoff, preview the online
+research backfill candidate without making a web request:
+
+```bash
+sudo -u aiemail /opt/aiemail-env/bin/python \
+  /opt/aiemail/scripts/backfill_product_list_requests.py \
+  --env-file /etc/aiemail/aiemail.env \
+  --handoff-id 1876 --company-research
+```
+
+Add `--apply` only after reviewing the candidate. That run performs the bounded
+search. It queues a reply only if the confidence gate passes and
+`COMPANY_RESEARCH_AUTO_SEND_ENABLED=true`; otherwise it keeps the handoff open
+and reclassifies it as `PRODUCT_CATEGORY_REVIEW` with the cited evidence.
 
 ## Excel templates
 

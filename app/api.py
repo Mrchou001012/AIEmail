@@ -858,6 +858,10 @@ async def dashboard_data(
             "safe_mode": settings.safe_mode,
             "auto_send_enabled": settings.auto_send_enabled,
             "imap_sync_enabled": settings.imap_sync_enabled,
+            "company_research_enabled": settings.company_research_enabled,
+            "company_research_auto_send_enabled": (
+                settings.company_research_auto_send_enabled
+            ),
             "rate_limits": {
                 "max_sends_per_hour": settings.max_sends_per_hour,
                 "max_sends_per_day": settings.max_sends_per_day,
@@ -1255,6 +1259,10 @@ async def admin_status(_: Admin, session: Session, settings: Annotated[Settings,
         "safe_mode": settings.safe_mode,
         "auto_send_enabled": settings.auto_send_enabled,
         "imap_sync_enabled": settings.imap_sync_enabled,
+        "company_research_enabled": settings.company_research_enabled,
+        "company_research_auto_send_enabled": (
+            settings.company_research_auto_send_enabled
+        ),
         "credentials_present": {
             "anthropic": bool(settings.anthropic_api_key),
             "gmail": bool(settings.gmail_address and settings.gmail_app_password),
@@ -2311,6 +2319,10 @@ def _suggested_handoff_reply(
         "NEW_INQUIRY_REVIEW": (
             "Thank you for your inquiry. We are reviewing the requested product details and will "
             "reply with the appropriate information."
+        ),
+        "PRODUCT_CATEGORY_REVIEW": (
+            "Thank you for your interest in our products. We are reviewing which product range "
+            "is most relevant to your business and will share the appropriate list."
         ),
         "PERSONNEL_CHANGE": (
             "Thank you for the update. We are reviewing the contact information before making any "

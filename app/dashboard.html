@@ -477,6 +477,8 @@
         `<span class="chip">钉钉 <strong>${esc(r.dingtalk_transport)}</strong></span>`,
         yesNo("Gmail 凭据", r.credentials.gmail),
         yesNo("Gmail 同步", r.imap_sync_enabled),
+        yesNo("公司联网研判", r.company_research_enabled),
+        yesNo("研判结果自动使用", r.company_research_auto_send_enabled),
         yesNo("安全模式", r.safe_mode),
         yesNo("自动发送", r.auto_send_enabled),
         `<span class="chip">退信（24h）<strong>${esc(data.metrics?.bounced_24h ?? 0)}</strong></span>`,
