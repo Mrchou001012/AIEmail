@@ -43,6 +43,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Queue eligible replies. Without this flag the command is read-only.",
     )
+    parser.add_argument(
+        "--company-research",
+        action="store_true",
+        help=(
+            "For explicitly selected category-less handoffs, allow bounded public "
+            "company research. Preview mode only marks the candidate; --apply "
+            "performs research and still honors both company-research switches."
+        ),
+    )
     args = parser.parse_args()
     if not args.env_file.is_file():
         parser.error(f"environment file does not exist: {args.env_file}")
@@ -81,6 +90,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             max_age_days=args.max_age_days,
             handoff_ids=tuple(args.handoff_id),
             include_history=args.include_history,
+            company_research=args.company_research,
         )
 
 

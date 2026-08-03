@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import re
 import smtplib
@@ -10,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email.utils import parseaddr
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -20,6 +22,8 @@ from sqlalchemy.orm import selectinload
 
 from app.ai import (
     AIClient,
+    CompanyCategoryDecision,
+    CompanyResearchSource,
     InboundAnalysis,
     explicit_product_list_requested,
     extract_quantity_kg,
@@ -163,6 +167,26 @@ PRIOR_THREAD_MARKERS = (
     "your previous offer",
 )
 
+FREE_EMAIL_DOMAINS = frozenset(
+    {
+        "aol.com",
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "icloud.com",
+        "live.com",
+        "outlook.com",
+        "proton.me",
+        "protonmail.com",
+        "qq.com",
+        "yahoo.com",
+        "yahoo.co.in",
+        "ymail.com",
+    }
+)
+COMPANY_RESEARCH_CACHE_KEY = "company_category_research"
+COMPANY_RESEARCH_CACHE_SCHEMA = "company-category-research.v1"
+
 
 @dataclass(frozen=True)
 class NewInquiryResolution:
@@ -185,6 +209,137 @@ class JobDeferred(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.available_at = available_at
+
+
+def _nonfree_email_domain(email_address: str) -> str | None:
+    _, separator, domain = email_address.strip().casefold().rpartition("@")
+    if not separator or not domain or domain in FREE_EMAIL_DOMAINS:
+        return None
+    return domain[:255]
+
+
+def _source_hostname(url: str) -> str | None:
+    try:
+        host = (urlparse(url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return None
+    return host or None
+
+
+def _company_research_gate(
+    decision: CompanyCategoryDecision,
+    sources: list[CompanyResearchSource],
+    *,
+    company_domain: str | None,
+    active_category_keys: set[str],
+    settings: Settings,
+) -> dict[str, Any]:
+    source_domains = sorted(
+        {
+            hostname
+            for source in sources
+            if (hostname := _source_hostname(source.url)) is not None
+        }
+    )
+    exact_domain_source = bool(
+        company_domain
+        and any(
+            hostname == company_domain or hostname.endswith(f".{company_domain}")
+            for hostname in source_domains
+        )
+    )
+    score_gap = max(
+        0.0,
+        float(decision.category_confidence) - float(decision.runner_up_confidence),
+    )
+    reasons: list[str] = []
+    if decision.recommended_category_key not in active_category_keys:
+        reasons.append("NO_ACTIVE_CATEGORY_RECOMMENDATION")
+    if decision.identity_confidence < settings.company_research_min_identity_confidence:
+        reasons.append("LOW_IDENTITY_CONFIDENCE")
+    if decision.category_confidence < settings.company_research_min_category_confidence:
+        reasons.append("LOW_CATEGORY_CONFIDENCE")
+    if score_gap < settings.company_research_min_score_gap:
+        reasons.append("CATEGORY_SCORE_GAP_TOO_SMALL")
+    if decision.conflicting_evidence:
+        reasons.append("CONFLICTING_EVIDENCE")
+    if (
+        len(source_domains) < settings.company_research_min_sources
+        and not exact_domain_source
+    ):
+        reasons.append("INSUFFICIENT_INDEPENDENT_SOURCES")
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "score_gap": round(score_gap, 4),
+        "source_domains": source_domains,
+        "exact_domain_source": exact_domain_source,
+    }
+
+
+def _cached_company_research(
+    customer: Customer,
+    *,
+    company_domain: str | None,
+    catalog_signature: str,
+    now: datetime,
+) -> tuple[CompanyCategoryDecision, list[CompanyResearchSource], dict[str, Any]] | None:
+    cache = (customer.metadata_json or {}).get(COMPANY_RESEARCH_CACHE_KEY)
+    if not isinstance(cache, dict):
+        return None
+    if (
+        cache.get("schema_version") != COMPANY_RESEARCH_CACHE_SCHEMA
+        or cache.get("catalog_signature") != catalog_signature
+        or cache.get("company_domain") != company_domain
+    ):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(str(cache["expires_at"]))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= now:
+            return None
+        decision = CompanyCategoryDecision.model_validate(cache["decision"])
+        sources = [
+            CompanyResearchSource.model_validate(item)
+            for item in cache.get("sources") or []
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    metadata = cache.get("metadata") if isinstance(cache.get("metadata"), dict) else {}
+    return decision, sources, {**metadata, "cache_hit": True}
+
+
+def _store_company_research_cache(
+    customer: Customer,
+    *,
+    company_domain: str | None,
+    catalog_signature: str,
+    decision: CompanyCategoryDecision,
+    sources: list[CompanyResearchSource],
+    metadata: dict[str, Any],
+    settings: Settings,
+    now: datetime,
+) -> None:
+    safe_metadata = {
+        key: metadata.get(key)
+        for key in ("provider", "model", "request_hash", "input_tokens", "output_tokens")
+        if metadata.get(key) is not None
+    }
+    cache = {
+        "schema_version": COMPANY_RESEARCH_CACHE_SCHEMA,
+        "researched_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=settings.company_research_cache_days)).isoformat(),
+        "company_domain": company_domain,
+        "catalog_signature": catalog_signature,
+        "decision": decision.model_dump(mode="json"),
+        "sources": [source.model_dump(mode="json") for source in sources],
+        "metadata": safe_metadata,
+    }
+    customer.metadata_json = {
+        **(customer.metadata_json or {}),
+        COMPANY_RESEARCH_CACHE_KEY: cache,
+    }
 
 
 def _pricing_policy(row: PricePolicy) -> PricingPolicy:
@@ -2452,6 +2607,63 @@ async def _resolve_new_inquiry_case(
             )
             if category_resolution is not None:
                 return category_resolution
+            # An explicit list request from one known contact is safe to
+            # represent as a product/category-pending case.  This lets the
+            # normal AI job run bounded company research instead of creating a
+            # premature case-less handoff.  Multiple internal interests remain
+            # ambiguous and are never overridden by public web evidence.
+            if (
+                get_settings().company_research_enabled
+                and explicit_product_list_requested(combined_text)
+                and not facts.get("active_interest_categories")
+            ):
+                currency_rows = await session.execute(
+                    select(SalesCase.currency).where(
+                        SalesCase.customer_id == contact.customer_id,
+                        SalesCase.status.not_in(
+                            [CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]
+                        ),
+                    )
+                )
+                currencies = set(currency_rows.scalars().all())
+                currency = next(iter(currencies)) if len(currencies) == 1 else "USD"
+                sales_case = SalesCase(
+                    customer_id=contact.customer_id,
+                    contact_id=contact.id,
+                    product_id=None,
+                    category_id=None,
+                    currency=currency,
+                    stage=CaseStage.QUOTING,
+                    status=CaseStatus.ACTIVE,
+                    subject_key=normalized_subject(parsed.subject)[:255],
+                )
+                session.add(sales_case)
+                await session.flush()
+                return NewInquiryResolution(
+                    sales_case,
+                    facts={
+                        **facts,
+                        "currency": currency,
+                        "product_pending": True,
+                        "category_pending": True,
+                        "match_basis": "explicit_product_list_pending_company_research",
+                    },
+                )
+            if (
+                explicit_product_list_requested(combined_text)
+                and not facts.get("active_interest_categories")
+            ):
+                return NewInquiryResolution(
+                    None,
+                    HandoffReason.PRODUCT_CATEGORY_REVIEW,
+                    "Product-list request has no unique CRM/Excel category; company research is disabled",
+                    {
+                        **facts,
+                        "product_pending": True,
+                        "category_pending": True,
+                        "company_research": {"status": "DISABLED"},
+                    },
+                )
         return NewInquiryResolution(
             None,
             HandoffReason.NEW_INQUIRY_REVIEW,
@@ -3522,6 +3734,325 @@ async def _maybe_send_quote_clarification(
     return True
 
 
+async def _company_research_catalog(
+    session: AsyncSession,
+) -> tuple[dict[str, ProductCategory], list[dict[str, Any]], str]:
+    categories = (
+        (
+            await session.execute(
+                select(ProductCategory)
+                .where(ProductCategory.active.is_(True))
+                .order_by(ProductCategory.sort_order, ProductCategory.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    products = (
+        (
+            await session.execute(
+                select(Product)
+                .where(
+                    Product.active.is_(True),
+                    Product.category_id.is_not(None),
+                )
+                .order_by(Product.category_id, Product.sort_order, Product.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    examples_by_category: dict[int, list[str]] = {}
+    for product in products:
+        if product.category_id is None:
+            continue
+        examples = examples_by_category.setdefault(product.category_id, [])
+        for value in (product.series, product.name):
+            normalized = str(value or "").strip()
+            if normalized and normalized not in examples and len(examples) < 12:
+                examples.append(normalized)
+    payload = [
+        {
+            "key": category.key,
+            "name": category.name,
+            "examples": examples_by_category.get(category.id, []),
+        }
+        for category in categories
+    ]
+    signature = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    return {category.key: category for category in categories}, payload, signature
+
+
+async def _maybe_research_and_send_product_list(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+    existing_handoff: Handoff | None = None,
+) -> bool:
+    """Use cited company research only for an explicit, category-less list request."""
+
+    async def route_handoff(
+        reason: HandoffReason,
+        summary: str,
+        facts: dict[str, Any],
+    ) -> Handoff:
+        if existing_handoff is None:
+            return await create_handoff(
+                session,
+                case=case,
+                reason=reason,
+                summary=summary,
+                facts=facts,
+                source_email_id=email_row.id,
+            )
+        existing_handoff.reason_code = reason.value
+        existing_handoff.summary = summary
+        existing_handoff.extracted_facts = facts
+        if case.status == CaseStatus.ACTIVE:
+            case.status = CaseStatus.WAITING_HUMAN
+        await audit(
+            session,
+            "handoff.reclassified",
+            case_id=case.id,
+            actor="company-research-backfill",
+            data={
+                "handoff_id": existing_handoff.id,
+                "reason": reason.value,
+                "source_email_id": email_row.id,
+            },
+        )
+        await session.commit()
+        return existing_handoff
+
+    if analysis.intent != Intent.PRODUCT_LIST_REQUEST or not explicit_product_list_requested(
+        f"{email_row.subject}\n{email_row.body_text}"
+    ):
+        return False
+    settings = get_settings()
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            product_confidence=1.0,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            product_known=analysis.product_code is None,
+            prebook_requested=analysis.prebook_requested,
+            packaging_requested=analysis.packaging_requested,
+            delivery_requested=analysis.shipping_requested,
+        ),
+        intent_threshold=settings.intent_confidence_threshold,
+        product_threshold=settings.product_confidence_threshold,
+        numeric_threshold=settings.numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await route_handoff(
+            send_decision.reason or HandoffReason.LOW_CONFIDENCE,
+            f"Inbound {analysis.intent.value} requires human review",
+            analysis_facts,
+        )
+        return True
+    if not settings.company_research_enabled:
+        await route_handoff(
+            HandoffReason.PRODUCT_CATEGORY_REVIEW,
+            "Product-list request has no unique CRM/Excel category; company research is disabled",
+            {
+                **analysis_facts,
+                "product_pending": True,
+                "company_research": {"status": "DISABLED"},
+            },
+        )
+        return True
+
+    categories_by_key, category_payload, catalog_signature = await _company_research_catalog(
+        session
+    )
+    if not categories_by_key:
+        await route_handoff(
+            HandoffReason.PRODUCT_CATEGORY_REVIEW,
+            "No active product category is available for a product-list reply",
+            {**analysis_facts, "product_pending": True},
+        )
+        return True
+    company_domain = _nonfree_email_domain(case.contact.email)
+    observed_at = datetime.now(UTC)
+    cached = _cached_company_research(
+        case.customer,
+        company_domain=company_domain,
+        catalog_signature=catalog_signature,
+        now=observed_at,
+    )
+    if cached is None:
+        ai = AIClient(settings)
+        try:
+            decision, sources, metadata = await ai.research_company_category(
+                company_name=case.customer.company_name,
+                company_domain=company_domain,
+                categories=category_payload,
+            )
+        except Exception as exc:
+            session.add(
+                AIInvocation(
+                    case_id=case.id,
+                    provider=settings.ai_provider,
+                    model=settings.anthropic_model,
+                    purpose="company_category_research",
+                    request_hash=hashlib.sha256(
+                        f"{case.customer.id}:{catalog_signature}".encode()
+                    ).hexdigest(),
+                    parsed_output=None,
+                    success=False,
+                    error_type=type(exc).__name__,
+                    input_tokens=None,
+                    output_tokens=None,
+                )
+            )
+            await audit(
+                session,
+                "company_research.failed",
+                case_id=case.id,
+                actor="system",
+                data={
+                    "email_id": email_row.id,
+                    "customer_id": case.customer_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await route_handoff(
+                HandoffReason.PRODUCT_CATEGORY_REVIEW,
+                "Company research failed; product category requires human confirmation",
+                {
+                    **analysis_facts,
+                    "product_pending": True,
+                    "company_research": {
+                        "status": "FAILED",
+                        "error_type": type(exc).__name__,
+                    },
+                },
+            )
+            return True
+        research_output = {
+            "decision": decision.model_dump(mode="json"),
+            "sources": [source.model_dump(mode="json") for source in sources],
+        }
+        session.add(
+            AIInvocation(
+                case_id=case.id,
+                provider=str(metadata.get("provider") or settings.ai_provider),
+                model=str(metadata.get("model") or settings.anthropic_model),
+                purpose="company_category_research",
+                request_hash=str(metadata.get("request_hash") or catalog_signature),
+                parsed_output=research_output,
+                success=True,
+                input_tokens=metadata.get("input_tokens"),
+                output_tokens=metadata.get("output_tokens"),
+            )
+        )
+        _store_company_research_cache(
+            case.customer,
+            company_domain=company_domain,
+            catalog_signature=catalog_signature,
+            decision=decision,
+            sources=sources,
+            metadata=metadata,
+            settings=settings,
+            now=observed_at,
+        )
+        cache_hit = False
+    else:
+        decision, sources, metadata = cached
+        cache_hit = True
+
+    gate = _company_research_gate(
+        decision,
+        sources,
+        company_domain=company_domain,
+        active_category_keys=set(categories_by_key),
+        settings=settings,
+    )
+    research_facts = {
+        "status": "COMPLETED",
+        "cache_hit": cache_hit,
+        "company_name": case.customer.company_name,
+        "company_domain": company_domain,
+        "decision": decision.model_dump(mode="json"),
+        "sources": [source.model_dump(mode="json") for source in sources],
+        "gate": gate,
+        "provider": metadata.get("provider"),
+        "model": metadata.get("model"),
+    }
+    await audit(
+        session,
+        "company_research.completed",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "customer_id": case.customer_id,
+            "cache_hit": cache_hit,
+            "recommended_category_key": decision.recommended_category_key,
+            "eligible": gate["eligible"],
+            "gate_reasons": gate["reasons"],
+            "source_domains": gate["source_domains"],
+        },
+    )
+    if not gate["eligible"] or not settings.company_research_auto_send_enabled:
+        recommended = categories_by_key.get(decision.recommended_category_key or "")
+        summary = (
+            f"Company research suggests {recommended.name}; human confirmation is required"
+            if recommended is not None
+            else "Company research could not safely determine a product category"
+        )
+        if gate["eligible"] and not settings.company_research_auto_send_enabled:
+            summary += " (observation mode)"
+        await route_handoff(
+            HandoffReason.PRODUCT_CATEGORY_REVIEW,
+            summary,
+            {
+                **analysis_facts,
+                "product_pending": True,
+                "company_research": research_facts,
+            },
+        )
+        return True
+
+    category = categories_by_key[decision.recommended_category_key or ""]
+    case.category_id = category.id
+    case.category = category
+    await audit(
+        session,
+        "company_research.category_selected",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "category_id": category.id,
+            "category_key": category.key,
+            "research": research_facts,
+        },
+    )
+    return await _maybe_send_product_list(
+        session,
+        case=case,
+        email_row=email_row,
+        analysis=analysis,
+        analysis_facts={
+            **analysis_facts,
+            "company_research": research_facts,
+        },
+    )
+
+
 async def _maybe_send_product_list(
     session: AsyncSession,
     *,
@@ -3712,13 +4243,16 @@ async def backfill_product_list_requests(
     max_age_days: int = 30,
     handoff_ids: tuple[int, ...] = (),
     include_history: bool = False,
+    company_research: bool = False,
 ) -> dict[str, Any]:
     """Safely queue replies for explicit, unresolved product-list requests.
 
     Preview mode is strictly read-only. Apply mode revalidates every delivery
-    guard, requires a unique active catalog category, preserves the original
-    reply thread, and resolves the obsolete handoff only after an idempotent
-    PRODUCT_LIST outbox row exists.
+    guard, normally requires a unique active catalog category, preserves the
+    original reply thread, and resolves the obsolete handoff only after an
+    idempotent PRODUCT_LIST outbox row exists. ``company_research`` is an
+    explicit opt-in for selected, category-less handoffs and remains governed
+    by both company-research feature switches.
     """
     if limit <= 0:
         raise ValueError("limit must be positive")
@@ -3848,6 +4382,7 @@ async def backfill_product_list_requests(
             continue
 
         category = None
+        research_required = False
         if sales_case is not None:
             category = sales_case.category
             if (
@@ -3866,14 +4401,27 @@ async def backfill_product_list_requests(
                 {item.id: item for item in interest_categories}.values()
             )
             if len(interest_categories) != 1:
-                exclude(
-                    handoff,
-                    "INTEREST_CATEGORY_NOT_UNIQUE",
-                    category_keys=[item.key for item in interest_categories],
-                )
-                continue
-            category = interest_categories[0]
-        if category.id not in categories_by_id:
+                if (
+                    company_research
+                    and not interest_categories
+                    and sales_case is not None
+                    and sales_case.product_id is None
+                    and sales_case.category_id is None
+                ):
+                    if not settings.company_research_enabled:
+                        exclude(handoff, "COMPANY_RESEARCH_DISABLED")
+                        continue
+                    research_required = True
+                else:
+                    exclude(
+                        handoff,
+                        "INTEREST_CATEGORY_NOT_UNIQUE",
+                        category_keys=[item.key for item in interest_categories],
+                    )
+                    continue
+            else:
+                category = interest_categories[0]
+        if category is not None and category.id not in categories_by_id:
             exclude(handoff, "CATEGORY_INACTIVE")
             continue
 
@@ -3948,7 +4496,22 @@ async def backfill_product_list_requests(
             source.attachment_metadata,
         ).model_copy(update={"risky_attachment": False})
         matched_product = None
-        if existing_product_list is None:
+        if existing_product_list is None and research_required:
+            if analysis.intent != Intent.PRODUCT_LIST_REQUEST:
+                exclude(
+                    handoff,
+                    "UNSAFE_PRODUCT_LIST_INTENT",
+                    detected_intent=analysis.intent.value,
+                )
+                continue
+            if analysis.product_code is not None:
+                exclude(
+                    handoff,
+                    "SPECIFIC_PRODUCT_REQUIRES_CATALOG_MATCH",
+                    detected_product_code=canonical_product_code(analysis.product_code),
+                )
+                continue
+        if existing_product_list is None and not research_required:
             if analysis.intent != Intent.PRODUCT_LIST_REQUEST:
                 exclude(
                     handoff,
@@ -4106,8 +4669,9 @@ async def backfill_product_list_requests(
             "recipient": contact.email,
             "subject": source.subject,
             "received_at": source.received_at.isoformat(),
-            "category_id": category.id,
-            "category_key": category.key,
+            "category_id": category.id if category is not None else None,
+            "category_key": category.key if category is not None else None,
+            "company_research_required": research_required,
             "detected_intent": analysis.intent.value,
             "detected_product_code": analysis.product_code,
             "matched_product_id": (
@@ -4120,6 +4684,57 @@ async def backfill_product_list_requests(
         candidates.append(candidate)
         if not apply:
             continue
+
+        if research_required and existing_product_list is None:
+            if sales_case is None:
+                exclusions.append(
+                    {
+                        "handoff_id": handoff.id,
+                        "email_id": source.id,
+                        "reason": "COMPANY_RESEARCH_CASE_REQUIRED",
+                    }
+                )
+                continue
+            if sales_case.status == CaseStatus.WAITING_HUMAN:
+                sales_case.status = CaseStatus.ACTIVE
+            await _maybe_research_and_send_product_list(
+                session,
+                case=sales_case,
+                email_row=source,
+                analysis=analysis,
+                analysis_facts={
+                    **(handoff.extracted_facts or {}),
+                    **analysis.model_dump(mode="json"),
+                    "company_research_backfill": True,
+                },
+                existing_handoff=handoff,
+            )
+            existing_product_list = await session.scalar(
+                select(Outbox).where(
+                    Outbox.business_key == f"inbound-product-list:{source.id}",
+                    Outbox.status != DeliveryStatus.CANCELLED,
+                )
+            )
+            if existing_product_list is None:
+                await session.refresh(handoff)
+                exclusions.append(
+                    {
+                        "handoff_id": handoff.id,
+                        "email_id": source.id,
+                        "reason": "COMPANY_RESEARCH_REQUIRES_HUMAN",
+                        "handoff_reason": handoff.reason_code,
+                        "summary": handoff.summary,
+                    }
+                )
+                continue
+            await session.refresh(sales_case, ["category"])
+            category = sales_case.category
+            if category is None:
+                raise RuntimeError(
+                    "company research queued a product list without assigning a category"
+                )
+            candidate["category_id"] = category.id
+            candidate["category_key"] = category.key
 
         if existing_product_list is None:
             prepared = prepared_replies[handoff.id]
@@ -4223,6 +4838,7 @@ async def backfill_product_list_requests(
     return {
         "apply": apply,
         "include_history": include_history,
+        "company_research": company_research,
         "max_age_days": max_age_days,
         "scanned": len(handoffs),
         "candidate_count": len(candidates),
@@ -4370,6 +4986,18 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
                 analysis_facts=analysis_facts,
             ):
                 return
+        if (
+            case.category_id is None
+            and analysis.intent == Intent.PRODUCT_LIST_REQUEST
+            and await _maybe_research_and_send_product_list(
+                session,
+                case=case,
+                email_row=email_row,
+                analysis=analysis,
+                analysis_facts=analysis_facts,
+            )
+        ):
+            return
         if analysis.intent == Intent.QUOTE_REQUEST:
             if await _maybe_send_quote_clarification(
                 session,
@@ -4382,8 +5010,16 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await create_handoff(
             session,
             case=case,
-            reason=HandoffReason.HUMAN_CONTROL,
-            summary="Case product is still pending human selection",
+            reason=(
+                HandoffReason.PRODUCT_CATEGORY_REVIEW
+                if analysis.intent == Intent.PRODUCT_LIST_REQUEST
+                else HandoffReason.HUMAN_CONTROL
+            ),
+            summary=(
+                "Product-list request requires product category confirmation"
+                if analysis.intent == Intent.PRODUCT_LIST_REQUEST
+                else "Case product is still pending human selection"
+            ),
             facts={**analysis_facts, "product_pending": True},
             source_email_id=email_row.id,
         )

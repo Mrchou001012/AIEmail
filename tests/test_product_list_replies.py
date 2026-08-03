@@ -9,7 +9,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
 from app.db import (
+    AIInvocation,
+    CaseStage,
     CaseStatus,
     Contact,
     Customer,
@@ -306,7 +309,9 @@ async def test_sample_request_still_requires_human(db_session: AsyncSession) -> 
     assert handoff.reason_code == HandoffReason.SAMPLE_REQUEST.value
 
 
-async def test_unknown_interest_routes_to_human(db_session: AsyncSession) -> None:
+async def test_unknown_interest_routes_to_semantic_handoff_when_research_disabled(
+    db_session: AsyncSession,
+) -> None:
     await _seed_catalog_and_interest(db_session, interests=[])
     email_row = await ingest_raw_email(
         db_session,
@@ -319,13 +324,254 @@ async def test_unknown_interest_routes_to_human(db_session: AsyncSession) -> Non
     )
 
     assert email_row is not None and email_row.case_id is None
+
     handoff = await db_session.scalar(
         select(Handoff).where(Handoff.source_email_id == email_row.id)
     )
     assert handoff is not None
-    assert handoff.reason_code == HandoffReason.NEW_INQUIRY_REVIEW.value
-    assert handoff.extracted_facts["interest_categories"] == []
+    assert handoff.reason_code == HandoffReason.PRODUCT_CATEGORY_REVIEW.value
+    assert handoff.extracted_facts["company_research"]["status"] == "DISABLED"
     assert await _queued_product_list(db_session) is None
+
+
+async def test_company_research_observation_mode_records_evidence_without_sending(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=[])
+    settings = get_settings()
+    monkeypatch.setattr(settings, "company_research_enabled", True)
+    monkeypatch.setattr(settings, "company_research_auto_send_enabled", False)
+
+    async def research(*args, **kwargs):
+        return (
+            CompanyCategoryDecision(
+                identity_confidence=0.98,
+                recommended_category_key="industrial_silanes",
+                category_confidence=0.94,
+                runner_up_category_key="rubber_plastics",
+                runner_up_confidence=0.20,
+                conflicting_evidence=False,
+                rationale="Two sources identify industrial silane distribution.",
+            ),
+            [
+                CompanyResearchSource(
+                    url="https://industry.example/ethachem",
+                    title="Industry directory",
+                    cited_text="Industrial silane distributor",
+                ),
+                CompanyResearchSource(
+                    url="https://trade.example/ethachem",
+                    title="Trade profile",
+                    cited_text="Silane coupling agents",
+                ),
+            ],
+            {
+                "provider": "anthropic",
+                "model": "claude-test",
+                "request_hash": "a" * 64,
+                "input_tokens": 20,
+                "output_tokens": 10,
+            },
+        )
+
+    monkeypatch.setattr(AIClient, "research_company_category", research)
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product list inquiry",
+            "Please send us your product list.",
+            message_id="research-observation@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+
+    await process_inbound(db_session, email_row.id)
+
+    assert await _queued_product_list(db_session) is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.PRODUCT_CATEGORY_REVIEW.value
+    research_facts = handoff.extracted_facts["company_research"]
+    assert research_facts["gate"]["eligible"] is True
+    assert research_facts["decision"]["recommended_category_key"] == "industrial_silanes"
+    invocation = await db_session.scalar(
+        select(AIInvocation).where(AIInvocation.purpose == "company_category_research")
+    )
+    assert invocation is not None and invocation.success is True
+
+
+async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=[])
+    settings = get_settings()
+    monkeypatch.setattr(settings, "company_research_enabled", True)
+    monkeypatch.setattr(settings, "company_research_auto_send_enabled", True)
+    calls = 0
+
+    async def research(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return (
+            CompanyCategoryDecision(
+                identity_confidence=0.98,
+                recommended_category_key="industrial_silanes",
+                category_confidence=0.94,
+                runner_up_category_key="rubber_plastics",
+                runner_up_confidence=0.20,
+                conflicting_evidence=False,
+                rationale="Two sources identify industrial silane distribution.",
+            ),
+            [
+                CompanyResearchSource(url="https://industry.example/ethachem"),
+                CompanyResearchSource(url="https://trade.example/ethachem"),
+            ],
+            {
+                "provider": "anthropic",
+                "model": "claude-test",
+                "request_hash": "b" * 64,
+            },
+        )
+
+    monkeypatch.setattr(AIClient, "research_company_category", research)
+    first = await ingest_raw_email(
+        db_session,
+        _message(
+            "First catalog request",
+            "Please send us your product list.",
+            message_id="research-auto-first@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert first is not None and first.case_id is not None
+    await process_inbound(db_session, first.id)
+
+    first_outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-product-list:{first.id}")
+    )
+    assert first_outbox is not None
+    first_case = await db_session.get(SalesCase, first.case_id)
+    assert first_case is not None and first_case.category_id is not None
+
+    second = await ingest_raw_email(
+        db_session,
+        _message(
+            "Second catalog request",
+            "Please send your product catalog.",
+            message_id="research-auto-second@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert second is not None and second.case_id is not None
+    await process_inbound(db_session, second.id)
+
+    second_outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.business_key == f"inbound-product-list:{second.id}")
+    )
+    assert second_outbox is not None
+    assert calls == 1
+
+
+async def test_selected_legacy_handoff_can_use_company_research_backfill(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    customer_id, contact_id = await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Legacy product list request",
+            "Please send us your product list.",
+            message_id="research-backfill@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is None
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+
+    sales_case = SalesCase(
+        customer_id=customer_id,
+        contact_id=contact_id,
+        product_id=None,
+        category_id=None,
+        currency="INR",
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.WAITING_HUMAN,
+        subject_key="legacy product list request",
+    )
+    db_session.add(sales_case)
+    await db_session.flush()
+    email_row.case_id = sales_case.id
+    handoff.case_id = sales_case.id
+    await db_session.commit()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "company_research_enabled", True)
+    monkeypatch.setattr(settings, "company_research_auto_send_enabled", True)
+    calls = 0
+
+    async def research(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return (
+            CompanyCategoryDecision(
+                identity_confidence=0.98,
+                recommended_category_key="industrial_silanes",
+                category_confidence=0.94,
+                runner_up_category_key="rubber_plastics",
+                runner_up_confidence=0.20,
+                conflicting_evidence=False,
+                rationale="Two sources identify industrial silane distribution.",
+            ),
+            [
+                CompanyResearchSource(url="https://industry.example/ethachem"),
+                CompanyResearchSource(url="https://trade.example/ethachem"),
+            ],
+            {
+                "provider": "anthropic",
+                "model": "claude-test",
+                "request_hash": "c" * 64,
+            },
+        )
+
+    monkeypatch.setattr(AIClient, "research_company_category", research)
+    preview = await backfill_product_list_requests(
+        db_session,
+        apply=False,
+        handoff_ids=(handoff.id,),
+        company_research=True,
+    )
+    assert preview["candidate_count"] == 1
+    assert preview["candidates"][0]["company_research_required"] is True
+    assert calls == 0
+
+    result = await backfill_product_list_requests(
+        db_session,
+        apply=True,
+        handoff_ids=(handoff.id,),
+        company_research=True,
+    )
+    assert result["queued_count"] == 1
+    assert calls == 1
+    outbox = await db_session.scalar(
+        select(Outbox).where(
+            Outbox.business_key == f"inbound-product-list:{email_row.id}"
+        )
+    )
+    assert outbox is not None
+    await db_session.refresh(handoff)
+    await db_session.refresh(sales_case)
+    assert handoff.status == "RESOLVED"
+    assert sales_case.status == CaseStatus.ACTIVE
+    assert sales_case.category_id is not None
 
 
 async def test_multiple_interests_route_to_human(db_session: AsyncSession) -> None:

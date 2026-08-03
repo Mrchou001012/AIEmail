@@ -35,6 +35,7 @@ HANDOFF_REASON_LABELS = {
     "BOUNCE_REVIEW": "退信待核对",
     "NEW_INQUIRY_REVIEW": "新询盘待确认",
     "INVENTORY_UNAVAILABLE": "库存不可用",
+    "PRODUCT_CATEGORY_REVIEW": "产品系列待确认",
 }
 
 HANDOFF_REASON_SUMMARIES = {
@@ -61,6 +62,7 @@ HANDOFF_REASON_SUMMARIES = {
     "BOUNCE_REVIEW": "退信暂时无法安全确定处理方式，需要核对。",
     "NEW_INQUIRY_REVIEW": "新询盘无法安全自动建立或关联业务案例。",
     "INVENTORY_UNAVAILABLE": "当前库存不足或库存信息尚未确认。",
+    "PRODUCT_CATEGORY_REVIEW": "客户索要产品列表，但系统无法安全确定应发送的产品系列，需要人工确认。",
 }
 
 
