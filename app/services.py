@@ -4207,6 +4207,81 @@ async def _augment_pending_quote_context(
     return analysis.model_copy(update=updates), None
 
 
+def _quantity_unit_label(unit: str | None) -> str:
+    """Human-readable quantity unit for clarification questions."""
+    normalized = (unit or "").strip().lower()
+    if normalized in {"kg", "kgs", "kilogram", "kilograms"}:
+        return "kilograms"
+    if normalized in {"piece", "pieces"}:
+        return "pieces"
+    if normalized in {"unit", "units"}:
+        return "units"
+    return normalized or "kilograms"
+
+
+def _pluralized_unit(unit: str | None) -> str:
+    """Pluralize the product unit when it is a countable noun."""
+    normalized = (unit or "").strip().lower()
+    if normalized in {"piece", "unit"}:
+        return f"{normalized}s"
+    return normalized or "unit"
+
+
+async def _moq_price_lines(
+    session: AsyncSession,
+    *,
+    codes: list[str],
+    currency: str,
+) -> list[str]:
+    """Build one reference-price line per product that has an active policy.
+
+    Products without a matching policy are simply skipped: the clarification
+    still asks for their quantity, and callers never crash when catalog or
+    commercial data changes underneath the request.
+    """
+    unique_codes = list(dict.fromkeys(code for code in codes if code))
+    if not unique_codes:
+        return []
+    products = (
+        (
+            await session.execute(
+                select(Product).where(
+                    _product_lookup_conditions(unique_codes),
+                    Product.active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    product_by_code = {
+        canonical_product_code(product.code): product for product in products
+    }
+    lines: list[str] = []
+    for code in unique_codes:
+        product = product_by_code.get(canonical_product_code(code))
+        if product is None:
+            continue
+        policy = await active_policy(session, product.id, currency)
+        if (
+            policy is None
+            or policy.min_quantity is None
+            or policy.min_quantity <= 0
+            or policy.standard_price is None
+            or policy.standard_price <= 0
+        ):
+            continue
+        raw_unit = (product.unit or "unit").strip() or "unit"
+        unit = _pluralized_unit(raw_unit)
+        lines.append(
+            f"For {product.code} ({product.name}): our minimum order quantity "
+            f"is {policy.min_quantity} {unit} at {currency} "
+            f"{policy.standard_price:.4f} per {raw_unit}. "
+            "Better pricing is available for larger volumes."
+        )
+    return lines
+
+
 async def _maybe_send_quote_clarification(
     session: AsyncSession,
     *,
@@ -4289,25 +4364,46 @@ async def _maybe_send_quote_clarification(
         question = (
             f"Could you please confirm the required quantity for {names}?"
         )
+        reference_lines = await _moq_price_lines(
+            session,
+            codes=missing_product_codes,
+            currency=case.currency,
+        )
     elif needs_quantity:
         opening = (
             f"Thank you for your quotation request for {case.product.name}."
             if case.product is not None
             else "Thank you for your quotation request."
         )
-        question = "Could you please confirm the required quantity in kilograms?"
+        reference_lines = (
+            await _moq_price_lines(
+                session,
+                codes=[case.product.code],
+                currency=case.currency,
+            )
+            if case.product is not None
+            else []
+        )
+        question = (
+            f"Could you please confirm the required quantity in "
+            f"{_quantity_unit_label(case.product.unit if case.product is not None else None)}?"
+        )
     else:
         opening = (
             f"Thank you for your quotation request for {analysis.quantity} kg."
             if analysis.quantity is not None
             else "Thank you for your quotation request."
         )
+        reference_lines = []
         question = (
             "Could you please confirm the product name or Lanya product code, "
             "together with the required quantity?"
         )
-    closing = "Once confirmed, we will check the current availability and price."
-    business_lines = [greeting, "", opening, "", question, closing]
+    closing = "Once confirmed, we will confirm availability and prepare your quotation accordingly."
+    business_lines = [greeting, "", opening]
+    for line in reference_lines:
+        business_lines.extend(["", line])
+    business_lines.extend(["", question, closing])
     text = "\n".join([*business_lines, "", bundle.signature_text.strip()])
     html_body = (
         "<p>"

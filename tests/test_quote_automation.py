@@ -1,7 +1,9 @@
 import hashlib
 from datetime import date
 from decimal import Decimal
+from email import policy
 from email.message import EmailMessage as MIMEMessage
+from email.parser import BytesParser
 
 import pytest
 from sqlalchemy import func, select
@@ -134,7 +136,16 @@ async def test_quote_missing_quantity_asks_then_quotes(db_session: AsyncSession)
         select(Outbox).where(Outbox.message_kind == "QUOTE_CLARIFICATION")
     )
     assert clarification is not None
-    assert "required quantity" in clarification.raw_message
+    mime = BytesParser(policy=policy.default).parsebytes(
+        clarification.raw_message.encode("utf-8")
+    )
+    body_text = mime.get_body(preferencelist=("plain",)).get_content()
+    assert "required quantity" in body_text
+    assert (
+        "minimum order quantity is 10 pieces at USD 100.0000 per piece"
+        in body_text
+    )
+    assert "Better pricing is available for larger volumes" in body_text
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
     reply = await _add_inbound(
@@ -393,7 +404,53 @@ async def test_multi_product_quote_missing_quantity_clarifies(
     )
     assert clarification is not None
     assert "WIDGET-200" in clarification.raw_message
+    mime = BytesParser(policy=policy.default).parsebytes(
+        clarification.raw_message.encode("utf-8")
+    )
+    body_text = mime.get_body(preferencelist=("plain",)).get_content()
+    assert (
+        "For WIDGET-200 (Industrial Widget 200): our minimum order quantity "
+        "is 1 kg at USD 200.0000 per kg" in body_text
+    )
     assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+
+
+async def test_multi_product_quote_missing_quantity_without_policy_clarifies_without_price(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    unpriced = Product(
+        code="WIDGET-999",
+        name="Unpriced Widget",
+        unit="kg",
+        approved_text_key="widget_999",
+    )
+    db_session.add(unpriced)
+    await db_session.commit()
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            "Please quote PRODUCT WIDGET-100 100 kg and PRODUCT WIDGET-999.",
+            message_id="multi-quote-missing-qty-unpriced",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+
+    await process_inbound(db_session, email_row.id)
+
+    clarification = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    )
+    assert clarification is not None
+    assert "WIDGET-999" in clarification.raw_message
+    mime = BytesParser(policy=policy.default).parsebytes(
+        clarification.raw_message.encode("utf-8")
+    )
+    body_text = mime.get_body(preferencelist=("plain",)).get_content()
+    assert "minimum order quantity" not in body_text
+    assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
 
 async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
