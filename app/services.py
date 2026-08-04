@@ -1810,7 +1810,9 @@ async def quote_with_manual_price(
     the next inquiry for the same product still routes to a human, and the
     review screen shows this stored price history.
     """
-    handoff = await session.get(Handoff, handoff_id)
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.id == handoff_id).with_for_update()
+    )
     if handoff is None:
         raise ValueError("handoff not found")
     if handoff.status != "OPEN":
@@ -2014,6 +2016,8 @@ async def quote_with_manual_price(
         references=_reply_references(source_email),
         inline_images=source.inline_images,
     )
+    if outbox is None:
+        raise ValueError("a quotation is already queued for this handoff")
     handoff.status = "RESOLVED"
     handoff.resolution_note = (
         note.strip()

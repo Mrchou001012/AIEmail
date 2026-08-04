@@ -755,6 +755,16 @@ async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
     assert quote is not None and quote.product_id == product.id
     await db_session.refresh(handoff)
     assert handoff.status == "RESOLVED"
+    with pytest.raises(ValueError, match="already resolved"):
+        await quote_with_manual_price(
+            db_session,
+            handoff_id=handoff.id,
+            product_id=product.id,
+            standard_price=Decimal("450.0000"),
+            currency="USD",
+            quantity=50,
+            actor="admin",
+        )
 
     # A later inquiry for the same product still routes to a human, and the
     # review screen shows the stored historical price for reference.
