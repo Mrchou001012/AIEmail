@@ -44,12 +44,25 @@
     .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
     button { border:0; border-radius:9px; padding:9px 13px; cursor:pointer; background:#e9eef6; color:var(--ink); font-weight:650; }
     button.primary { background:var(--blue); color:#fff; }
+    button.secondary { background:#fff; border:1px dashed #c7d0dd; color:var(--blue); }
     button.warn { background:#fff1f0; color:var(--red); }
     button:disabled { opacity:.45; cursor:not-allowed; }
+    button:not(:disabled) { transition:background .12s ease, filter .12s ease, transform .06s ease; }
+    button:not(:disabled):hover { filter:brightness(.97); }
+    button:not(:disabled):active { transform:translateY(1px); }
+    input:focus, select:focus, textarea:focus { outline:2px solid rgba(23,92,211,.22); outline-offset:0; border-color:var(--blue); }
     .check { display:flex; align-items:center; gap:8px; font-weight:400; }
     .check input { width:auto; }
     .file-help { color:var(--muted); font-size:12px; margin-top:6px; }
     .file-list { margin-top:8px; padding:9px 11px; border-radius:9px; background:#f8fafc; color:var(--muted); overflow-wrap:anywhere; }
+    .suggested-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .suggested-tag { display:inline-flex; align-items:center; gap:5px; background:#eef4ff; color:#1849a9; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:650; }
+    .suggested-tag .qty { color:#667085; font-weight:400; }
+    .price-line { display:grid; grid-template-columns:minmax(0,1fr) 132px 112px 34px; gap:8px; align-items:center; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:8px; }
+    .price-line .sub { grid-column:1 / -1; margin:2px 0 0; font-size:12px; }
+    .price-line input { padding:8px 10px; }
+    .price-line .manual-price-remove { width:34px; height:34px; border-radius:9px; background:#fff; border:1px solid var(--line); color:var(--muted); font-size:16px; line-height:1; }
+    .price-line .manual-price-remove:hover { background:#fff1f0; color:var(--red); border-color:#fda29b; }
     .identity-review { margin:12px 0; padding:12px; border:1px solid #f7d394; border-radius:10px; background:#fffaeb; }
     .identity-review strong { color:#7a2e0e; }
     .row.compact { grid-template-columns:minmax(0,1fr) auto; }
@@ -57,7 +70,13 @@
     #notice.error { display:block; background:#fff1f0; color:var(--red); }
     #notice.ok { display:block; background:#ecfdf3; color:var(--green); }
     .hidden { display:none !important; }
-    @media (max-width:850px) { .grid { grid-template-columns:1fr; } .shell { padding:14px; } .meta { grid-template-columns:90px 1fr; } }
+    @media (max-width:850px) {
+      .grid { grid-template-columns:1fr; }
+      .shell { padding:14px; }
+      .meta { grid-template-columns:90px 1fr; }
+      .price-line { grid-template-columns:1fr 1fr; }
+      .price-line .manual-price-remove { grid-column:2; justify-self:end; }
+    }
   </style>
 </head>
 <body>
@@ -133,10 +152,10 @@
         <article class="card" id="manual-price-card">
           <h2>快速定价并发送报价</h2>
           <div class="sub" id="manual-price-help">产品默认不预选；按需添加产品并填写单价、数量，可一次为多个产品定价，系统生成一封报价邮件发送，价格保存为历史参考；下次同产品询价仍转人工。</div>
-          <div id="manual-price-suggested" class="file-list"></div>
+          <div id="manual-price-suggested" class="suggested-tags"></div>
           <div id="manual-price-lines"></div>
           <div class="actions">
-            <button id="manual-price-add" type="button">添加产品</button>
+            <button id="manual-price-add" class="secondary" type="button">＋ 添加产品</button>
           </div>
           <label for="manual-price-note">处理备注</label>
           <input id="manual-price-note" maxlength="2000" placeholder="例如：客户要 YAC-HMDS，人工定价后系统代发">
@@ -442,18 +461,14 @@
     let manualPriceOpen = false;
     function manualPriceRow(productId, quantity) {
       const row = document.createElement("div");
-      row.className = "card";
-      row.style.marginBottom = "8px";
-      row.style.padding = "8px";
+      row.className = "price-line";
       row.innerHTML = `
-        <div class="row">
-          <select class="manual-price-product">
-            <option value="">选择产品…</option>
-          </select>
-          <input class="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001" placeholder="单价">
-          <input class="manual-price-quantity" type="number" min="1" step="1" placeholder="数量">
-          <button class="manual-price-remove" type="button" title="移除">×</button>
-        </div>
+        <select class="manual-price-product" aria-label="产品">
+          <option value="">选择产品…</option>
+        </select>
+        <input class="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001" placeholder="单价">
+        <input class="manual-price-quantity" type="number" min="1" step="1" placeholder="数量">
+        <button class="manual-price-remove" type="button" title="移除" aria-label="移除">×</button>
         <div class="sub manual-price-history">暂无可参考的历史价格</div>`;
       const select = row.querySelector(".manual-price-product");
       for (const product of manualPriceProducts) {
@@ -500,14 +515,26 @@
       const productById = new Map((data.products || []).map((product) => [String(product.id), product]));
       const suggested = data.suggested_lines || [];
       const suggestedNode = $("#manual-price-suggested");
-      suggestedNode.textContent = suggested.length
-        ? "该处理单涉及：" + suggested.map((line) => {
-            const product = productById.get(String(line.product_id));
-            return product
-              ? `${product.code}${line.quantity ? `（数量 ${line.quantity}）` : ""}`
-              : String(line.product_id);
-          }).join("、")
-        : "";
+      suggestedNode.innerHTML = "";
+      if (suggested.length) {
+        const hint = document.createElement("span");
+        hint.className = "sub";
+        hint.textContent = "该处理单涉及：";
+        suggestedNode.appendChild(hint);
+        for (const line of suggested) {
+          const product = productById.get(String(line.product_id));
+          const tag = document.createElement("span");
+          tag.className = "suggested-tag";
+          tag.textContent = product ? product.code : String(line.product_id);
+          if (line.quantity) {
+            const qty = document.createElement("span");
+            qty.className = "qty";
+            qty.textContent = `数量 ${line.quantity}`;
+            tag.appendChild(qty);
+          }
+          suggestedNode.appendChild(tag);
+        }
+      }
       const container = $("#manual-price-lines");
       container.innerHTML = "";
       container.appendChild(manualPriceRow(null, null));
