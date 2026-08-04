@@ -564,7 +564,7 @@
     function renderHandoffs(rows) {
       $("#handoffs-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${timeCell(row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td>${timeCell(row.created_at)}<span class="cell-sub">#${esc(row.id)}</span></td>
           <td>${reasonTag(row.reason)}</td>
           <td><a class="link-btn" href="/admin/handoffs/${row.id}/review" title="${esc(row.summary)}">${esc(short(row.summary, 72))}</a><span class="cell-sub">${statusTag(row.status)}</span></td>
           <td>${statusTag(row.dingtalk_status)}</td>
@@ -575,7 +575,7 @@
     function renderOutbox(rows) {
       $("#outbox-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${timeCell(row.sent_at || row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td>${timeCell(row.sent_at || row.created_at)}<span class="cell-sub">#${esc(row.id)}</span></td>
           <td><button class="link-btn" data-detail="outbox" data-id="${row.id}" data-title="发件记录 #${row.id}" title="${esc(row.recipient)}">${esc(short(row.recipient, 48))}</button>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 62))}</span>` : ""}</td>
           <td>${statusTag(row.status)}</td>
           <td>${esc(row.attempts)}</td>
@@ -598,7 +598,7 @@
     function renderJobs(rows) {
       $("#jobs-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${timeCell(row.updated_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td>${timeCell(row.updated_at)}<span class="cell-sub">#${esc(row.id)}</span></td>
           <td><span class="cell-main mono" title="${esc(row.kind)}">${esc(row.kind)}</span>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 70))}</span>` : ""}</td>
           <td>${statusTag(row.status)}</td>
           <td>${esc(row.attempts)} / ${esc(row.max_attempts)}</td>

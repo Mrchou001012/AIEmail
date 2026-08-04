@@ -20,6 +20,7 @@
     .table-scroll::-webkit-scrollbar-thumb { background: #d5dbe5; border-radius: 999px; }
     .page-ellipsis { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; color: var(--text-secondary); }
     @media (max-width: 1100px) { .shell { width: calc(100% - 32px); } }
+    @media (min-width: 1140px) { .table-scroll { overflow-x: visible; } }
     @media (max-width: 768px) { .title-area { flex-direction: column; } .shell { width: calc(100% - 24px); padding-top: 16px; } }
   </style>
 </head>
@@ -104,8 +105,7 @@
     }
     function fmt(value) {
       if (!value) return "—";
-      const text = String(value).replace("T", " ").slice(0, 19);
-      return text.includes(" ") ? text : text;
+      return String(value).replace("T", " ").slice(0, 19);
     }
     function timeCell(value) {
       const text = fmt(value);
@@ -162,7 +162,7 @@
         return `<tr>
           <td class="col-time">${timeCell(row.created_at)}</td>
           <td class="col-reason">${reasonTag(row.reason)}</td>
-          <td class="col-summary"><a class="summary-link" href="/admin/handoffs/${row.id}/review" title="${esc(summary)}"><span class="summary-id">#${row.id}</span><span class="ellipsis">${esc(summary || "（无摘要）")}</span></a></td>
+          <td class="col-summary"><a class="summary-link" href="/admin/handoffs/${row.id}/review" title="${esc(summary)}"><span class="summary-id">#${esc(row.id)}</span><span class="ellipsis">${esc(summary || "（无摘要）")}</span></a></td>
           <td class="col-status">${statusTag(row.status)}</td>
           <td class="col-dingtalk">${statusTag(row.dingtalk_status)}</td>
           <td class="col-updated">${timeCell(row.updated_at)}</td>
@@ -173,7 +173,7 @@
         return `<tr>
           <td class="col-time">${timeCell(row.created_at)}</td>
           <td class="col-recipient"><span class="ellipsis" title="${esc(recipient)}">${esc(recipient)}</span></td>
-          <td class="col-kind"><span class="status-tag gray" title="${esc(row.message_kind)}">${esc(row.message_kind)}</span> #${row.id}</td>
+          <td class="col-kind"><span class="status-tag gray" title="${esc(row.message_kind)}">${esc(row.message_kind)}</span> #${esc(row.id)}</td>
           <td class="col-status">${statusTag(row.status)}</td>
           <td class="col-attempts">${esc(row.attempts)}</td>
           <td class="col-error">${row.last_error ? `<span class="error-text ellipsis" title="${esc(row.last_error)}">${esc(short(row.last_error, 120))}</span>` : ""}</td>
@@ -182,7 +182,7 @@
       const kind = String(row.kind || "");
       return `<tr>
         <td class="col-time">${timeCell(row.created_at)}</td>
-        <td class="col-kind"><span class="status-tag gray" title="${esc(kind)}">${esc(kind)}</span> #${row.id}</td>
+        <td class="col-kind"><span class="status-tag gray" title="${esc(kind)}">${esc(kind)}</span> #${esc(row.id)}</td>
         <td class="col-status">${statusTag(row.status)}</td>
         <td class="col-attempts">${esc(row.attempts)}/${esc(row.max_attempts)}</td>
         <td class="col-available">${timeCell(row.available_at)}</td>

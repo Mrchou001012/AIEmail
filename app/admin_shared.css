@@ -68,6 +68,15 @@
   line-height: 1;
 }
 
+.view-all-button:focus-visible,
+.segmented-item:focus-visible,
+.page-button:focus-visible,
+.filter-group select:focus-visible,
+.filter-group button:focus-visible {
+  outline: 2px solid #93b4f8;
+  outline-offset: 2px;
+}
+
 /* 状态胶囊 */
 .status-tag {
   display: inline-flex;
@@ -160,6 +169,11 @@
   color: #1e40af;
   font-weight: 600;
   flex: 0 0 auto;
+}
+
+.summary-link .ellipsis {
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 /* 分段选择器 */
