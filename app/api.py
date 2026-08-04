@@ -78,6 +78,7 @@ from app.reactivation import (
     validate_template,
 )
 from app.services import (
+    _product_lookup_conditions,
     active_policy,
     add_customer_contact_endpoint,
     assign_handoff_case,
@@ -86,6 +87,7 @@ from app.services import (
     generate_handoff_draft_preview,
     ingest_raw_email,
     queue_human_reply,
+    quote_with_manual_price,
     replace_handoff_recipient,
     resolve_deliverability_handoff,
     seed_demo_data,
@@ -168,6 +170,14 @@ class HandoffReplyRequest(BaseModel):
     body_text: str = Field(min_length=1, max_length=50_000)
     note: str = Field(default="", max_length=2_000)
     resume_automation: bool = False
+
+
+class ManualPriceQuoteRequest(BaseModel):
+    product_id: int = Field(gt=0)
+    standard_price: Decimal = Field(gt=0, le=1_000_000_000)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+    quantity: int = Field(gt=0)
+    note: str = Field(default="", max_length=2_000)
 
 
 class ContactEndpointCreateRequest(BaseModel):
@@ -2488,6 +2498,54 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
     approved_outbox = await session.scalar(
         select(Outbox).where(Outbox.approval_handoff_id == handoff.id)
     )
+    history_product = None
+    if case is not None and case.product_id is not None:
+        history_product = await session.get(Product, case.product_id)
+    else:
+        fact_codes = [
+            str(item)
+            for item in (handoff.extracted_facts.get("product_codes") or [])
+        ]
+        if not fact_codes and handoff.extracted_facts.get("product_code"):
+            fact_codes = [str(handoff.extracted_facts["product_code"])]
+        if fact_codes:
+            history_product = await session.scalar(
+                select(Product)
+                .where(
+                    _product_lookup_conditions(fact_codes),
+                    Product.active.is_(True),
+                )
+                .order_by(Product.id)
+                .limit(1)
+            )
+    price_history: list[dict[str, Any]] = []
+    if history_product is not None:
+        history_rows = (
+            (
+                await session.execute(
+                    select(PricePolicy)
+                    .where(PricePolicy.product_id == history_product.id)
+                    .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        price_history = [
+            {
+                "id": row.id,
+                "price": str(row.standard_price),
+                "currency": row.currency,
+                "valid_from": row.valid_from.isoformat(),
+                "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                "active": row.active,
+                "created_at": (
+                    row.created_at.isoformat() if row.created_at else None
+                ),
+            }
+            for row in history_rows
+        ]
     return {
         "id": handoff.id,
         "case_id": handoff.case_id,
@@ -2532,6 +2590,16 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
             }
             for product in products
         ],
+        "price_history_product": (
+            {
+                "id": history_product.id,
+                "code": history_product.code,
+                "name": history_product.name,
+            }
+            if history_product is not None
+            else None
+        ),
+        "price_history": price_history,
         "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
         "approved_outbox": (
             {
@@ -2725,6 +2793,35 @@ async def send_handoff_reply(
         "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
         "outbox_id": outbox.id,
         "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/price-quote", status_code=202)
+async def send_manual_price_quote(
+    handoff_id: int,
+    request: ManualPriceQuoteRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    """Human sets one price; the system persists it and sends the quotation."""
+    try:
+        outbox = await quote_with_manual_price(
+            session,
+            handoff_id=handoff_id,
+            product_id=request.product_id,
+            standard_price=request.standard_price,
+            currency=request.currency,
+            quantity=request.quantity,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+        "product_id": request.product_id,
     }
 
 

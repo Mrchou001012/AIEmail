@@ -1786,6 +1786,258 @@ async def queue_human_reply(
     return outbox
 
 
+async def quote_with_manual_price(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    product_id: int,
+    standard_price: Decimal,
+    currency: str,
+    quantity: int,
+    actor: str,
+    note: str = "",
+) -> Outbox:
+    """Persist a human-set price and let the system send the quotation.
+
+    The price is stored as an active standalone price policy (inheriting
+    commercial terms from the most recent policy of the same product when
+    available), so the next inquiry for the same product can be quoted
+    automatically and historical prices remain visible to the team.
+    """
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.case_id is None or handoff.source_email_id is None:
+        raise ValueError("associate the handoff with a case before quoting")
+    case = await session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.contact))
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if case is None:
+        raise ValueError("handoff case no longer exists")
+    product = await session.scalar(
+        select(Product).where(Product.id == product_id, Product.active.is_(True))
+    )
+    if product is None:
+        raise ValueError("product is not active in the catalog")
+    currency = currency.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("currency must be a three-letter code")
+    if standard_price <= 0:
+        raise ValueError("standard price must be positive")
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+
+    latest_policy = await session.scalar(
+        select(PricePolicy)
+        .where(
+            PricePolicy.product_id == product.id,
+            PricePolicy.currency == currency,
+        )
+        .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+        .limit(1)
+    )
+    today = date.today()
+    policy = PricePolicy(
+        commercial_cycle_id=None,
+        product_id=product.id,
+        currency=currency,
+        standard_price=standard_price,
+        # Counteroffers stay human-only; the floor equals the human-set price
+        # so no accidental automatic discount is possible.
+        absolute_floor=standard_price,
+        max_discount_pct=Decimal("0"),
+        max_negotiation_rounds=(
+            latest_policy.max_negotiation_rounds
+            if latest_policy is not None
+            else 2
+        ),
+        concession_step_pct=(
+            latest_policy.concession_step_pct
+            if latest_policy is not None
+            else Decimal("0.02")
+        ),
+        min_quantity=latest_policy.min_quantity if latest_policy is not None else 1,
+        max_quantity=(
+            latest_policy.max_quantity if latest_policy is not None else None
+        ),
+        tier_1_max_multiple=(
+            latest_policy.tier_1_max_multiple if latest_policy is not None else None
+        ),
+        tier_1_markup_pct=(
+            latest_policy.tier_1_markup_pct if latest_policy is not None else Decimal("0")
+        ),
+        tier_2_max_multiple=(
+            latest_policy.tier_2_max_multiple if latest_policy is not None else None
+        ),
+        tier_2_markup_pct=(
+            latest_policy.tier_2_markup_pct if latest_policy is not None else Decimal("0")
+        ),
+        quote_valid_days=latest_policy.quote_valid_days if latest_policy is not None else 30,
+        quote_valid_weekday=(
+            latest_policy.quote_valid_weekday if latest_policy is not None else None
+        ),
+        standard_incoterm=(
+            latest_policy.standard_incoterm
+            if latest_policy is not None
+            else "EXW"
+        ),
+        allowed_incoterms=list(latest_policy.allowed_incoterms or ["EXW"])
+        if latest_policy is not None
+        else ["EXW"],
+        standard_payment_term=(
+            latest_policy.standard_payment_term
+            if latest_policy is not None
+            else "100% before shipment"
+        ),
+        allowed_payment_terms=list(latest_policy.allowed_payment_terms or ["100% before shipment"])
+        if latest_policy is not None
+        else ["100% before shipment"],
+        taxes_included=latest_policy.taxes_included if latest_policy is not None else False,
+        freight_included=(
+            latest_policy.freight_included if latest_policy is not None else False
+        ),
+        valid_from=today,
+        valid_to=None,
+        source_hash=f"manual-price:{handoff_id}:{actor}:{today.isoformat()}:{product.id}:{currency}",
+        # Historical reference only: prices change frequently, so a
+        # human-set price must never feed the next autonomous quotation.
+        # The review screen shows this record; the next inquiry routes to a
+        # human again who can price with the history in view.
+        active=False,
+    )
+    session.add(policy)
+    await session.flush()
+
+    if case.product_id is None:
+        case.product_id = product.id
+        case.product = product
+    if case.currency != currency:
+        case.currency = currency
+    settings = get_settings()
+    valid_until = quote_valid_until(
+        quote_valid_days=policy.quote_valid_days,
+        quote_valid_weekday=policy.quote_valid_weekday,
+        today=datetime.now(UTC)
+        .astimezone(ZoneInfo(settings.business_timezone))
+        .date(),
+    )
+    bundle = load_content(settings.content_dir)
+    try:
+        plan = await AIClient().draft_plan(
+            {
+                "subject": "Quotation",
+                "contact_name": case.contact.name,
+                "approved_product_key": product.approved_text_key,
+            }
+        )
+        source_email = await session.get(EmailMessage, handoff.source_email_id)
+        if source_email is None:
+            raise ValueError("handoff source email no longer exists")
+        source = _reply_source(source_email)
+        text, html_body = render_multi_quote(
+            plan=plan,
+            bundle=bundle,
+            lines=[
+                {
+                    "product_name": product.name,
+                    "quantity": quantity,
+                    "unit": product.unit,
+                    "unit_price": standard_price,
+                    "incoterm": policy.standard_incoterm,
+                    "payment_term": policy.standard_payment_term,
+                    "taxes_included": policy.taxes_included,
+                    "freight_included": policy.freight_included,
+                }
+            ],
+            currency=currency,
+            valid_until=valid_until,
+            availability_note="Subject to confirmation at order placement",
+        )
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=source_email.from_address,
+            source_body=source.body_text,
+            source_html=source.body_html,
+            occurred_at=source_email.received_at,
+        )
+    except Exception as exc:
+        raise ValueError(f"quotation rendering failed: {type(exc).__name__}") from exc
+
+    latest_quote = await session.scalar(
+        select(Quote)
+        .where(Quote.case_id == case.id)
+        .order_by(Quote.round_number.desc(), Quote.id.desc())
+        .limit(1)
+    )
+    round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
+    quote = Quote(
+        case_id=case.id,
+        product_id=product.id,
+        price_policy_id=policy.id,
+        commercial_cycle_id=None,
+        round_number=round_number,
+        unit_price=standard_price,
+        currency=currency,
+        quantity=quantity,
+        incoterm=policy.standard_incoterm,
+        payment_term=policy.standard_payment_term,
+        valid_until=valid_until,
+        pricing_snapshot={
+            "hard_minimum": str(standard_price),
+            "pricing_reason": "manual-price",
+            "applied_markup_pct": "0",
+            "requested_price": None,
+        },
+    )
+    session.add(quote)
+    await session.flush()
+    case.negotiation_round = round_number
+    outbox = await freeze_outbox(
+        session,
+        case=case,
+        quote=quote,
+        subject=f"Re: {source_email.subject}",
+        text_body=text,
+        html_body=html_body,
+        business_key=f"handoff-reply:{handoff.id}:manual-price",
+        in_reply_to=source_email.message_id,
+        references=_reply_references(source_email),
+        inline_images=source.inline_images,
+    )
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = (
+        note.strip()
+        or f"Priced by {actor} at {currency} {standard_price} for {quantity} {product.unit}"
+    )
+    if handoff.dingtalk_status != "SENT":
+        handoff.dingtalk_status = "CANCELLED"
+    session.add(
+        AuditEvent(
+            case_id=case.id,
+            actor=actor,
+            event_type="handoff.manual_price_quoted",
+            data={
+                "handoff_id": handoff.id,
+                "outbox_id": outbox.id,
+                "product_id": product.id,
+                "product_code": product.code,
+                "currency": currency,
+                "standard_price": str(standard_price),
+                "quantity": quantity,
+                "policy_id": policy.id,
+                "quote_id": quote.id,
+            },
+        )
+    )
+    await session.commit()
+    return outbox
+
+
 def _reply_references(source_email: EmailMessage) -> list[str]:
     """Build a complete, ordered RFC reply chain for a response."""
     return list(
@@ -2835,7 +3087,13 @@ async def _resolve_new_inquiry_case(
         )
 
     product = await session.scalar(
-        select(Product).where(Product.code == product_codes[0], Product.active.is_(True))
+        select(Product)
+        .where(
+            _product_lookup_conditions(product_codes),
+            Product.active.is_(True),
+        )
+        .order_by(Product.id)
+        .limit(1)
     )
     if product is None:
         return NewInquiryResolution(
@@ -2870,6 +3128,17 @@ async def _resolve_new_inquiry_case(
         # Manual-only products can still be represented as a case and routed to
         # a human using the customer's established market currency.
         currency = next(iter(customer_currencies))
+    elif (
+        not policy_currencies
+        and not customer_currencies
+        and not explicit_product_list_requested(combined_text)
+    ):
+        # Unpriced product in a quotation context with no customer history:
+        # still create the case with the default INR market so the human can
+        # price it from the handoff (the review screen then sends the
+        # quotation automatically). Explicit catalog requests stay case-less
+        # for the product-list backfill pipeline.
+        currency = "INR"
     else:
         return NewInquiryResolution(
             None,

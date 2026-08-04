@@ -25,6 +25,7 @@ from app.services import (
     active_policy,
     ingest_raw_email,
     process_inbound,
+    quote_with_manual_price,
     seed_demo_data,
 )
 from app.settings import Settings
@@ -393,3 +394,98 @@ async def test_multi_product_quote_missing_quantity_clarifies(
     assert clarification is not None
     assert "WIDGET-200" in clarification.raw_message
     assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+
+
+async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    product = Product(
+        code="WIDGET-300",
+        name="Industrial Widget 300",
+        unit="kg",
+        approved_text_key="widget_300",
+    )
+    db_session.add(product)
+    await db_session.commit()
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            "Please quote PRODUCT WIDGET-300 50 kg.",
+            message_id="manual-price-inquiry",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.NONSTANDARD.value
+    assert handoff.case_id is not None
+
+    outbox = await quote_with_manual_price(
+        db_session,
+        handoff_id=handoff.id,
+        product_id=product.id,
+        standard_price=Decimal("450.0000"),
+        currency="USD",
+        quantity=50,
+        actor="admin",
+    )
+    assert outbox.message_kind == "AUTO_QUOTE"
+    assert "Industrial Widget 300" in outbox.raw_message
+
+    policy = await db_session.scalar(
+        select(PricePolicy).where(
+            PricePolicy.product_id == product.id,
+        )
+        .order_by(PricePolicy.id.desc())
+        .limit(1)
+    )
+    assert policy is not None
+    assert policy.standard_price == Decimal("450.0000")
+    assert policy.absolute_floor == Decimal("450.0000")
+    # History only: the human-set price must not enable the next automatic
+    # quotation because prices change frequently.
+    assert policy.active is False
+    quote = await db_session.scalar(
+        select(Quote).where(Quote.case_id == handoff.case_id)
+    )
+    assert quote is not None and quote.product_id == product.id
+    await db_session.refresh(handoff)
+    assert handoff.status == "RESOLVED"
+
+    # A later inquiry for the same product still routes to a human, and the
+    # review screen shows the stored historical price for reference.
+    second = await ingest_raw_email(
+        db_session,
+        _mime(
+            "Please quote PRODUCT WIDGET-300 100 kg.",
+            message_id="manual-price-followup",
+        ),
+        mailbox="integration-test",
+    )
+    assert second is not None and second.case_id is not None
+    await process_inbound(db_session, second.id)
+    second_handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == second.id)
+    )
+    assert second_handoff is not None
+    assert second_handoff.reason_code == HandoffReason.NONSTANDARD.value
+    history_rows = (
+        (
+            await db_session.execute(
+                select(PricePolicy)
+                .where(PricePolicy.product_id == product.id)
+                .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(
+        row.standard_price == Decimal("450.0000") and row.active is False
+        for row in history_rows
+    )
