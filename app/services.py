@@ -7126,6 +7126,8 @@ async def send_one_outbox(
         and row.human_approved_by
         and row.human_approved_at is not None
     )
+    is_forward = row.message_kind == "FORWARD"
+    internal_message = human_approved or is_forward
     if row.message_kind == "REACTIVATION":
         guard = await reactivation_send_guard(session, row, settings=settings, at=now)
         if guard.action == "DEFER":
@@ -7142,7 +7144,7 @@ async def send_one_outbox(
     if (
         settings.commercial_gate_enabled
         and not settings.demo_mode
-        and not human_approved
+        and not internal_message
         and not is_business_day(settings, now)
     ):
         row.status = DeliveryStatus.PENDING
@@ -7150,7 +7152,7 @@ async def send_one_outbox(
         row.last_error = "commercial gate deferred automated mail until Monday"
         await session.commit()
         return True
-    if row.case_id:
+    if row.case_id and not is_forward:
         case = await session.scalar(
             select(SalesCase)
             .options(
@@ -7233,74 +7235,75 @@ async def send_one_outbox(
             return True
     if settings.mail_transport == "smtp":
         recipient = row.recipient.lower()
-        if settings.safe_mode and recipient not in settings.recipient_allowlist:
-            row.status = DeliveryStatus.CANCELLED
-            row.last_error = "SAFE_MODE blocked recipient not on allowlist"
-            await audit(
+        if not is_forward:
+            if settings.safe_mode and recipient not in settings.recipient_allowlist:
+                row.status = DeliveryStatus.CANCELLED
+                row.last_error = "SAFE_MODE blocked recipient not on allowlist"
+                await audit(
+                    session,
+                    "outbox.blocked_safe_mode",
+                    case_id=row.case_id,
+                    actor="policy",
+                    data={"recipient": recipient},
+                )
+                await session.commit()
+                return True
+            if not settings.auto_send_enabled and not human_approved:
+                row.status = DeliveryStatus.CANCELLED
+                row.last_error = "AUTO_SEND_ENABLED is false"
+                await session.commit()
+                return True
+            preflight_outcome, preflight_detail, preflight_facts = await _recipient_preflight(
                 session,
-                "outbox.blocked_safe_mode",
-                case_id=row.case_id,
-                actor="policy",
-                data={"recipient": recipient},
+                recipient,
+                settings,
             )
-            await session.commit()
-            return True
-        if not settings.auto_send_enabled and not human_approved:
-            row.status = DeliveryStatus.CANCELLED
-            row.last_error = "AUTO_SEND_ENABLED is false"
-            await session.commit()
-            return True
-        preflight_outcome, preflight_detail, preflight_facts = await _recipient_preflight(
-            session,
-            recipient,
-            settings,
-        )
-        if preflight_outcome == "DEFER":
-            row.status = DeliveryStatus.PENDING
-            row.available_at = now + timedelta(minutes=settings.mx_temporary_retry_minutes)
-            row.last_error = f"recipient preflight deferred: {preflight_detail}"[:2000]
+            if preflight_outcome == "DEFER":
+                row.status = DeliveryStatus.PENDING
+                row.available_at = now + timedelta(minutes=settings.mx_temporary_retry_minutes)
+                row.last_error = f"recipient preflight deferred: {preflight_detail}"[:2000]
+                await audit(
+                    session,
+                    "outbox.preflight_deferred",
+                    case_id=row.case_id,
+                    actor="dns",
+                    data={"outbox_id": row.id, **preflight_facts},
+                )
+                await session.commit()
+                return True
+            if preflight_outcome == "BLOCK":
+                row.status = DeliveryStatus.CANCELLED
+                row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
+                auto_suppressed = bool(preflight_facts.get("auto_suppressed"))
+                if auto_suppressed and case is not None and case.status not in {
+                    CaseStatus.CLOSED_WON,
+                    CaseStatus.CLOSED_LOST,
+                }:
+                    case.status = CaseStatus.PAUSED
+                await audit(
+                    session,
+                    "outbox.preflight_blocked",
+                    case_id=row.case_id,
+                    actor="policy",
+                    data={"outbox_id": row.id, **preflight_facts},
+                )
+                await session.commit()
+                if case is not None and not auto_suppressed:
+                    await create_handoff(
+                        session,
+                        case=case,
+                        reason=HandoffReason.EMAIL_DELIVERABILITY,
+                        summary=f"Recipient preflight blocked {recipient}: {preflight_detail}",
+                        facts={"outbox_id": row.id, **preflight_facts},
+                    )
+                return True
             await audit(
                 session,
-                "outbox.preflight_deferred",
+                "outbox.preflight_passed",
                 case_id=row.case_id,
                 actor="dns",
                 data={"outbox_id": row.id, **preflight_facts},
             )
-            await session.commit()
-            return True
-        if preflight_outcome == "BLOCK":
-            row.status = DeliveryStatus.CANCELLED
-            row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
-            auto_suppressed = bool(preflight_facts.get("auto_suppressed"))
-            if auto_suppressed and case is not None and case.status not in {
-                CaseStatus.CLOSED_WON,
-                CaseStatus.CLOSED_LOST,
-            }:
-                case.status = CaseStatus.PAUSED
-            await audit(
-                session,
-                "outbox.preflight_blocked",
-                case_id=row.case_id,
-                actor="policy",
-                data={"outbox_id": row.id, **preflight_facts},
-            )
-            await session.commit()
-            if case is not None and not auto_suppressed:
-                await create_handoff(
-                    session,
-                    case=case,
-                    reason=HandoffReason.EMAIL_DELIVERABILITY,
-                    summary=f"Recipient preflight blocked {recipient}: {preflight_detail}",
-                    facts={"outbox_id": row.id, **preflight_facts},
-                )
-            return True
-        await audit(
-            session,
-            "outbox.preflight_passed",
-            case_id=row.case_id,
-            actor="dns",
-            data={"outbox_id": row.id, **preflight_facts},
-        )
         since_hour = now - timedelta(hours=1)
         since_day = now - timedelta(days=1)
         sent_events = await _mailbox_sent_events_since(session, mailbox, since_day, now)

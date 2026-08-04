@@ -1,4 +1,5 @@
 import hashlib
+from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 
@@ -10,6 +11,7 @@ from app.db import (
     AuditEvent,
     CaseStage,
     CaseStatus,
+    DeliveryStatus,
     EmailMessage,
     ForwardRecipient,
     Handoff,
@@ -23,7 +25,9 @@ from app.services import (
     process_inbound,
     save_forward_recipient,
     seed_demo_data,
+    send_one_outbox,
 )
+from app.settings import get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -147,6 +151,30 @@ async def test_process_inbound_skips_human_takeover_cases(
     assert await db_session.scalar(
         select(func.count()).select_from(Handoff)
     ) == 1
+
+
+async def test_forward_outbox_delivers_under_human_takeover(
+    db_session: AsyncSession,
+) -> None:
+    case, _email_row, handoff = await _forward_case(db_session)
+    outbox = await forward_handoff_email(
+        db_session,
+        handoff_id=handoff.id,
+        recipient="sales@lanyachem.com",
+        actor="admin",
+    )
+    await db_session.refresh(case)
+    assert case.status == CaseStatus.HUMAN_TAKEOVER
+
+    delivered = await send_one_outbox(
+        db_session,
+        get_settings(),
+        at=datetime.now(UTC),
+    )
+    assert delivered is True
+    await db_session.refresh(outbox)
+    assert outbox.status == DeliveryStatus.SENT
+    assert outbox.recipient == "sales@lanyachem.com"
 
 
 async def test_forward_recipients_search_and_save(
