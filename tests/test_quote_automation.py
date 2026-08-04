@@ -31,8 +31,9 @@ from app.services import (
     process_inbound,
     quote_with_manual_price,
     seed_demo_data,
+    standard_quote_valid_until,
 )
-from app.settings import Settings
+from app.settings import Settings, get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -318,6 +319,17 @@ async def test_multi_product_quote_sends_one_email_with_two_quotes(
     assert outbox is not None
     assert "Industrial Widget 100" in outbox.raw_message
     assert "Industrial Widget 200" in outbox.raw_message
+    expected_valid_until = standard_quote_valid_until(get_settings())
+    assert expected_valid_until.weekday() == 0
+    assert 1 <= (expected_valid_until - date.today()).days <= 7
+    mime = BytesParser(policy=policy.default).parsebytes(
+        outbox.raw_message.encode("utf-8")
+    )
+    body_text = mime.get_body(preferencelist=("plain",)).get_content()
+    assert (
+        f"Quote valid until: {expected_valid_until.isoformat()} "
+        f"({expected_valid_until.strftime('%A')})"
+    ) in body_text
     quotes = (
         (
             await db_session.execute(
@@ -333,6 +345,7 @@ async def test_multi_product_quote_sends_one_email_with_two_quotes(
         (await db_session.scalar(select(Product).where(Product.code == "WIDGET-200"))).id,
     }
     assert len({quote.round_number for quote in quotes}) == 1
+    assert {quote.valid_until for quote in quotes} == {expected_valid_until}
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
 

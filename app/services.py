@@ -1929,13 +1929,7 @@ async def quote_with_manual_price(
     if case.currency != currency:
         case.currency = currency
     settings = get_settings()
-    valid_until = quote_valid_until(
-        quote_valid_days=policy.quote_valid_days,
-        quote_valid_weekday=policy.quote_valid_weekday,
-        today=datetime.now(UTC)
-        .astimezone(ZoneInfo(settings.business_timezone))
-        .date(),
-    )
+    valid_until = standard_quote_valid_until(settings)
     bundle = load_content(settings.content_dir)
     try:
         plan = await AIClient().draft_plan(
@@ -2287,6 +2281,24 @@ def render_multi_quote(
     return text, html_body
 
 
+def standard_quote_valid_until(
+    settings: Settings,
+    at: datetime | None = None,
+) -> date:
+    """Quotations expire on the coming Monday.
+
+    The weekly price refresh covers only the current week, so every quotation
+    is anchored to the Monday of the following week regardless of the product
+    or the day it was issued.
+    """
+    observed = at or datetime.now(UTC)
+    today = observed.astimezone(ZoneInfo(settings.business_timezone)).date()
+    days_until_monday = (0 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    return today + timedelta(days=days_until_monday)
+
+
 async def freeze_outbox(
     session: AsyncSession,
     *,
@@ -2606,11 +2618,7 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             facts={"quantity": quantity, "hard_minimum": str(decision.hard_minimum)},
         )
         return
-    valid_until = quote_valid_until(
-        quote_valid_days=policy_row.quote_valid_days,
-        quote_valid_weekday=policy_row.quote_valid_weekday,
-        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
-    )
+    valid_until = standard_quote_valid_until(settings)
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
@@ -4581,6 +4589,7 @@ async def _maybe_send_multi_product_quote(
 
     codes = [product.code for product in product_by_key.values()]
     settings = get_settings()
+    valid_until = standard_quote_valid_until(settings)
     quote_rows: list[tuple[Product, PricePolicy, QuoteContext, Decimal, int, date]] = []
     for product, quantity in resolved_requests:
         context = await _commercial_quote_context(
@@ -4648,13 +4657,6 @@ async def _maybe_send_multi_product_quote(
                 source_email_id=email_row.id,
             )
             return True
-        valid_until = quote_valid_until(
-            quote_valid_days=policy_row.quote_valid_days,
-            quote_valid_weekday=policy_row.quote_valid_weekday,
-            today=datetime.now(UTC)
-            .astimezone(ZoneInfo(settings.business_timezone))
-            .date(),
-        )
         quote_rows.append(
             (
                 product,
@@ -4757,7 +4759,7 @@ async def _maybe_send_multi_product_quote(
         bundle=bundle,
         lines=lines,
         currency=case.currency,
-        valid_until=quote_rows[0][5],
+        valid_until=valid_until,
         availability_note=availability_note,
     )
     try:
@@ -6396,11 +6398,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    valid_until = quote_valid_until(
-        quote_valid_days=policy_row.quote_valid_days,
-        quote_valid_weekday=policy_row.quote_valid_weekday,
-        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
-    )
+    valid_until = standard_quote_valid_until(settings)
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
