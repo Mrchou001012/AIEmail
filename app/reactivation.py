@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.auto_replies import AutomatedReplyType
 from app.db import (
     AuditEvent,
     CaseStage,
@@ -1167,7 +1168,18 @@ async def record_reactivation_reply(
     allow_changed_contact: bool = False,
     commit: bool = True,
 ) -> bool:
-    if email_row.direction != "INBOUND" or email_row.is_bounce or email_row.is_automated_reply:
+    if (
+        email_row.direction != "INBOUND"
+        or email_row.is_bounce
+        or (
+            email_row.is_automated_reply
+            and email_row.automated_reply_type
+            not in {
+                AutomatedReplyType.DEPARTED.value,
+                AutomatedReplyType.CONTACT_CHANGE.value,
+            }
+        )
+    ):
         return False
     contact_id = email_row.contact_id
     if contact_id is None and email_row.from_address:

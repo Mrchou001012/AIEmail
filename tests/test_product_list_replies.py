@@ -1329,6 +1329,12 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
     assert await db_session.scalar(
         select(func.count()).select_from(Handoff)
     ) == 0
+    recipient = await db_session.scalar(
+        select(ReactivationRecipient).where(
+            ReactivationRecipient.outbox_id == parent.id
+        )
+    )
+    assert recipient is not None and recipient.status == "REPLIED"
 
 
 async def test_departed_reply_without_interest_researches_and_auto_sends(

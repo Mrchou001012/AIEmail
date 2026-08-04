@@ -3265,6 +3265,10 @@ async def ingest_raw_email(
             session.add(row)
             await session.flush()
     except IntegrityError:
+        # The personnel-change / thread-linking side effects above live
+        # outside the savepoint and must not survive a duplicate-email
+        # collision (for example two IMAP syncs racing on the same message).
+        await session.rollback()
         duplicate = await session.scalar(duplicate_query)
         if duplicate is None:
             raise
