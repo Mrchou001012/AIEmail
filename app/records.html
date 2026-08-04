@@ -165,10 +165,21 @@
       $("#rows").innerHTML = items.length
         ? items.map(renderRow).join("")
         : '<tr><td colspan="6" class="empty">没有匹配记录</td></tr>';
-      $("#summary").textContent = lastData ? `共 ${lastData.total} 条` : "加载失败";
-      const start = lastData ? lastData.offset + 1 : 0;
-      const end = lastData ? lastData.offset + items.length : 0;
-      $("#range").textContent = lastData ? `第 ${start}-${end} 条，共 ${lastData.total} 条` : "—";
+      if (!lastData) {
+        $("#summary").textContent = "加载失败";
+        $("#range").textContent = "—";
+      } else if (lastData.total === 0) {
+        $("#summary").textContent = "共 0 条";
+        $("#range").textContent = "共 0 条";
+      } else if (!items.length) {
+        $("#summary").textContent = `共 ${lastData.total} 条`;
+        $("#range").textContent = "已到末尾，没有更多记录";
+      } else {
+        const start = lastData.offset + 1;
+        const end = lastData.offset + items.length;
+        $("#summary").textContent = `共 ${lastData.total} 条`;
+        $("#range").textContent = `第 ${start}-${end} 条，共 ${lastData.total} 条`;
+      }
       $("#prev").disabled = !lastData || lastData.offset <= 0;
       $("#next").disabled = !lastData || lastData.offset + items.length >= lastData.total;
     }

@@ -2721,6 +2721,8 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
 
     suggested_lines: list[dict[str, Any]] = []
     requested_quantity = handoff.extracted_facts.get("requested_quantity")
+    if not isinstance(requested_quantity, int):
+        requested_quantity = handoff.extracted_facts.get("quantity")
     if case is not None and case.product_id is not None:
         suggested_lines.append(
             {
@@ -2779,24 +2781,22 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
                 )
 
     price_history_by_product: dict[str, list[dict[str, Any]]] = {}
-    suggested_product_ids = [
-        int(line["product_id"]) for line in suggested_lines
-    ]
-    if suggested_product_ids:
-        suggested_history_rows = (
+    selectable_product_ids = [int(product.id) for product in products]
+    if selectable_product_ids:
+        selectable_history_rows = (
             (
                 await session.execute(
                     select(PricePolicy)
-                    .where(PricePolicy.product_id.in_(suggested_product_ids))
+                    .where(PricePolicy.product_id.in_(selectable_product_ids))
                     .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
                 )
             )
             .scalars()
             .all()
         )
-        for product_id in suggested_product_ids:
+        for product_id in selectable_product_ids:
             rows_for_product = [
-                row for row in suggested_history_rows if row.product_id == product_id
+                row for row in selectable_history_rows if row.product_id == product_id
             ][:10]
             price_history_by_product[str(product_id)] = [
                 _price_history_payload(row) for row in rows_for_product
