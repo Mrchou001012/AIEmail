@@ -108,6 +108,7 @@ COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
 CONTACTS_PATH = Path(__file__).with_name("contacts.html")
 RECORDS_PATH = Path(__file__).with_name("records.html")
+ADMIN_SHARED_CSS_PATH = Path(__file__).with_name("admin_shared.css")
 MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
@@ -285,6 +286,15 @@ async def favicon() -> FileResponse:
         FAVICON_PATH,
         media_type="image/x-icon",
         headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.get("/admin/static/admin-shared.css", include_in_schema=False)
+async def admin_shared_css() -> FileResponse:
+    return FileResponse(
+        ADMIN_SHARED_CSS_PATH,
+        media_type="text/css",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 

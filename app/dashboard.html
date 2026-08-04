@@ -315,6 +315,7 @@
       .audit-item { grid-template-columns: 1fr; gap: 4px; }
     }
   </style>
+  <link rel="stylesheet" href="/admin/static/admin-shared.css">
 </head>
 <body>
   <main class="shell">
@@ -368,9 +369,15 @@
 
     <div class="two-col">
       <section class="panel">
-        <div class="panel-head"><h2>待人工与异常</h2><small>最近 30 条 · <a href="/admin/records#handoffs">查看全部</a></small></div>
+        <div class="panel-head card-header">
+          <h2>待人工与异常</h2>
+          <div class="card-header-actions">
+            <span class="record-limit">最近 30 条</span>
+            <a class="view-all-button" href="/admin/records#handoffs">查看全部 <span>→</span></a>
+          </div>
+        </div>
         <div class="table-wrap">
-          <table>
+          <table class="mini-table">
             <thead><tr><th>时间</th><th>原因</th><th>摘要</th><th>钉钉</th></tr></thead>
             <tbody id="handoffs-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
           </table>
@@ -378,9 +385,15 @@
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2>发件队列</h2><small>最近 30 条 · <a href="/admin/records#outbox">查看全部</a></small></div>
+        <div class="panel-head card-header">
+          <h2>发件队列</h2>
+          <div class="card-header-actions">
+            <span class="record-limit">最近 30 条</span>
+            <a class="view-all-button" href="/admin/records#outbox">查看全部 <span>→</span></a>
+          </div>
+        </div>
         <div class="table-wrap">
-          <table>
+          <table class="mini-table">
             <thead><tr><th>时间</th><th>收件人</th><th>状态</th><th>重试</th></tr></thead>
             <tbody id="outbox-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
           </table>
@@ -400,9 +413,15 @@
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2>后台任务</h2><small>最近 30 条 · <a href="/admin/records#jobs">查看全部</a></small></div>
+        <div class="panel-head card-header">
+          <h2>后台任务</h2>
+          <div class="card-header-actions">
+            <span class="record-limit">最近 30 条</span>
+            <a class="view-all-button" href="/admin/records#jobs">查看全部 <span>→</span></a>
+          </div>
+        </div>
         <div class="table-wrap">
-          <table>
+          <table class="mini-table">
             <thead><tr><th>时间</th><th>任务</th><th>状态</th><th>尝试</th></tr></thead>
             <tbody id="jobs-body"><tr><td colspan="4" class="empty">正在加载…</td></tr></tbody>
           </table>
@@ -448,6 +467,40 @@
       const warning = ["PENDING", "CLAIMED", "RUNNING", "OPEN", "WAITING_HUMAN", "PAUSED"];
       const kind = good.includes(text) ? "good" : bad.includes(text) ? "bad" : warning.includes(text) ? "warn" : "neutral";
       return `<span class="pill ${kind}">${esc(text)}</span>`;
+    };
+    const statusClass = (value) => {
+      const text = String(value || "").toUpperCase();
+      if (["SENT", "DONE", "RESOLVED"].includes(text)) return "green";
+      if (["FAILED", "UNKNOWN"].includes(text)) return "red";
+      if (["OPEN", "WAITING_HUMAN", "CLAIMED"].includes(text)) return "amber";
+      if (["RECEIVED", "ACTIVE"].includes(text)) return "blue";
+      if (["PROCESSING", "RUNNING"].includes(text)) return "purple";
+      return "gray";
+    };
+    const statusTag = (value) => {
+      const text = String(value ?? "UNKNOWN");
+      return `<span class="status-tag ${statusClass(text)}" title="${esc(text)}">${esc(text)}</span>`;
+    };
+    const reasonClass = (value) => {
+      const text = String(value || "").toUpperCase();
+      if (["AI_FAILURE", "BOUNCE_REVIEW", "SEND_FAILURE"].includes(text)) return "danger";
+      if (["INVENTORY_UNAVAILABLE", "INVENTORY_REVIEW"].includes(text)) return "inventory";
+      if (["THREAD_AMBIGUOUS", "PRIOR_CONTEXT"].includes(text)) return "thread";
+      if (["HUMAN_CONTROL"].includes(text)) return "neutral";
+      return "warn";
+    };
+    const reasonTag = (value) => {
+      const text = String(value ?? "UNKNOWN");
+      return `<span class="reason-tag ${reasonClass(text)}" title="${esc(text)}">${esc(text)}</span>`;
+    };
+    const timeCell = (value) => {
+      if (!value) return "—";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return esc(String(value));
+      const pad = (num) => String(num).padStart(2, "0");
+      const dateText = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+      const timeText = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+      return `<span class="time-cell"><span class="time-date">${dateText}</span><span class="time-time">${timeText}</span></span>`;
     };
     const empty = (cols, text = "暂无记录") => `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`;
 
@@ -511,10 +564,10 @@
     function renderHandoffs(rows) {
       $("#handoffs-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${fmt(row.created_at)}<span class="cell-sub">#${row.id}</span></td>
-          <td>${pill(row.reason)}</td>
-          <td><a class="link-btn" href="/admin/handoffs/${row.id}/review">${esc(short(row.summary, 72))}</a><span class="cell-sub">${pill(row.status)}</span></td>
-          <td>${pill(row.dingtalk_status)}</td>
+          <td>${timeCell(row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td>${reasonTag(row.reason)}</td>
+          <td><a class="link-btn" href="/admin/handoffs/${row.id}/review" title="${esc(row.summary)}">${esc(short(row.summary, 72))}</a><span class="cell-sub">${statusTag(row.status)}</span></td>
+          <td>${statusTag(row.dingtalk_status)}</td>
         </tr>
       `).join("") : empty(4);
     }
@@ -522,9 +575,9 @@
     function renderOutbox(rows) {
       $("#outbox-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${fmt(row.sent_at || row.created_at)}<span class="cell-sub">#${row.id}</span></td>
-          <td><button class="link-btn" data-detail="outbox" data-id="${row.id}" data-title="发件记录 #${row.id}">${esc(short(row.recipient, 48))}</button>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 62))}</span>` : ""}</td>
-          <td>${pill(row.status)}</td>
+          <td>${timeCell(row.sent_at || row.created_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td><button class="link-btn" data-detail="outbox" data-id="${row.id}" data-title="发件记录 #${row.id}" title="${esc(row.recipient)}">${esc(short(row.recipient, 48))}</button>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 62))}</span>` : ""}</td>
+          <td>${statusTag(row.status)}</td>
           <td>${esc(row.attempts)}</td>
         </tr>
       `).join("") : empty(4);
@@ -545,9 +598,9 @@
     function renderJobs(rows) {
       $("#jobs-body").innerHTML = rows.length ? rows.map((row) => `
         <tr>
-          <td>${fmt(row.updated_at)}<span class="cell-sub">#${row.id}</span></td>
-          <td><span class="cell-main mono">${esc(row.kind)}</span>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 70))}</span>` : ""}</td>
-          <td>${pill(row.status)}</td>
+          <td>${timeCell(row.updated_at)}<span class="cell-sub">#${row.id}</span></td>
+          <td><span class="cell-main mono" title="${esc(row.kind)}">${esc(row.kind)}</span>${row.last_error ? `<span class="cell-sub">${esc(short(row.last_error, 70))}</span>` : ""}</td>
+          <td>${statusTag(row.status)}</td>
           <td>${esc(row.attempts)} / ${esc(row.max_attempts)}</td>
         </tr>
       `).join("") : empty(4);
