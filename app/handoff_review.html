@@ -164,6 +164,19 @@
           </div>
           <div class="sub" id="manual-price-state"></div>
         </article>
+        <article class="card" id="forward-card">
+          <h2>转发给业务员接管</h2>
+          <div class="sub" id="forward-help">输入业务员邮箱，系统按 Gmail 转发格式发送完整邮件（保留正文与附件），并把该案例转为人工接管，之后 AI 不再处理此案例。</div>
+          <label for="forward-recipient">业务员邮箱</label>
+          <input id="forward-recipient" type="email" maxlength="320" list="forward-recipient-list" placeholder="name@company.com" autocomplete="off">
+          <datalist id="forward-recipient-list"></datalist>
+          <label for="forward-note">转发备注（可选）</label>
+          <input id="forward-note" maxlength="2000" placeholder="例如：请跟进并处理该询盘">
+          <div class="actions">
+            <button class="primary" id="forward-send" type="button">转发并转人工接管</button>
+          </div>
+          <div class="sub" id="forward-state"></div>
+        </article>
         <article class="card" id="reply-card">
           <h2>人工回复</h2>
           <div class="sub">可先调用当前大模型和历史邮件 RAG 生成预览。生成只保存草稿，不会发邮件或通知钉钉。</div>
@@ -455,6 +468,7 @@
       $("#suppress-recipient").disabled = data.status !== "OPEN";
       $("#resolve").classList.toggle("hidden", deliverability);
       renderManualPrice(data);
+      renderForward(data);
     }
     const manualPriceProducts = [];
     const manualPriceHistory = {};
@@ -543,6 +557,28 @@
       const state = $("#manual-price-state");
       state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可定价发送。" : "";
       updateManualPriceSendState();
+    }
+    function renderForward(data) {
+      const state = $("#forward-state");
+      state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可转发。" : "";
+      $("#forward-send").disabled = data.status !== "OPEN";
+    }
+    let forwardRecipientTimer = null;
+    async function loadForwardRecipients() {
+      const query = $("#forward-recipient").value.trim();
+      try {
+        const rows = await api(`/admin/forward-recipients?query=${encodeURIComponent(query)}`);
+        const list = $("#forward-recipient-list");
+        list.innerHTML = "";
+        for (const row of rows) {
+          const option = document.createElement("option");
+          option.value = row.email;
+          option.label = row.name ? `${row.name} <${row.email}>` : row.email;
+          list.appendChild(option);
+        }
+      } catch (_) {
+        // 联想失败不应阻断手动输入和转发。
+      }
     }
     async function load() {
       try {
@@ -684,6 +720,31 @@
       } catch (error) {
         notice(error.message, "error");
         updateManualPriceSendState();
+      }
+    });
+    $("#forward-recipient").addEventListener("input", () => {
+      clearTimeout(forwardRecipientTimer);
+      forwardRecipientTimer = setTimeout(loadForwardRecipients, 300);
+    });
+    $("#forward-send").addEventListener("click", async () => {
+      const recipient = $("#forward-recipient").value.trim();
+      const note = $("#forward-note").value.trim();
+      if (!recipient || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) {
+        notice("请输入有效的业务员邮箱。", "error");
+        return;
+      }
+      if (!confirm(`确认将本案例完整转发给 ${recipient} 并转为人工接管？转发后 AI 将不再处理该案例。`)) return;
+      $("#forward-send").disabled = true;
+      try {
+        await api(`/admin/handoffs/${id}/forward`, {
+          method: "POST",
+          body: JSON.stringify({recipient, note}),
+        });
+        notice("已转发给业务员，案例已转人工接管。", "ok");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#forward-send").disabled = false;
       }
     });
     $("#load-remote-images").addEventListener("click", () => {

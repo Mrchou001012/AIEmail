@@ -107,6 +107,16 @@ class Contact(Base, TimestampMixin):
     customer: Mapped[Customer] = relationship(back_populates="contacts")
 
 
+class ForwardRecipient(Base, TimestampMixin):
+    """Known salesperson addresses used for human takeover forwards."""
+
+    __tablename__ = "forward_recipients"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    name: Mapped[str | None] = mapped_column(String(255))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Product(Base, TimestampMixin):
     __tablename__ = "products"
     id: Mapped[int] = mapped_column(primary_key=True)

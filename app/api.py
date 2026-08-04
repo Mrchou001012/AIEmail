@@ -84,12 +84,15 @@ from app.services import (
     assign_handoff_case,
     create_case_for_handoff,
     enqueue_job,
+    forward_handoff_email,
     generate_handoff_draft_preview,
     ingest_raw_email,
+    list_forward_recipients,
     queue_human_reply,
     quote_with_manual_price,
     replace_handoff_recipient,
     resolve_deliverability_handoff,
+    save_forward_recipient,
     seed_demo_data,
     stream_handoff_draft_preview,
     suppress_contact_endpoint,
@@ -184,6 +187,16 @@ class ManualPriceQuoteRequest(BaseModel):
     lines: list[ManualPriceQuoteLine] = Field(min_length=1, max_length=20)
     currency: str = Field(default="INR", min_length=3, max_length=3)
     note: str = Field(default="", max_length=2_000)
+
+
+class ForwardHandoffRequest(BaseModel):
+    recipient: EmailStr
+    note: str = Field(default="", max_length=2_000)
+
+
+class ForwardRecipientCreateRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="", max_length=255)
 
 
 class ContactEndpointCreateRequest(BaseModel):
@@ -3091,6 +3104,58 @@ async def send_manual_price_quote(
         "status": outbox.status.value,
         "product_ids": [line.product_id for line in request.lines],
     }
+
+
+@router.post("/admin/handoffs/{handoff_id}/forward", status_code=202)
+async def forward_handoff_to_salesperson(
+    handoff_id: int,
+    request: ForwardHandoffRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    """Forward the case email to a salesperson and take the case over."""
+    try:
+        outbox = await forward_handoff_email(
+            session,
+            handoff_id=handoff_id,
+            recipient=str(request.recipient),
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+        "recipient": str(request.recipient),
+    }
+
+
+@router.get("/admin/forward-recipients")
+async def forward_recipients(
+    _: Admin,
+    session: Session,
+    query: str = "",
+    limit: int = Query(20, ge=1, le=50),
+) -> list[dict[str, Any]]:
+    return await list_forward_recipients(session, query=query, limit=limit)
+
+
+@router.post("/admin/forward-recipients")
+async def create_forward_recipient(
+    request: ForwardRecipientCreateRequest,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        return await save_forward_recipient(
+            session,
+            email=str(request.email),
+            name=request.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 async def _read_handoff_reply_attachments(

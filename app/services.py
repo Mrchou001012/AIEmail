@@ -62,6 +62,7 @@ from app.db import (
     EmailAddressStatus,
     EmailDomainStatus,
     EmailMessage,
+    ForwardRecipient,
     Handoff,
     Job,
     JobStatus,
@@ -94,6 +95,7 @@ from app.mail import (
     InlineImageAsset,
     OutboundAttachment,
     ParsedEmail,
+    _sanitize_quoted_html,
     append_quoted_reply,
     attachments_require_review,
     build_message,
@@ -2118,6 +2120,294 @@ async def quote_with_manual_price(
     return outbox
 
 
+def _forward_recipient_email_ok(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()))
+
+
+def _extract_forward_attachments(raw: bytes) -> tuple[OutboundAttachment, ...]:
+    """Collect non-inline MIME parts as forward attachments."""
+    from email import policy as _email_policy
+    from email.parser import BytesParser as _BytesParser
+
+    message = _BytesParser(policy=_email_policy.default).parsebytes(raw)
+    result: list[OutboundAttachment] = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = part.get_content_disposition()
+        content_id = str(part.get("Content-ID") or "").strip()
+        content_location = str(part.get("Content-Location") or "").strip()
+        inline_resource = bool(
+            (content_id or content_location)
+            and (disposition == "inline" or part.get_content_type().startswith("image/"))
+        )
+        if disposition == "attachment" or (filename and not inline_resource):
+            payload = part.get_payload(decode=True) or b""
+            if payload:
+                result.append(
+                    OutboundAttachment(
+                        filename=filename or "unnamed",
+                        content_type=part.get_content_type(),
+                        payload=payload,
+                    )
+                )
+    return tuple(result)
+
+
+def _forwarded_message_bodies(
+    *,
+    note: str,
+    source: FullReplySource,
+    original_from: str,
+    original_to: str,
+    original_subject: str,
+    occurred_at: datetime | None,
+) -> tuple[str, str]:
+    """Build a Gmail-style forwarded message with text and HTML preserved."""
+    timestamp = occurred_at or datetime.now(UTC)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    date_line = timestamp.astimezone(UTC).strftime("%a, %d %b %Y %H:%M %z")
+    body_text = source.body_text or ""
+    header_lines = [
+        "---------- Forwarded message ---------",
+        f"From: {original_from}",
+        f"Date: {date_line}",
+        f"Subject: {original_subject}",
+        f"To: {original_to}",
+    ]
+    text = "\n".join(header_lines) + "\n\n" + body_text
+    if note.strip():
+        text = f"{note.strip()}\n\n{text}"
+
+    header_html = "".join(
+        f"<b>{html.escape(label)}:</b> {html.escape(value)}<br>"
+        for label, value in (
+            ("From", original_from),
+            ("Date", date_line),
+            ("Subject", original_subject),
+            ("To", original_to),
+        )
+    )
+    if source.body_html:
+        quoted_html = _sanitize_quoted_html(source.body_html)
+    else:
+        quoted_html = (
+            '<div style="white-space:pre-wrap">' + html.escape(body_text) + "</div>"
+        )
+    note_html = f"<p>{html.escape(note.strip())}</p>" if note.strip() else ""
+    html_body = (
+        "<div>"
+        f"{note_html}"
+        "<p><b>---------- Forwarded message ---------</b></p>"
+        f"<p>{header_html}</p>"
+        f'<div class="gmail_quote">{quoted_html}</div>'
+        "</div>"
+    )
+    return text, html_body
+
+
+async def list_forward_recipients(
+    session: AsyncSession,
+    *,
+    query: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    conditions = []
+    q = query.strip()
+    if q:
+        pattern = f"%{q}%"
+        conditions.append(
+            or_(
+                ForwardRecipient.email.ilike(pattern),
+                ForwardRecipient.name.ilike(pattern),
+            )
+        )
+    rows = (
+        (
+            await session.execute(
+                select(ForwardRecipient)
+                .where(*conditions)
+                .order_by(
+                    ForwardRecipient.last_used_at.desc().nullslast(),
+                    ForwardRecipient.id.desc(),
+                )
+                .limit(max(1, min(limit, 50)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "email": row.email,
+            "name": row.name,
+            "last_used_at": (
+                row.last_used_at.isoformat() if row.last_used_at else None
+            ),
+        }
+        for row in rows
+    ]
+
+
+async def save_forward_recipient(
+    session: AsyncSession,
+    *,
+    email: str,
+    name: str = "",
+) -> dict[str, Any]:
+    normalized = email.strip().casefold()
+    if not _forward_recipient_email_ok(normalized):
+        raise ValueError("recipient must be a valid email address")
+    row = await session.scalar(
+        select(ForwardRecipient).where(ForwardRecipient.email == normalized)
+    )
+    if row is None:
+        row = ForwardRecipient(
+            email=normalized,
+            name=name.strip() or None,
+            last_used_at=datetime.now(UTC),
+        )
+        session.add(row)
+    else:
+        if name.strip():
+            row.name = name.strip()
+        row.last_used_at = datetime.now(UTC)
+    await session.commit()
+    return {"id": row.id, "email": row.email, "name": row.name}
+
+
+async def forward_handoff_email(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    recipient: str,
+    actor: str,
+    note: str = "",
+) -> Outbox:
+    """Forward the source email to a salesperson and take the case over.
+
+    The forward keeps the original message as a Gmail-style multipart
+    alternative (plain text + sanitized HTML) and preserves non-inline
+    attachments. The case is set to human takeover so the AI never replies to
+    it again.
+    """
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.id == handoff_id).with_for_update()
+    )
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.case_id is None or handoff.source_email_id is None:
+        raise ValueError("associate the handoff with a case before forwarding")
+    case = await session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.contact))
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if case is None:
+        raise ValueError("handoff case no longer exists")
+    recipient = recipient.strip()
+    if not _forward_recipient_email_ok(recipient):
+        raise ValueError("recipient must be a valid email address")
+    source_email = await session.get(EmailMessage, handoff.source_email_id)
+    if source_email is None:
+        raise ValueError("handoff source email no longer exists")
+
+    settings = get_settings()
+    archive_folder = "mail_archive" if source_email.is_history else "inbound_archive"
+    archive_path = (
+        settings.runtime_dir / archive_folder / f"{source_email.raw_sha256}.eml"
+    )
+    attachments: tuple[OutboundAttachment, ...] = ()
+    try:
+        raw = archive_path.read_bytes()
+        source = extract_full_reply_source(raw)
+        attachments = _extract_forward_attachments(raw)
+    except OSError:
+        if html_requires_mime_resources(source_email.body_html):
+            raise ValueError(
+                "the original email archive with inline images is unavailable "
+                "for forwarding"
+            ) from None
+        source = FullReplySource(
+            body_text=source_email.body_text,
+            body_html=source_email.body_html,
+        )
+
+    text_body, html_body = _forwarded_message_bodies(
+        note=note,
+        source=source,
+        original_from=source_email.from_address,
+        original_to=", ".join(source_email.to_addresses),
+        original_subject=source_email.subject,
+        occurred_at=source_email.received_at,
+    )
+    subject = (
+        f"Fwd: {source_email.subject}"
+        if source_email.subject
+        else "Fwd: (no subject)"
+    )
+    outbox = await freeze_outbox(
+        session,
+        case=case,
+        message_kind="FORWARD",
+        recipient=recipient,
+        subject=subject[:998],
+        text_body=text_body,
+        html_body=html_body,
+        business_key=f"handoff-reply:{handoff.id}:forward",
+        in_reply_to=None,
+        references=[],
+        inline_images=source.inline_images,
+        attachments=attachments,
+    )
+    if outbox is None:
+        raise ValueError("a forward is already queued for this handoff")
+
+    normalized = recipient.casefold()
+    recipient_row = await session.scalar(
+        select(ForwardRecipient).where(ForwardRecipient.email == normalized)
+    )
+    if recipient_row is None:
+        recipient_row = ForwardRecipient(
+            email=normalized,
+            name=None,
+            last_used_at=datetime.now(UTC),
+        )
+        session.add(recipient_row)
+    else:
+        recipient_row.last_used_at = datetime.now(UTC)
+
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = (
+        note.strip()
+        or f"Forwarded by {actor} to {recipient} for human takeover"
+    )
+    if handoff.dingtalk_status != "SENT":
+        handoff.dingtalk_status = "CANCELLED"
+    case.status = CaseStatus.HUMAN_TAKEOVER
+    session.add(
+        AuditEvent(
+            case_id=case.id,
+            actor=actor,
+            event_type="handoff.forwarded_to_salesperson",
+            data={
+                "handoff_id": handoff.id,
+                "outbox_id": outbox.id,
+                "recipient": normalized,
+                "case_status": case.status.value,
+                "attachments": len(attachments),
+            },
+        )
+    )
+    await session.commit()
+    return outbox
+
+
 def _reply_references(source_email: EmailMessage) -> list[str]:
     """Build a complete, ordered RFC reply chain for a response."""
     return list(
@@ -2380,6 +2670,7 @@ async def freeze_outbox(
     case: SalesCase,
     quote: Quote | None = None,
     message_kind: str = "AUTO_QUOTE",
+    recipient: str | None = None,
     subject: str,
     text_body: str,
     html_body: str,
@@ -2389,9 +2680,10 @@ async def freeze_outbox(
     inline_images: tuple[InlineImageAsset, ...] = (),
     attachments: tuple[OutboundAttachment, ...] = (),
 ) -> Outbox | None:
+    mail_recipient = recipient or case.contact.email
     message_id, raw = build_message(
         from_address=get_settings().mail_from,
-        recipient=case.contact.email,
+        recipient=mail_recipient,
         subject=subject,
         text_body=text_body,
         html_body=html_body,
@@ -2410,7 +2702,7 @@ async def freeze_outbox(
                 message_kind=message_kind,
                 business_key=business_key,
                 message_id=message_id,
-                recipient=case.contact.email,
+                recipient=mail_recipient,
                 raw_message=raw,
             )
             session.add(row)
@@ -2425,7 +2717,7 @@ async def freeze_outbox(
                     in_reply_to=in_reply_to,
                     references_json=references or [],
                     from_address=parseaddr(get_settings().mail_from)[1],
-                    to_addresses=[case.contact.email],
+                    to_addresses=[mail_recipient],
                     subject=subject,
                     body_text=text_body,
                     body_html=html_body,
@@ -6105,6 +6397,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         return
     case = await session.get(SalesCase, email_row.case_id)
     if case is None:
+        return
+    if case.status == CaseStatus.HUMAN_TAKEOVER:
+        # The salesperson explicitly took the case over: the AI must not
+        # reply, clarify, quote or create handoffs for this case again.
         return
     reply_key = f"inbound-reply:{email_row.id}"
     existing_reply = await session.scalar(
