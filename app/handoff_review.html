@@ -15,7 +15,7 @@
     .top { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
     h1 { margin:0; font-size:24px; }
     .sub { color:var(--muted); margin-top:4px; }
-    .grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(340px,.75fr); gap:18px; align-items:start; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(380px,.8fr); gap:18px; align-items:start; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 4px 18px rgba(16,24,40,.04); margin-bottom:18px; }
     .card h2 { font-size:16px; margin:0 0 14px; }
     .meta { display:grid; grid-template-columns:120px 1fr; gap:8px 14px; }
@@ -58,10 +58,12 @@
     .suggested-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .suggested-tag { display:inline-flex; align-items:center; gap:5px; background:#eef4ff; color:#1849a9; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:650; }
     .suggested-tag .qty { color:#667085; font-weight:400; }
-    .price-line { display:grid; grid-template-columns:minmax(0,1fr) 132px 112px 34px; gap:8px; align-items:center; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:8px; }
+    .price-line { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; align-items:center; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:8px; }
+    .price-line .manual-price-product { grid-column:1 / -1; }
     .price-line .sub { grid-column:1 / -1; margin:2px 0 0; font-size:12px; }
-    .price-line input { padding:8px 10px; }
-    .price-line .manual-price-remove { width:34px; height:34px; border-radius:9px; background:#fff; border:1px solid var(--line); color:var(--muted); font-size:16px; line-height:1; }
+    .price-line input { padding:9px 10px; }
+    .price-line .manual-price-remove { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--muted); }
+    .price-line .manual-price-remove svg { display:block; }
     .price-line .manual-price-remove:hover { background:#fff1f0; color:var(--red); border-color:#fda29b; }
     .identity-review { margin:12px 0; padding:12px; border:1px solid #f7d394; border-radius:10px; background:#fffaeb; }
     .identity-review strong { color:#7a2e0e; }
@@ -74,8 +76,6 @@
       .grid { grid-template-columns:1fr; }
       .shell { padding:14px; }
       .meta { grid-template-columns:90px 1fr; }
-      .price-line { grid-template-columns:1fr 1fr; }
-      .price-line .manual-price-remove { grid-column:2; justify-self:end; }
     }
   </style>
 </head>
@@ -468,7 +468,9 @@
         </select>
         <input class="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001" placeholder="单价">
         <input class="manual-price-quantity" type="number" min="1" step="1" placeholder="数量">
-        <button class="manual-price-remove" type="button" title="移除" aria-label="移除">×</button>
+        <button class="manual-price-remove" type="button" title="移除这行" aria-label="移除这行">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
         <div class="sub manual-price-history">暂无可参考的历史价格</div>`;
       const select = row.querySelector(".manual-price-product");
       for (const product of manualPriceProducts) {
