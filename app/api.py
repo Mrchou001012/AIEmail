@@ -107,6 +107,7 @@ HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
 CONTACTS_PATH = Path(__file__).with_name("contacts.html")
+RECORDS_PATH = Path(__file__).with_name("records.html")
 MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
@@ -2425,19 +2426,160 @@ async def _handoff_case_payload(session: AsyncSession, case_id: int | None) -> d
 
 
 @router.get("/admin/handoffs")
-async def list_handoffs(_: Admin, session: Session) -> list[dict[str, Any]]:
-    rows = (await session.execute(select(Handoff).order_by(Handoff.id.desc()))).scalars().all()
-    return [
-        {
-            "id": row.id,
-            "case_id": row.case_id,
-            "reason": row.reason_code,
-            "summary": row.summary,
-            "status": row.status,
-            "dingtalk_status": row.dingtalk_status,
-        }
-        for row in rows
-    ]
+async def list_handoffs(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Handoff.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Handoff).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Handoff)
+                .where(*conditions)
+                .order_by(Handoff.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "reason": row.reason_code,
+                "summary": row.summary,
+                "status": row.status,
+                "dingtalk_status": row.dingtalk_status,
+                "created_at": row.created_at.isoformat(),
+                "updated_at": (
+                    row.updated_at.isoformat() if row.updated_at else None
+                ),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/outbox")
+async def list_outbox(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Outbox.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Outbox).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Outbox)
+                .where(*conditions)
+                .order_by(Outbox.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "recipient": row.recipient,
+                "message_kind": row.message_kind,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "last_error": row.last_error,
+                "created_at": row.created_at.isoformat(),
+                "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/jobs")
+async def list_jobs(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Job.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Job).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Job)
+                .where(*conditions)
+                .order_by(Job.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "max_attempts": row.max_attempts,
+                "last_error": row.last_error,
+                "available_at": (
+                    row.available_at.isoformat() if row.available_at else None
+                ),
+                "created_at": row.created_at.isoformat(),
+                "updated_at": (
+                    row.updated_at.isoformat() if row.updated_at else None
+                ),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/records", response_class=HTMLResponse, include_in_schema=False)
+async def records_page(_: Admin, session: Session) -> HTMLResponse:
+    return HTMLResponse(
+        RECORDS_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
 
 
 @router.get("/admin/handoffs/{handoff_id}/review", response_class=HTMLResponse, include_in_schema=False)

@@ -168,6 +168,7 @@
     }
 
     .panel-head small { color: var(--muted); }
+    .panel-head a { font-weight: 650; }
 
     .config-row {
       display: flex;
@@ -367,7 +368,7 @@
 
     <div class="two-col">
       <section class="panel">
-        <div class="panel-head"><h2>待人工与异常</h2><small>最近 30 条</small></div>
+        <div class="panel-head"><h2>待人工与异常</h2><small>最近 30 条 · <a href="/admin/records#handoffs">查看全部</a></small></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>时间</th><th>原因</th><th>摘要</th><th>钉钉</th></tr></thead>
@@ -377,7 +378,7 @@
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2>发件队列</h2><small>最近 30 条</small></div>
+        <div class="panel-head"><h2>发件队列</h2><small>最近 30 条 · <a href="/admin/records#outbox">查看全部</a></small></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>时间</th><th>收件人</th><th>状态</th><th>重试</th></tr></thead>
@@ -399,7 +400,7 @@
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2>后台任务</h2><small>最近 30 条</small></div>
+        <div class="panel-head"><h2>后台任务</h2><small>最近 30 条 · <a href="/admin/records#jobs">查看全部</a></small></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>时间</th><th>任务</th><th>状态</th><th>尝试</th></tr></thead>
