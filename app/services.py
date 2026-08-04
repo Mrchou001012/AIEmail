@@ -111,7 +111,12 @@ from app.product_catalog import (
     customer_interest_keys,
     render_product_list_email,
 )
-from app.products import canonical_product_code, find_product_codes, product_codes_match
+from app.products import (
+    canonical_product_code,
+    find_product_codes,
+    product_codes_match,
+    product_text_key,
+)
 from app.rag_retrieval import LocalRAGRetriever
 from app.reactivation import reactivation_send_guard, record_reactivation_reply
 from app.settings import Settings, get_settings
@@ -1799,10 +1804,11 @@ async def quote_with_manual_price(
 ) -> Outbox:
     """Persist a human-set price and let the system send the quotation.
 
-    The price is stored as an active standalone price policy (inheriting
+    The price is stored as an inactive historical price policy (inheriting
     commercial terms from the most recent policy of the same product when
-    available), so the next inquiry for the same product can be quoted
-    automatically and historical prices remain visible to the team.
+    available). Prices change frequently, so the record is for reference only:
+    the next inquiry for the same product still routes to a human, and the
+    review screen shows this stored price history.
     """
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
@@ -1823,6 +1829,11 @@ async def quote_with_manual_price(
     )
     if product is None:
         raise ValueError("product is not active in the catalog")
+    if case.product_id is not None and case.product_id != product.id:
+        raise ValueError(
+            "the selected product does not match the case product; "
+            "choose the case product to price it"
+        )
     currency = currency.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", currency):
         raise ValueError("currency must be a three-letter code")
@@ -2766,21 +2777,19 @@ def _explicit_product_codes(text: str) -> list[str]:
 def _product_lookup_conditions(codes: list[str]) -> Any:
     """Match catalog codes by exact value or canonical normalization.
 
-    ``canonical_product_code`` may normalize an unknown token (for example
-    WIDGET-100 -> widget_100) while the catalog stores the original spelling.
-    Match both so explicit product mentions resolve to the same product.
+    Product codes are normalized with the same separator-insensitive key used
+    for lookups, so WIDGET-100, WIDGET_100 and widget_100 all resolve to the
+    same catalog row. Exact equality is kept as a fast path.
     """
     conditions = []
     for code in codes:
         conditions.append(Product.code == code)
-        canonical = canonical_product_code(code)
-        if canonical != code:
-            conditions.append(
-                func.lower(
-                    func.regexp_replace(Product.code, r"[^a-z0-9]", "_", "g")
-                )
-                == canonical
+        conditions.append(
+            func.lower(
+                func.regexp_replace(Product.code, r"[^a-zA-Z0-9]", "_", "g")
             )
+            == product_text_key(code)
+        )
     return or_(*conditions)
 
 
@@ -4227,17 +4236,18 @@ def _pluralized_unit(unit: str | None) -> str:
     return normalized or "unit"
 
 
-async def _moq_price_lines(
+async def _moq_price_rows(
     session: AsyncSession,
     *,
     codes: list[str],
     currency: str,
-) -> list[str]:
-    """Build one reference-price line per product that has an active policy.
+) -> list[tuple[Product, PricePolicy]]:
+    """Return one active MOQ reference price per product that has a policy.
 
     Products without a matching policy are simply skipped: the clarification
     still asks for their quantity, and callers never crash when catalog or
-    commercial data changes underneath the request.
+    commercial data changes underneath the request. Callers format the rows
+    with the wording appropriate for single- or multi-product requests.
     """
     unique_codes = list(dict.fromkeys(code for code in codes if code))
     if not unique_codes:
@@ -4254,12 +4264,12 @@ async def _moq_price_lines(
         .scalars()
         .all()
     )
-    product_by_code = {
-        canonical_product_code(product.code): product for product in products
+    product_by_key = {
+        product_text_key(product.code): product for product in products
     }
-    lines: list[str] = []
+    rows: list[tuple[Product, PricePolicy]] = []
     for code in unique_codes:
-        product = product_by_code.get(canonical_product_code(code))
+        product = product_by_key.get(product_text_key(code))
         if product is None:
             continue
         policy = await active_policy(session, product.id, currency)
@@ -4271,15 +4281,8 @@ async def _moq_price_lines(
             or policy.standard_price <= 0
         ):
             continue
-        raw_unit = (product.unit or "unit").strip() or "unit"
-        unit = _pluralized_unit(raw_unit)
-        lines.append(
-            f"For {product.code} ({product.name}): our minimum order quantity "
-            f"is {policy.min_quantity} {unit} at {currency} "
-            f"{policy.standard_price:.4f} per {raw_unit}. "
-            "Better pricing is available for larger volumes."
-        )
-    return lines
+        rows.append((product, policy))
+    return rows
 
 
 async def _maybe_send_quote_clarification(
@@ -4361,13 +4364,24 @@ async def _maybe_send_quote_clarification(
     if needs_multi_quantities:
         opening = "Thank you for your quotation request."
         names = ", ".join(missing_product_codes)
-        question = (
-            f"Could you please confirm the required quantity for {names}?"
-        )
-        reference_lines = await _moq_price_lines(
+        moq_rows = await _moq_price_rows(
             session,
             codes=missing_product_codes,
             currency=case.currency,
+        )
+        reference_lines = []
+        for product, policy in moq_rows:
+            raw_unit = (product.unit or "unit").strip() or "unit"
+            reference_lines.append(
+                f"{product.code}: MOQ {policy.min_quantity} "
+                f"{_pluralized_unit(raw_unit)} at {case.currency} "
+                f"{policy.standard_price:.2f}"
+            )
+        question = (
+            f"Could you please let us know the quantity you require for {names}? "
+            "Better pricing is available for larger volumes."
+            if moq_rows
+            else f"Could you please confirm the required quantity for {names}?"
         )
     elif needs_quantity:
         opening = (
@@ -4375,19 +4389,30 @@ async def _maybe_send_quote_clarification(
             if case.product is not None
             else "Thank you for your quotation request."
         )
-        reference_lines = (
-            await _moq_price_lines(
+        reference_lines = []
+        if case.product is not None:
+            moq_rows = await _moq_price_rows(
                 session,
                 codes=[case.product.code],
                 currency=case.currency,
             )
-            if case.product is not None
-            else []
-        )
-        question = (
-            f"Could you please confirm the required quantity in "
-            f"{_quantity_unit_label(case.product.unit if case.product is not None else None)}?"
-        )
+            for product, policy in moq_rows:
+                raw_unit = (product.unit or "unit").strip() or "unit"
+                reference_lines.append(
+                    f"Our minimum order quantity is {policy.min_quantity} "
+                    f"{_pluralized_unit(raw_unit)} at {case.currency} "
+                    f"{policy.standard_price:.2f} per {raw_unit}."
+                )
+        if reference_lines:
+            question = (
+                "Could you please let us know the quantity you require? "
+                "Better pricing is available for larger volumes."
+            )
+        else:
+            question = (
+                f"Could you please confirm the required quantity in "
+                f"{_quantity_unit_label(case.product.unit if case.product is not None else None)}?"
+            )
     else:
         opening = (
             f"Thank you for your quotation request for {analysis.quantity} kg."
@@ -4485,12 +4510,20 @@ async def _maybe_send_multi_product_quote(
     if case.product_id is not None:
         return False
 
-    codes = list(dict.fromkeys(line.product_code for line in requests if line.product_code))
+    normalized_codes = list(
+        dict.fromkeys(product_text_key(line.product_code) for line in requests)
+    )
     products = (
         (
             await session.execute(
                 select(Product).where(
-                    _product_lookup_conditions(codes),
+                    _product_lookup_conditions(
+                        list(
+                            dict.fromkeys(
+                                line.product_code for line in requests
+                            )
+                        )
+                    ),
                     Product.active.is_(True),
                 )
             )
@@ -4498,10 +4531,10 @@ async def _maybe_send_multi_product_quote(
         .scalars()
         .all()
     )
-    product_by_code = {
-        canonical_product_code(product.code): product for product in products
+    product_by_key = {
+        product_text_key(product.code): product for product in products
     }
-    if len(set(product_by_code)) != len(codes):
+    if len(product_by_key) != len(normalized_codes):
         await create_handoff(
             session,
             case=case,
@@ -4512,13 +4545,29 @@ async def _maybe_send_multi_product_quote(
         )
         return True
 
-    missing_quantity_codes = [
-        product_by_code[line.product_code].code
-        for line in requests
-        if line.product_code
-        and line.quantity is None
-        and line.product_code in product_by_code
-    ]
+    # The same product may be mentioned more than once. Resolve every mention
+    # to its catalog row first, then keep one line per product only when all
+    # mentions agree on the same quantity. Missing or conflicting quantities
+    # are clarified instead of guessing, and duplicate rows can never violate
+    # the (case, round, product) uniqueness constraint.
+    grouped_quantities: dict[int, list[int | None]] = {}
+    product_by_id: dict[int, Product] = {}
+    for line in requests:
+        product = product_by_key.get(product_text_key(line.product_code))
+        if product is None:
+            continue
+        product_by_id[product.id] = product
+        grouped_quantities.setdefault(product.id, []).append(line.quantity)
+
+    missing_quantity_codes: list[str] = []
+    resolved_requests: list[tuple[Product, int]] = []
+    for product_id, quantities in grouped_quantities.items():
+        product = product_by_id[product_id]
+        distinct_quantities = set(quantities)
+        if len(distinct_quantities) == 1 and None not in distinct_quantities:
+            resolved_requests.append((product, next(iter(distinct_quantities))))
+        else:
+            missing_quantity_codes.append(product.code)
     if missing_quantity_codes:
         await _maybe_send_quote_clarification(
             session,
@@ -4530,21 +4579,10 @@ async def _maybe_send_multi_product_quote(
         )
         return True
 
+    codes = [product.code for product in product_by_key.values()]
     settings = get_settings()
     quote_rows: list[tuple[Product, PricePolicy, QuoteContext, Decimal, int, date]] = []
-    for line in requests:
-        product = product_by_code[line.product_code]
-        quantity = line.quantity
-        if quantity is None:
-            await _maybe_send_quote_clarification(
-                session,
-                case=case,
-                email_row=email_row,
-                analysis=analysis,
-                analysis_facts=analysis_facts,
-                missing_product_codes=[line.product_code],
-            )
-            return True
+    for product, quantity in resolved_requests:
         context = await _commercial_quote_context(
             session,
             product_id=product.id,

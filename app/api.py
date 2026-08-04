@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -839,16 +839,7 @@ async def dashboard_data(
         .scalars()
         .all()
     )
-    quote_rows = (
-        await session.execute(
-            select(Quote, Customer.company_name, Product.code)
-            .join(SalesCase, Quote.case_id == SalesCase.id)
-            .join(Customer, SalesCase.customer_id == Customer.id)
-            .join(Product, SalesCase.product_id == Product.id)
-            .order_by(Quote.created_at.desc(), Quote.id.desc())
-            .limit(30)
-        )
-    ).all()
+    quote_rows = await _admin_latest_quote_rows(session)
     ai_failure_count = await session.scalar(
         select(func.count()).select_from(AIInvocation).where(AIInvocation.success.is_(False))
     )
@@ -1254,6 +1245,42 @@ async def outbox_detail(outbox_id: int, _: Admin, session: Session) -> dict[str,
         "raw_message": row.raw_message[:message_limit],
         "message_truncated": len(row.raw_message) > message_limit,
     }
+
+
+async def _admin_latest_quote_rows(
+    session: AsyncSession,
+) -> list[tuple[Quote, str, str | None]]:
+    """Latest quotations with a display product code.
+
+    Multi-product cases have no single case product, so the product is taken
+    from the quote row itself; single-product rows keep using the case product
+    for backward compatibility.
+    """
+    return (
+        (
+            await session.execute(
+                select(Quote, Customer.company_name, Product.code)
+                .join(SalesCase, Quote.case_id == SalesCase.id)
+                .join(Customer, SalesCase.customer_id == Customer.id)
+                .outerjoin(
+                    Product,
+                    or_(
+                        and_(
+                            Quote.product_id.is_not(None),
+                            Quote.product_id == Product.id,
+                        ),
+                        and_(
+                            Quote.product_id.is_(None),
+                            SalesCase.product_id == Product.id,
+                        ),
+                    ),
+                )
+                .order_by(Quote.created_at.desc(), Quote.id.desc())
+                .limit(30)
+            )
+        )
+        .all()
+    )
 
 
 @router.get("/admin/status")

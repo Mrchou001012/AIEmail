@@ -9,6 +9,8 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai import InboundAnalysis, ProductLine
+from app.api import _admin_latest_quote_rows
 from app.commercial import get_or_create_current_cycle
 from app.db import (
     CaseStage,
@@ -22,7 +24,7 @@ from app.db import (
     Quote,
     SalesCase,
 )
-from app.domain import HandoffReason
+from app.domain import HandoffReason, Intent
 from app.services import (
     active_policy,
     ingest_raw_email,
@@ -140,12 +142,15 @@ async def test_quote_missing_quantity_asks_then_quotes(db_session: AsyncSession)
         clarification.raw_message.encode("utf-8")
     )
     body_text = mime.get_body(preferencelist=("plain",)).get_content()
-    assert "required quantity" in body_text
+    assert "quantity you require" in body_text
     assert (
-        "minimum order quantity is 10 pieces at USD 100.0000 per piece"
+        "Our minimum order quantity is 10 pieces at USD 100.00 per piece"
         in body_text
     )
-    assert "Better pricing is available for larger volumes" in body_text
+    assert (
+        "Could you please let us know the quantity you require? "
+        "Better pricing is available for larger volumes."
+    ) in body_text
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
     reply = await _add_inbound(
@@ -409,10 +414,233 @@ async def test_multi_product_quote_missing_quantity_clarifies(
     )
     body_text = mime.get_body(preferencelist=("plain",)).get_content()
     assert (
-        "For WIDGET-200 (Industrial Widget 200): our minimum order quantity "
-        "is 1 kg at USD 200.0000 per kg" in body_text
+        "WIDGET-200: MOQ 1 kg at USD 200.00" in body_text
     )
+    assert (
+        "Could you please let us know the quantity you require for WIDGET-200? "
+        "Better pricing is available for larger volumes."
+    ) in body_text
     assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+
+
+async def test_multi_product_quote_duplicate_mentions_with_conflicting_quantities_clarifies(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    await seed_demo_data(db_session)
+    await _add_quoteable_product(
+        db_session,
+        code="WIDGET-200",
+        name="Industrial Widget 200",
+        approved_text_key="widget_200",
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            (
+                "Please quote PRODUCT WIDGET-100 100 kg, "
+                "PRODUCT WIDGET-100 200 kg and PRODUCT WIDGET-200 200 kg."
+            ),
+            message_id="multi-quote-duplicate-conflict",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+
+    async def fake_analyze(self, subject, body, attachments):
+        return (
+            InboundAnalysis(
+                intent=Intent.QUOTE_REQUEST,
+                intent_confidence=0.99,
+                product_code="WIDGET-100",
+                product_confidence=0.99,
+                product_requests=[
+                    ProductLine(product_code="WIDGET-100", quantity=100),
+                    ProductLine(product_code="WIDGET-100", quantity=200),
+                    ProductLine(product_code="WIDGET-200", quantity=200),
+                ],
+                quantity=100,
+                numeric_confidence=0.99,
+            ),
+            {
+                "provider": "stub",
+                "model": "stub",
+                "request_hash": "duplicate-conflict",
+                "input_tokens": 1,
+                "output_tokens": 1,
+            },
+        )
+
+    monkeypatch.setattr("app.services.AIClient.analyze", fake_analyze)
+    await process_inbound(db_session, email_row.id)
+
+    clarification = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "QUOTE_CLARIFICATION")
+    )
+    assert clarification is not None
+    mime = BytesParser(policy=policy.default).parsebytes(
+        clarification.raw_message.encode("utf-8")
+    )
+    body_text = mime.get_body(preferencelist=("plain",)).get_content()
+    assert "WIDGET-100" in body_text
+    assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
+
+
+async def test_multi_product_quote_duplicate_mentions_with_same_quantity_dedupe(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    await _add_quoteable_product(
+        db_session,
+        code="WIDGET-200",
+        name="Industrial Widget 200",
+        approved_text_key="widget_200",
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            (
+                "Please quote PRODUCT WIDGET-100 100 kg, "
+                "PRODUCT WIDGET-100 100 kg and PRODUCT WIDGET-200 200 kg."
+            ),
+            message_id="multi-quote-duplicate-same",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+    case = await db_session.get(SalesCase, email_row.case_id)
+    assert case is not None and case.product_id is None
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "AUTO_QUOTE")
+    )
+    assert outbox is not None
+    quotes = (
+        (
+            await db_session.execute(
+                select(Quote).where(Quote.case_id == case.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(quotes) == 2
+    assert len({quote.product_id for quote in quotes}) == 2
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
+
+
+async def test_multi_product_quote_resolves_separator_variants(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    await _add_quoteable_product(
+        db_session,
+        code="WIDGET-200",
+        name="Industrial Widget 200",
+        approved_text_key="widget_200",
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            "Please quote PRODUCT WIDGET_100 100 kg and PRODUCT WIDGET-200 200 kg.",
+            message_id="multi-quote-separator-variant",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await db_session.scalar(
+        select(Outbox).where(Outbox.message_kind == "AUTO_QUOTE")
+    )
+    assert outbox is not None
+    quotes = (
+        (
+            await db_session.execute(
+                select(Quote).join(SalesCase, Quote.case_id == SalesCase.id)
+                .where(SalesCase.id == email_row.case_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(quotes) == 2
+    product_codes = set()
+    for quote in quotes:
+        product = await db_session.get(Product, quote.product_id)
+        assert product is not None
+        product_codes.add(product.code)
+    assert product_codes == {"WIDGET-100", "WIDGET-200"}
+    assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
+
+
+async def test_manual_price_rejects_product_mismatch_with_case(
+    db_session: AsyncSession,
+) -> None:
+    case = await _seed_case(db_session)
+    other = await _add_quoteable_product(
+        db_session,
+        code="WIDGET-200",
+        name="Industrial Widget 200",
+        approved_text_key="widget_200",
+    )
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "Please quote PRODUCT WIDGET-200.",
+        suffix="manual-price-mismatch",
+    )
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.NONSTANDARD.value,
+        summary="manual price mismatch fixture",
+        extracted_facts={},
+        status="OPEN",
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="does not match the case product"):
+        await quote_with_manual_price(
+            db_session,
+            handoff_id=handoff.id,
+            product_id=other.id,
+            standard_price=Decimal("300.0000"),
+            currency="USD",
+            quantity=50,
+            actor="admin",
+        )
+
+
+async def test_admin_latest_quote_rows_include_multi_product_quotes(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    await _add_quoteable_product(
+        db_session,
+        code="WIDGET-200",
+        name="Industrial Widget 200",
+        approved_text_key="widget_200",
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            "Please quote PRODUCT WIDGET-100 100 kg and PRODUCT WIDGET-200 200 kg.",
+            message_id="admin-multi-quote",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
+
+    rows = await _admin_latest_quote_rows(db_session)
+    codes = {row[2] for row in rows}
+    assert {"WIDGET-100", "WIDGET-200"} <= codes
 
 
 async def test_multi_product_quote_missing_quantity_without_policy_clarifies_without_price(
@@ -448,7 +676,8 @@ async def test_multi_product_quote_missing_quantity_without_policy_clarifies_wit
         clarification.raw_message.encode("utf-8")
     )
     body_text = mime.get_body(preferencelist=("plain",)).get_content()
-    assert "minimum order quantity" not in body_text
+    assert "MOQ" not in body_text
+    assert "Could you please confirm the required quantity for WIDGET-999?" in body_text
     assert await db_session.scalar(select(func.count()).select_from(Quote)) == 0
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
