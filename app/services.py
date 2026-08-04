@@ -3007,11 +3007,28 @@ async def ingest_raw_email(
         if direction == "INBOUND" and duplicate.direction == "INBOUND" and not is_history:
             await _ensure_inbound_follow_up(session, duplicate)
         return duplicate
+    # DEPARTED / CONTACT_CHANGE messages are normally written by a human
+    # (for example "Pooja no longer works here, please send the product
+    # list to this address"). They must enter the normal new-inquiry and
+    # product-list pipeline instead of being swallowed as automated noise,
+    # while keeping subject-based case matching for threadless replies.
+    personnel_reply = bool(
+        automated_reply
+        and automated_reply.reply_type
+        in {
+            AutomatedReplyType.DEPARTED,
+            AutomatedReplyType.CONTACT_CHANGE,
+        }
+    )
     live_human_inbound = bool(
         direction == "INBOUND"
         and not is_history
         and not (bounce and bounce.is_bounce)
-        and not (automated_reply and automated_reply.is_automated)
+        and not (
+            automated_reply
+            and automated_reply.is_automated
+            and not personnel_reply
+        )
     )
     is_system_notification = bool(
         automated_reply
@@ -3029,10 +3046,11 @@ async def ingest_raw_email(
             # A live human-authored message may inherit commercial history only
             # through Message-ID/References. Subject-only matching is retained for
             # history reconciliation, outbound mail, and non-sending auto replies.
-            allow_subject_fallback=not live_human_inbound,
+            allow_subject_fallback=not live_human_inbound or personnel_reply,
         )
     new_inquiry = NewInquiryResolution(case)
     reactivation_parent: CaseLessReactivationParent | None = None
+    personnel_change_handled = False
     if live_human_inbound and case is None and not ambiguous:
         has_thread_headers = bool(parsed.in_reply_to or parsed.references)
         if has_thread_headers:
@@ -3119,6 +3137,53 @@ async def ingest_raw_email(
                     },
                 )
             )
+        if (
+            automated_reply
+            and automated_reply.reply_type
+            in {
+                AutomatedReplyType.DEPARTED,
+                AutomatedReplyType.CONTACT_CHANGE,
+            }
+        ):
+            original = reactivation_parent.original_contact
+            if original.id != reactivation_parent.reply_contact.id:
+                # The historical recipient left the company / changed roles;
+                # retire that endpoint while keeping the new reply contact
+                # active so the business request can still be handled.
+                original.suppressed = True
+                personnel_change_handled = True
+                session.add(
+                    AuditEvent(
+                        case_id=case.id,
+                        actor="thread_resolver",
+                        event_type="contact.suppressed_for_personnel_change",
+                        data={
+                            "original_contact_id": original.id,
+                            "original_email": original.email,
+                            "reply_contact_id": reactivation_parent.reply_contact.id,
+                            "reply_email": reactivation_parent.reply_contact.email,
+                            "automated_reply_type": automated_reply.reply_type.value,
+                        },
+                    )
+                )
+            else:
+                # Same endpoint is the one that left; suppress it as well.
+                original.suppressed = True
+                personnel_change_handled = True
+                session.add(
+                    AuditEvent(
+                        case_id=case.id,
+                        actor="thread_resolver",
+                        event_type="contact.suppressed_for_personnel_change",
+                        data={
+                            "original_contact_id": original.id,
+                            "original_email": original.email,
+                            "reply_contact_id": reactivation_parent.reply_contact.id,
+                            "reply_email": reactivation_parent.reply_contact.email,
+                            "automated_reply_type": automated_reply.reply_type.value,
+                        },
+                    )
+                )
     matched_outbox = None
     if bounce and bounce.is_bounce and bounce.original_message_id:
         matched_outbox = await session.scalar(
@@ -3151,6 +3216,16 @@ async def ingest_raw_email(
     )
     try:
         async with session.begin_nested():
+            automated_metadata = (
+                {**automated_reply.metadata(), "headers": parsed.header_metadata}
+                if automated_reply and automated_reply.is_automated
+                else {}
+            )
+            if personnel_change_handled and reactivation_parent is not None:
+                automated_metadata["personnel_change_handled"] = True
+                automated_metadata["original_contact_id"] = (
+                    reactivation_parent.original_contact.id
+                )
             row = EmailMessage(
                 case_id=case.id if case else None,
                 customer_id=identity_customer_id,
@@ -3177,11 +3252,7 @@ async def ingest_raw_email(
                     if automated_reply and automated_reply.reply_type is not None
                     else None
                 ),
-                automated_reply_metadata=(
-                    {**automated_reply.metadata(), "headers": parsed.header_metadata}
-                    if automated_reply and automated_reply.is_automated
-                    else {}
-                ),
+                automated_reply_metadata=automated_metadata,
                 is_bounce=bool(bounce and bounce.is_bounce),
                 bounce_type=(
                     bounce.bounce_type.value
@@ -3517,12 +3588,12 @@ async def _handle_automated_reply(
         "automated_reply_type": reply_type,
         **(email_row.automated_reply_metadata or {}),
     }
-    email_row.automated_reply_handled_at = datetime.now(UTC)
     if reply_type in {
         AutomatedReplyType.OUT_OF_OFFICE.value,
         AutomatedReplyType.GENERIC_AUTOREPLY.value,
         AutomatedReplyType.SYSTEM_NOTIFICATION.value,
     }:
+        email_row.automated_reply_handled_at = datetime.now(UTC)
         await audit(
             session,
             "inbound.automated_reply_handled",
@@ -3533,14 +3604,30 @@ async def _handle_automated_reply(
         await session.commit()
         return True
 
-    if reply_type == AutomatedReplyType.DEPARTED.value:
+    if reply_type in {
+        AutomatedReplyType.DEPARTED.value,
+        AutomatedReplyType.CONTACT_CHANGE.value,
+    }:
+        if email_row.automated_reply_metadata.get("personnel_change_handled"):
+            # The old endpoint was already retired and a new contact was
+            # linked during ingestion; record the personnel change and keep
+            # processing the business request (quote / product list / ...).
+            await audit(
+                session,
+                "inbound.personnel_change_recorded",
+                case_id=case.id,
+                actor="system",
+                data={"email_id": email_row.id, **facts},
+            )
+            return False
+        email_row.automated_reply_handled_at = datetime.now(UTC)
+        # No reactivation context: conservative fallback keeps the original
+        # behavior (retire the current contact and ask a human to verify).
         case.contact.suppressed = True
         summary = "Contact appears to have left the company; verify any replacement contact"
         reason = HandoffReason.PERSONNEL_CHANGE
-    elif reply_type == AutomatedReplyType.CONTACT_CHANGE.value:
-        summary = "Inbound message reports a personnel or contact change"
-        reason = HandoffReason.PERSONNEL_CHANGE
     else:
+        email_row.automated_reply_handled_at = datetime.now(UTC)
         summary = "Automated reply could not be handled safely"
         reason = HandoffReason.AUTOMATED_REPLY_REVIEW
     await audit(

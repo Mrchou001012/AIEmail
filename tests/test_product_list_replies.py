@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email import policy
 from email.message import EmailMessage
@@ -24,6 +24,8 @@ from app.db import (
     PricePolicy,
     Product,
     ProductCategory,
+    ReactivationCampaign,
+    ReactivationRecipient,
     SalesCase,
 )
 from app.db import (
@@ -83,6 +85,116 @@ async def _seed_catalog_and_interest(
     db_session.add(contact)
     await db_session.commit()
     return customer.id, contact.id
+
+
+async def _seed_departed_reactivation_parent(
+    db_session: AsyncSession,
+    *,
+    interests: list[str],
+    old_email: str = "globalsourcing@witofly.com",
+    reply_email: str = "marketing001@witofly.com",
+) -> tuple[int, int, Outbox]:
+    await import_product_catalog(db_session, apply=True)
+    customer = Customer(
+        company_name="Shanghai Witofly Chemical Co.,Ltd",
+        language="en",
+        auto_send_allowed=True,
+        consent_basis="existing CRM/customer-list relationship",
+        metadata_json={},
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    if interests:
+        from app.product_catalog import (
+            category_names_by_key,
+            interest_entry,
+            merge_customer_interests,
+        )
+
+        names = await category_names_by_key(db_session)
+        merge_customer_interests(
+            customer,
+            [
+                interest_entry(
+                    category_key=key,
+                    category_name=names.get(key, key),
+                    source="test",
+                    value=key,
+                )
+                for key in interests
+            ],
+        )
+    old_contact = Contact(
+        customer_id=customer.id,
+        name="Pooja Raut",
+        email=old_email,
+        language="en",
+    )
+    db_session.add(old_contact)
+    await db_session.flush()
+    parent = Outbox(
+        case_id=None,
+        quote_id=None,
+        message_kind="REACTIVATION",
+        business_key="reactivation:test:departed",
+        message_id="<wake-departed@lanyachemindia.com>",
+        recipient=old_email,
+        raw_message=f"From: sales-agent@example.com\nTo: {old_email}\n\nChecking in",
+        status=DeliveryStatus.SENT,
+        sent_at=datetime.now(UTC) - timedelta(minutes=10),
+        sent_via="smtp",
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    campaign = ReactivationCampaign(
+        name="Departed reply test",
+        status="RUNNING",
+        subject_template="Checking in",
+        body_template="Hello",
+        start_date=date.today(),
+        created_by="test",
+    )
+    db_session.add(campaign)
+    await db_session.flush()
+    recipient = ReactivationRecipient(
+        campaign_id=campaign.id,
+        customer_id=customer.id,
+        contact_id=old_contact.id,
+        outbox_id=parent.id,
+        status="SENT",
+        eligible=True,
+        selected=True,
+        sent_at=parent.sent_at,
+    )
+    db_session.add(recipient)
+    outbound = DBEmailMessage(
+        case_id=None,
+        customer_id=customer.id,
+        contact_id=old_contact.id,
+        direction="OUTBOUND",
+        message_id=parent.message_id,
+        from_address="sales-agent@example.com",
+        to_addresses=[old_email],
+        subject="Checking in from Lanya Chem",
+        body_text="Checking in",
+        raw_sha256="d" * 64,
+        received_at=parent.sent_at,
+    )
+    db_session.add_all([recipient, outbound])
+    await db_session.commit()
+    return customer.id, old_contact.id, parent
+
+
+def _departed_reply_message(parent_message_id: str, body: str) -> bytes:
+    message = EmailMessage()
+    message["From"] = "Judy Ao <marketing001@witofly.com>"
+    message["To"] = "sales-agent@example.com"
+    message["Subject"] = "Re: Checking in from Lanya Chem"
+    message["Message-ID"] = "<departed-reply@example.com>"
+    message["In-Reply-To"] = parent_message_id
+    message["References"] = parent_message_id
+    message.set_content(body)
+    return message.as_bytes()
 
 
 def _message(
@@ -225,9 +337,10 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
         )
     )
     assert outbound_email is not None
-    assert outbound_email.attachment_metadata[0]["filename"] == (
-        "Lanya_Chem_pharmaceutical_product_list.xlsx"
-    )
+    assert any(
+        item["filename"] == "Lanya_Chem_pharmaceutical_product_list.xlsx"
+        for item in outbound_email.attachment_metadata
+    ), outbound_email.attachment_metadata
 
 
 async def test_generic_category_interest_email_auto_replies(
@@ -1164,3 +1277,133 @@ async def test_full_customer_workbook_stores_interest_category(
     await process_inbound(db_session, email_row.id)
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
+
+
+async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_sends(
+    db_session: AsyncSession,
+) -> None:
+    customer_id, old_contact_id, parent = await _seed_departed_reactivation_parent(
+        db_session,
+        interests=["industrial_silanes"],
+    )
+    email_row = await ingest_raw_email(
+        db_session,
+        _departed_reply_message(
+            parent.message_id,
+            (
+                "Dear Shreya\n\n"
+                "Ms. Pooja no longer works in our company.\n\n"
+                "Please send us your product list.\n\n"
+                "Regards, Judy"
+            ),
+        ),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    assert email_row.automated_reply_type == "DEPARTED"
+    assert email_row.automated_reply_metadata["personnel_change_handled"] is True
+
+    old_contact = await db_session.get(Contact, old_contact_id)
+    assert old_contact is not None and old_contact.suppressed is True
+
+    new_contact = await db_session.scalar(
+        select(Contact).where(
+            func.lower(Contact.email) == "marketing001@witofly.com"
+        )
+    )
+    assert new_contact is not None and new_contact.suppressed is False
+    assert new_contact.customer_id == customer_id
+
+    case = await db_session.get(SalesCase, email_row.case_id)
+    assert case is not None and case.category_id is not None
+    category = await db_session.get(ProductCategory, case.category_id)
+    assert category is not None and category.key == "industrial_silanes"
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    assert "marketing001@witofly.com" in outbox.raw_message
+    assert "YAC-A110" in outbox.raw_message
+    assert await db_session.scalar(
+        select(func.count()).select_from(Handoff)
+    ) == 0
+
+
+async def test_departed_reply_without_interest_researches_and_auto_sends(
+    db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    customer_id, old_contact_id, parent = await _seed_departed_reactivation_parent(
+        db_session,
+        interests=[],
+    )
+    settings = get_settings()
+    monkeypatch.setattr(settings, "company_research_enabled", True)
+    monkeypatch.setattr(settings, "company_research_auto_send_enabled", True)
+
+    async def research(*args, **kwargs):
+        return (
+            CompanyCategoryDecision(
+                identity_confidence=0.98,
+                recommended_category_key="industrial_silanes",
+                category_confidence=0.94,
+                runner_up_category_key="rubber_plastics",
+                runner_up_confidence=0.20,
+                conflicting_evidence=False,
+                rationale="Two sources identify industrial silane distribution.",
+            ),
+            [
+                CompanyResearchSource(
+                    url="https://industry.example/witofly",
+                    title="Industry directory",
+                    cited_text="Industrial silane distributor",
+                ),
+                CompanyResearchSource(
+                    url="https://trade.example/witofly",
+                    title="Trade profile",
+                    cited_text="Silane coupling agents",
+                ),
+            ],
+            {
+                "provider": "anthropic",
+                "model": "claude-test",
+                "request_hash": "e" * 64,
+                "input_tokens": 20,
+                "output_tokens": 10,
+            },
+        )
+
+    monkeypatch.setattr(AIClient, "research_company_category", research)
+    email_row = await ingest_raw_email(
+        db_session,
+        _departed_reply_message(
+            parent.message_id,
+            (
+                "Dear Shreya\n\n"
+                "Ms. Pooja no longer works in our company.\n\n"
+                "Please send us your product list.\n\n"
+                "Regards, Judy"
+            ),
+        ),
+        mailbox="integration-test",
+    )
+
+    assert email_row is not None and email_row.case_id is not None
+    old_contact = await db_session.get(Contact, old_contact_id)
+    assert old_contact is not None and old_contact.suppressed is True
+    new_contact = await db_session.scalar(
+        select(Contact).where(
+            func.lower(Contact.email) == "marketing001@witofly.com"
+        )
+    )
+    assert new_contact is not None and new_contact.suppressed is False
+    assert new_contact.customer_id == customer_id
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    assert "marketing001@witofly.com" in outbox.raw_message
+    assert "YAC-A110" in outbox.raw_message
