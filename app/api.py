@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -78,6 +78,7 @@ from app.reactivation import (
     validate_template,
 )
 from app.services import (
+    _product_lookup_conditions,
     active_policy,
     add_customer_contact_endpoint,
     assign_handoff_case,
@@ -86,6 +87,7 @@ from app.services import (
     generate_handoff_draft_preview,
     ingest_raw_email,
     queue_human_reply,
+    quote_with_manual_price,
     replace_handoff_recipient,
     resolve_deliverability_handoff,
     seed_demo_data,
@@ -168,6 +170,14 @@ class HandoffReplyRequest(BaseModel):
     body_text: str = Field(min_length=1, max_length=50_000)
     note: str = Field(default="", max_length=2_000)
     resume_automation: bool = False
+
+
+class ManualPriceQuoteRequest(BaseModel):
+    product_id: int = Field(gt=0)
+    standard_price: Decimal = Field(gt=0, le=1_000_000_000)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+    quantity: int = Field(gt=0)
+    note: str = Field(default="", max_length=2_000)
 
 
 class ContactEndpointCreateRequest(BaseModel):
@@ -829,16 +839,7 @@ async def dashboard_data(
         .scalars()
         .all()
     )
-    quote_rows = (
-        await session.execute(
-            select(Quote, Customer.company_name, Product.code)
-            .join(SalesCase, Quote.case_id == SalesCase.id)
-            .join(Customer, SalesCase.customer_id == Customer.id)
-            .join(Product, SalesCase.product_id == Product.id)
-            .order_by(Quote.created_at.desc(), Quote.id.desc())
-            .limit(30)
-        )
-    ).all()
+    quote_rows = await _admin_latest_quote_rows(session)
     ai_failure_count = await session.scalar(
         select(func.count()).select_from(AIInvocation).where(AIInvocation.success.is_(False))
     )
@@ -1244,6 +1245,42 @@ async def outbox_detail(outbox_id: int, _: Admin, session: Session) -> dict[str,
         "raw_message": row.raw_message[:message_limit],
         "message_truncated": len(row.raw_message) > message_limit,
     }
+
+
+async def _admin_latest_quote_rows(
+    session: AsyncSession,
+) -> list[tuple[Quote, str, str | None]]:
+    """Latest quotations with a display product code.
+
+    Multi-product cases have no single case product, so the product is taken
+    from the quote row itself; single-product rows keep using the case product
+    for backward compatibility.
+    """
+    return (
+        (
+            await session.execute(
+                select(Quote, Customer.company_name, Product.code)
+                .join(SalesCase, Quote.case_id == SalesCase.id)
+                .join(Customer, SalesCase.customer_id == Customer.id)
+                .outerjoin(
+                    Product,
+                    or_(
+                        and_(
+                            Quote.product_id.is_not(None),
+                            Quote.product_id == Product.id,
+                        ),
+                        and_(
+                            Quote.product_id.is_(None),
+                            SalesCase.product_id == Product.id,
+                        ),
+                    ),
+                )
+                .order_by(Quote.created_at.desc(), Quote.id.desc())
+                .limit(30)
+            )
+        )
+        .all()
+    )
 
 
 @router.get("/admin/status")
@@ -2488,6 +2525,54 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
     approved_outbox = await session.scalar(
         select(Outbox).where(Outbox.approval_handoff_id == handoff.id)
     )
+    history_product = None
+    if case is not None and case.product_id is not None:
+        history_product = await session.get(Product, case.product_id)
+    else:
+        fact_codes = [
+            str(item)
+            for item in (handoff.extracted_facts.get("product_codes") or [])
+        ]
+        if not fact_codes and handoff.extracted_facts.get("product_code"):
+            fact_codes = [str(handoff.extracted_facts["product_code"])]
+        if fact_codes:
+            history_product = await session.scalar(
+                select(Product)
+                .where(
+                    _product_lookup_conditions(fact_codes),
+                    Product.active.is_(True),
+                )
+                .order_by(Product.id)
+                .limit(1)
+            )
+    price_history: list[dict[str, Any]] = []
+    if history_product is not None:
+        history_rows = (
+            (
+                await session.execute(
+                    select(PricePolicy)
+                    .where(PricePolicy.product_id == history_product.id)
+                    .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        price_history = [
+            {
+                "id": row.id,
+                "price": str(row.standard_price),
+                "currency": row.currency,
+                "valid_from": row.valid_from.isoformat(),
+                "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+                "active": row.active,
+                "created_at": (
+                    row.created_at.isoformat() if row.created_at else None
+                ),
+            }
+            for row in history_rows
+        ]
     return {
         "id": handoff.id,
         "case_id": handoff.case_id,
@@ -2532,6 +2617,16 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
             }
             for product in products
         ],
+        "price_history_product": (
+            {
+                "id": history_product.id,
+                "code": history_product.code,
+                "name": history_product.name,
+            }
+            if history_product is not None
+            else None
+        ),
+        "price_history": price_history,
         "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
         "approved_outbox": (
             {
@@ -2725,6 +2820,35 @@ async def send_handoff_reply(
         "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
         "outbox_id": outbox.id,
         "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/price-quote", status_code=202)
+async def send_manual_price_quote(
+    handoff_id: int,
+    request: ManualPriceQuoteRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    """Human sets one price; the system persists it and sends the quotation."""
+    try:
+        outbox = await quote_with_manual_price(
+            session,
+            handoff_id=handoff_id,
+            product_id=request.product_id,
+            standard_price=request.standard_price,
+            currency=request.currency,
+            quantity=request.quantity,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+        "product_id": request.product_id,
     }
 
 

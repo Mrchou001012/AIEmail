@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -16,6 +16,8 @@ from app.domain import (
     quote_valid_until,
     transition,
 )
+from app.services import standard_quote_valid_until
+from app.settings import Settings
 
 
 @pytest.fixture
@@ -199,3 +201,20 @@ def test_ready_stock_quantity_tiers_use_four_and_twelve_times_moq() -> None:
 )
 def test_quote_validity_ends_on_friday(today: date, expected: date) -> None:
     assert quote_valid_until(quote_valid_days=7, quote_valid_weekday=4, today=today) == expected
+
+
+@pytest.mark.parametrize(
+    ("at", "expected"),
+    [
+        (datetime(2026, 8, 3, 12, 0, tzinfo=UTC), date(2026, 8, 10)),
+        (datetime(2026, 8, 4, 12, 0, tzinfo=UTC), date(2026, 8, 10)),
+        (datetime(2026, 8, 7, 12, 0, tzinfo=UTC), date(2026, 8, 10)),
+        (datetime(2026, 8, 9, 12, 0, tzinfo=UTC), date(2026, 8, 10)),
+    ],
+)
+def test_standard_quote_validity_expires_on_coming_monday(
+    at: datetime,
+    expected: date,
+) -> None:
+    settings = Settings(_env_file=None, business_timezone="Asia/Kolkata")
+    assert standard_quote_valid_until(settings, at=at) == expected

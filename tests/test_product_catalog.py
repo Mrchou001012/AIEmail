@@ -300,3 +300,24 @@ def test_explicit_product_code_extraction_ignores_list_catalog_words() -> None:
     assert _explicit_product_codes("Please quote PRODUCT WIDGET-100 quantity 100 kg.") == [
         "WIDGET-100"
     ]
+
+
+def test_stub_analysis_extracts_multi_product_requests_with_quantities() -> None:
+    analysis = stub_analyze(
+        "Re: quotation",
+        "Please quote PRODUCT WIDGET-100 100 kg and PRODUCT WIDGET-200 200 kg.",
+        [],
+    )
+    assert len(analysis.product_requests) == 2
+    by_code = {line.product_code: line.quantity for line in analysis.product_requests}
+    assert by_code.get("WIDGET-100") == 100
+    assert by_code.get("WIDGET-200") == 200
+
+    partial = stub_analyze(
+        "Re: quotation",
+        "Please quote PRODUCT WIDGET-100 100 kg and PRODUCT WIDGET-200.",
+        [],
+    )
+    by_code = {line.product_code: line.quantity for line in partial.product_requests}
+    assert by_code.get("WIDGET-100") == 100
+    assert by_code.get("WIDGET-200") is None

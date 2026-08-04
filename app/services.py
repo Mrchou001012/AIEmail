@@ -111,7 +111,12 @@ from app.product_catalog import (
     customer_interest_keys,
     render_product_list_email,
 )
-from app.products import canonical_product_code, find_product_codes, product_codes_match
+from app.products import (
+    canonical_product_code,
+    find_product_codes,
+    product_codes_match,
+    product_text_key,
+)
 from app.rag_retrieval import LocalRAGRetriever
 from app.reactivation import reactivation_send_guard, record_reactivation_reply
 from app.settings import Settings, get_settings
@@ -1786,6 +1791,262 @@ async def queue_human_reply(
     return outbox
 
 
+async def quote_with_manual_price(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    product_id: int,
+    standard_price: Decimal,
+    currency: str,
+    quantity: int,
+    actor: str,
+    note: str = "",
+) -> Outbox:
+    """Persist a human-set price and let the system send the quotation.
+
+    The price is stored as an inactive historical price policy (inheriting
+    commercial terms from the most recent policy of the same product when
+    available). Prices change frequently, so the record is for reference only:
+    the next inquiry for the same product still routes to a human, and the
+    review screen shows this stored price history.
+    """
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.id == handoff_id).with_for_update()
+    )
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.case_id is None or handoff.source_email_id is None:
+        raise ValueError("associate the handoff with a case before quoting")
+    case = await session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.contact))
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if case is None:
+        raise ValueError("handoff case no longer exists")
+    product = await session.scalar(
+        select(Product).where(Product.id == product_id, Product.active.is_(True))
+    )
+    if product is None:
+        raise ValueError("product is not active in the catalog")
+    if case.product_id is not None and case.product_id != product.id:
+        raise ValueError(
+            "the selected product does not match the case product; "
+            "choose the case product to price it"
+        )
+    currency = currency.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("currency must be a three-letter code")
+    if standard_price <= 0:
+        raise ValueError("standard price must be positive")
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+
+    latest_policy = await session.scalar(
+        select(PricePolicy)
+        .where(
+            PricePolicy.product_id == product.id,
+            PricePolicy.currency == currency,
+        )
+        .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+        .limit(1)
+    )
+    today = date.today()
+    policy = PricePolicy(
+        commercial_cycle_id=None,
+        product_id=product.id,
+        currency=currency,
+        standard_price=standard_price,
+        # Counteroffers stay human-only; the floor equals the human-set price
+        # so no accidental automatic discount is possible.
+        absolute_floor=standard_price,
+        max_discount_pct=Decimal("0"),
+        max_negotiation_rounds=(
+            latest_policy.max_negotiation_rounds
+            if latest_policy is not None
+            else 2
+        ),
+        concession_step_pct=(
+            latest_policy.concession_step_pct
+            if latest_policy is not None
+            else Decimal("0.02")
+        ),
+        min_quantity=latest_policy.min_quantity if latest_policy is not None else 1,
+        max_quantity=(
+            latest_policy.max_quantity if latest_policy is not None else None
+        ),
+        tier_1_max_multiple=(
+            latest_policy.tier_1_max_multiple if latest_policy is not None else None
+        ),
+        tier_1_markup_pct=(
+            latest_policy.tier_1_markup_pct if latest_policy is not None else Decimal("0")
+        ),
+        tier_2_max_multiple=(
+            latest_policy.tier_2_max_multiple if latest_policy is not None else None
+        ),
+        tier_2_markup_pct=(
+            latest_policy.tier_2_markup_pct if latest_policy is not None else Decimal("0")
+        ),
+        quote_valid_days=latest_policy.quote_valid_days if latest_policy is not None else 30,
+        quote_valid_weekday=(
+            latest_policy.quote_valid_weekday if latest_policy is not None else None
+        ),
+        standard_incoterm=(
+            latest_policy.standard_incoterm
+            if latest_policy is not None
+            else "EXW"
+        ),
+        allowed_incoterms=list(latest_policy.allowed_incoterms or ["EXW"])
+        if latest_policy is not None
+        else ["EXW"],
+        standard_payment_term=(
+            latest_policy.standard_payment_term
+            if latest_policy is not None
+            else "100% before shipment"
+        ),
+        allowed_payment_terms=list(latest_policy.allowed_payment_terms or ["100% before shipment"])
+        if latest_policy is not None
+        else ["100% before shipment"],
+        taxes_included=latest_policy.taxes_included if latest_policy is not None else False,
+        freight_included=(
+            latest_policy.freight_included if latest_policy is not None else False
+        ),
+        valid_from=today,
+        valid_to=None,
+        source_hash=f"manual-price:{handoff_id}:{actor}:{today.isoformat()}:{product.id}:{currency}",
+        # Historical reference only: prices change frequently, so a
+        # human-set price must never feed the next autonomous quotation.
+        # The review screen shows this record; the next inquiry routes to a
+        # human again who can price with the history in view.
+        active=False,
+    )
+    session.add(policy)
+    await session.flush()
+
+    if case.product_id is None:
+        case.product_id = product.id
+        case.product = product
+    if case.currency != currency:
+        case.currency = currency
+    settings = get_settings()
+    valid_until = standard_quote_valid_until(settings)
+    bundle = load_content(settings.content_dir)
+    try:
+        plan = await AIClient().draft_plan(
+            {
+                "subject": "Quotation",
+                "contact_name": case.contact.name,
+                "approved_product_key": product.approved_text_key,
+            }
+        )
+        source_email = await session.get(EmailMessage, handoff.source_email_id)
+        if source_email is None:
+            raise ValueError("handoff source email no longer exists")
+        source = _reply_source(source_email)
+        text, html_body = render_multi_quote(
+            plan=plan,
+            bundle=bundle,
+            lines=[
+                {
+                    "product_name": product.name,
+                    "quantity": quantity,
+                    "unit": product.unit,
+                    "unit_price": standard_price,
+                    "incoterm": policy.standard_incoterm,
+                    "payment_term": policy.standard_payment_term,
+                    "taxes_included": policy.taxes_included,
+                    "freight_included": policy.freight_included,
+                }
+            ],
+            currency=currency,
+            valid_until=valid_until,
+            availability_note="Subject to confirmation at order placement",
+        )
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=source_email.from_address,
+            source_body=source.body_text,
+            source_html=source.body_html,
+            occurred_at=source_email.received_at,
+        )
+    except Exception as exc:
+        raise ValueError(f"quotation rendering failed: {type(exc).__name__}") from exc
+
+    latest_quote = await session.scalar(
+        select(Quote)
+        .where(Quote.case_id == case.id)
+        .order_by(Quote.round_number.desc(), Quote.id.desc())
+        .limit(1)
+    )
+    round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
+    quote = Quote(
+        case_id=case.id,
+        product_id=product.id,
+        price_policy_id=policy.id,
+        commercial_cycle_id=None,
+        round_number=round_number,
+        unit_price=standard_price,
+        currency=currency,
+        quantity=quantity,
+        incoterm=policy.standard_incoterm,
+        payment_term=policy.standard_payment_term,
+        valid_until=valid_until,
+        pricing_snapshot={
+            "hard_minimum": str(standard_price),
+            "pricing_reason": "manual-price",
+            "applied_markup_pct": "0",
+            "requested_price": None,
+        },
+    )
+    session.add(quote)
+    await session.flush()
+    case.negotiation_round = round_number
+    outbox = await freeze_outbox(
+        session,
+        case=case,
+        quote=quote,
+        subject=f"Re: {source_email.subject}",
+        text_body=text,
+        html_body=html_body,
+        business_key=f"handoff-reply:{handoff.id}:manual-price",
+        in_reply_to=source_email.message_id,
+        references=_reply_references(source_email),
+        inline_images=source.inline_images,
+    )
+    if outbox is None:
+        raise ValueError("a quotation is already queued for this handoff")
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = (
+        note.strip()
+        or f"Priced by {actor} at {currency} {standard_price} for {quantity} {product.unit}"
+    )
+    if handoff.dingtalk_status != "SENT":
+        handoff.dingtalk_status = "CANCELLED"
+    session.add(
+        AuditEvent(
+            case_id=case.id,
+            actor=actor,
+            event_type="handoff.manual_price_quoted",
+            data={
+                "handoff_id": handoff.id,
+                "outbox_id": outbox.id,
+                "product_id": product.id,
+                "product_code": product.code,
+                "currency": currency,
+                "standard_price": str(standard_price),
+                "quantity": quantity,
+                "policy_id": policy.id,
+                "quote_id": quote.id,
+            },
+        )
+    )
+    await session.commit()
+    return outbox
+
+
 def _reply_references(source_email: EmailMessage) -> list[str]:
     """Build a complete, ordered RFC reply chain for a response."""
     return list(
@@ -1971,6 +2232,75 @@ def render_quote(
         + bundle.signature_html
     )
     return text, html_body
+
+
+def render_multi_quote(
+    *,
+    plan: Any,
+    bundle: ContentBundle,
+    lines: list[dict[str, object]],
+    currency: str,
+    valid_until: date,
+    availability_note: str,
+) -> tuple[str, str]:
+    """Render one non-binding quotation covering several products."""
+    safe_greeting = plan.greeting.lower().startswith("dear ") and not any(
+        ch.isdigit() for ch in plan.greeting
+    )
+    greeting = plan.greeting if safe_greeting else "Dear Customer,"
+    opening = "Thank you for your inquiry."
+    price_lead_in = "Please find our standard quotation details below."
+    closing = "Please let us know if you have questions about this non-binding standard quotation."
+    body_lines: list[str] = [greeting, "", opening, "", price_lead_in]
+    for index, line in enumerate(lines):
+        body_lines.extend(
+            [
+                f"Product: {line['product_name']}",
+                f"Quantity: {line['quantity']} {line['unit']}",
+                f"Unit price: {currency} {line['unit_price']:.4f} per {line['unit']}",
+                f"Availability: {availability_note}",
+                f"Price basis: {line['incoterm']} (ex-warehouse)",
+                f"Taxes: {'included' if line['taxes_included'] else 'excluded'}",
+                f"Freight: {'included' if line['freight_included'] else 'excluded'}",
+                f"Payment term: {line['payment_term']}",
+            ]
+        )
+        if index < len(lines) - 1:
+            body_lines.append("---")
+    body_lines.extend(
+        [
+            f"Quote valid until: {valid_until.isoformat()} ({valid_until.strftime('%A')})",
+            "",
+            closing,
+        ]
+    )
+    business_text = "\n".join(body_lines)
+    text = "\n".join([business_text, "", bundle.signature_text.strip()])
+    html_body = (
+        "<p>"
+        + "</p><p>".join(html.escape(line) if line else "&nbsp;" for line in body_lines)
+        + "</p>"
+        + bundle.signature_html
+    )
+    return text, html_body
+
+
+def standard_quote_valid_until(
+    settings: Settings,
+    at: datetime | None = None,
+) -> date:
+    """Quotations expire on the coming Monday.
+
+    The weekly price refresh covers only the current week, so every quotation
+    is anchored to the Monday of the following week regardless of the product
+    or the day it was issued.
+    """
+    observed = at or datetime.now(UTC)
+    today = observed.astimezone(ZoneInfo(settings.business_timezone)).date()
+    days_until_monday = (0 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    return today + timedelta(days=days_until_monday)
 
 
 async def freeze_outbox(
@@ -2292,11 +2622,7 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
             facts={"quantity": quantity, "hard_minimum": str(decision.hard_minimum)},
         )
         return
-    valid_until = quote_valid_until(
-        quote_valid_days=policy_row.quote_valid_days,
-        quote_valid_weekday=policy_row.quote_valid_weekday,
-        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
-    )
+    valid_until = standard_quote_valid_until(settings)
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
@@ -2458,6 +2784,25 @@ def _explicit_product_codes(text: str) -> list[str]:
         ):
             explicit.append(candidate)
     return list(dict.fromkeys([*codes, *(canonical_product_code(value) for value in explicit)]))
+
+
+def _product_lookup_conditions(codes: list[str]) -> Any:
+    """Match catalog codes by exact value or canonical normalization.
+
+    Product codes are normalized with the same separator-insensitive key used
+    for lookups, so WIDGET-100, WIDGET_100 and widget_100 all resolve to the
+    same catalog row. Exact equality is kept as a fast path.
+    """
+    conditions = []
+    for code in codes:
+        conditions.append(Product.code == code)
+        conditions.append(
+            func.lower(
+                func.regexp_replace(Product.code, r"[^a-zA-Z0-9]", "_", "g")
+            )
+            == product_text_key(code)
+        )
+    return or_(*conditions)
 
 
 def _prior_thread_marker(text: str) -> str | None:
@@ -2696,6 +3041,61 @@ async def _resolve_new_inquiry_case(
                         "company_research": {"status": "DISABLED"},
                     },
                 )
+        elif len(product_codes) > 1:
+            # Multi-product quotation: keep the whole thread for automatic
+            # processing only when every named product exists in the active
+            # catalog. Any unknown product sends the entire request to a human.
+            active_products = (
+                (
+                    await session.execute(
+                        select(Product).where(
+                            _product_lookup_conditions(product_codes),
+                            Product.active.is_(True),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(active_products) != len(set(product_codes)):
+                return NewInquiryResolution(
+                    None,
+                    HandoffReason.NEW_INQUIRY_REVIEW,
+                    "New inbound thread names a product that is not active in the catalog",
+                    {**facts, "unknown_product": True},
+                )
+            currency_rows = await session.execute(
+                select(SalesCase.currency).where(
+                    SalesCase.customer_id == contact.customer_id,
+                    SalesCase.status.not_in(
+                        [CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]
+                    ),
+                )
+            )
+            currencies = set(currency_rows.scalars().all())
+            currency = next(iter(currencies)) if len(currencies) == 1 else "USD"
+            sales_case = SalesCase(
+                customer_id=contact.customer_id,
+                contact_id=contact.id,
+                product_id=None,
+                category_id=None,
+                currency=currency,
+                stage=CaseStage.QUOTING,
+                status=CaseStatus.ACTIVE,
+                subject_key=normalized_subject(parsed.subject)[:255],
+            )
+            session.add(sales_case)
+            await session.flush()
+            return NewInquiryResolution(
+                sales_case,
+                facts={
+                    **facts,
+                    "currency": currency,
+                    "product_pending": True,
+                    "multi_product": True,
+                    "match_basis": "explicit_multi_product_inquiry",
+                },
+            )
         return NewInquiryResolution(
             None,
             HandoffReason.NEW_INQUIRY_REVIEW,
@@ -2708,7 +3108,13 @@ async def _resolve_new_inquiry_case(
         )
 
     product = await session.scalar(
-        select(Product).where(Product.code == product_codes[0], Product.active.is_(True))
+        select(Product)
+        .where(
+            _product_lookup_conditions(product_codes),
+            Product.active.is_(True),
+        )
+        .order_by(Product.id)
+        .limit(1)
     )
     if product is None:
         return NewInquiryResolution(
@@ -2743,6 +3149,17 @@ async def _resolve_new_inquiry_case(
         # Manual-only products can still be represented as a case and routed to
         # a human using the customer's established market currency.
         currency = next(iter(customer_currencies))
+    elif (
+        not policy_currencies
+        and not customer_currencies
+        and not explicit_product_list_requested(combined_text)
+    ):
+        # Unpriced product in a quotation context with no customer history:
+        # still create the case with the default INR market so the human can
+        # price it from the handoff (the review screen then sends the
+        # quotation automatically). Explicit catalog requests stay case-less
+        # for the product-list backfill pipeline.
+        currency = "INR"
     else:
         return NewInquiryResolution(
             None,
@@ -3811,6 +4228,75 @@ async def _augment_pending_quote_context(
     return analysis.model_copy(update=updates), None
 
 
+def _quantity_unit_label(unit: str | None) -> str:
+    """Human-readable quantity unit for clarification questions."""
+    normalized = (unit or "").strip().lower()
+    if normalized in {"kg", "kgs", "kilogram", "kilograms"}:
+        return "kilograms"
+    if normalized in {"piece", "pieces"}:
+        return "pieces"
+    if normalized in {"unit", "units"}:
+        return "units"
+    return normalized or "kilograms"
+
+
+def _pluralized_unit(unit: str | None) -> str:
+    """Pluralize the product unit when it is a countable noun."""
+    normalized = (unit or "").strip().lower()
+    if normalized in {"piece", "unit"}:
+        return f"{normalized}s"
+    return normalized or "unit"
+
+
+async def _moq_price_rows(
+    session: AsyncSession,
+    *,
+    codes: list[str],
+    currency: str,
+) -> list[tuple[Product, PricePolicy]]:
+    """Return one active MOQ reference price per product that has a policy.
+
+    Products without a matching policy are simply skipped: the clarification
+    still asks for their quantity, and callers never crash when catalog or
+    commercial data changes underneath the request. Callers format the rows
+    with the wording appropriate for single- or multi-product requests.
+    """
+    unique_codes = list(dict.fromkeys(code for code in codes if code))
+    if not unique_codes:
+        return []
+    products = (
+        (
+            await session.execute(
+                select(Product).where(
+                    _product_lookup_conditions(unique_codes),
+                    Product.active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    product_by_key = {
+        product_text_key(product.code): product for product in products
+    }
+    rows: list[tuple[Product, PricePolicy]] = []
+    for code in unique_codes:
+        product = product_by_key.get(product_text_key(code))
+        if product is None:
+            continue
+        policy = await active_policy(session, product.id, currency)
+        if (
+            policy is None
+            or policy.min_quantity is None
+            or policy.min_quantity <= 0
+            or policy.standard_price is None
+            or policy.standard_price <= 0
+        ):
+            continue
+        rows.append((product, policy))
+    return rows
+
+
 async def _maybe_send_quote_clarification(
     session: AsyncSession,
     *,
@@ -3818,9 +4304,17 @@ async def _maybe_send_quote_clarification(
     email_row: EmailMessage,
     analysis: InboundAnalysis,
     analysis_facts: dict[str, Any],
+    missing_product_codes: list[str] | None = None,
 ) -> bool:
-    """Ask once for a missing product instead of immediately handing off."""
-    if analysis.intent != Intent.QUOTE_REQUEST or case.product_id is not None:
+    """Ask once for missing product/quantity details instead of handing off."""
+    product_known = case.product_id is not None
+    quantity_known = analysis.quantity is not None
+    needs_product = not product_known and not (missing_product_codes or analysis.product_requests)
+    needs_quantity = product_known and not quantity_known
+    needs_multi_quantities = bool(missing_product_codes)
+    if analysis.intent != Intent.QUOTE_REQUEST or not (
+        needs_product or needs_quantity or needs_multi_quantities
+    ):
         return False
 
     previous_clarification = await session.scalar(
@@ -3879,20 +4373,74 @@ async def _maybe_send_quote_clarification(
 
     bundle = load_content(get_settings().content_dir)
     greeting = f"Dear {case.contact.name.strip() or 'Customer'},"
-    if analysis.quantity is not None:
-        opening = f"Thank you for your quotation request for {analysis.quantity} kg."
-        question = (
-            "Could you please confirm the product name or Lanya product code "
-            "for this requirement?"
-        )
-    else:
+    if needs_multi_quantities:
         opening = "Thank you for your quotation request."
+        names = ", ".join(missing_product_codes)
+        moq_rows = await _moq_price_rows(
+            session,
+            codes=missing_product_codes,
+            currency=case.currency,
+        )
+        reference_lines = []
+        for product, policy in moq_rows:
+            raw_unit = (product.unit or "unit").strip() or "unit"
+            reference_lines.append(
+                f"{product.code}: MOQ {policy.min_quantity} "
+                f"{_pluralized_unit(raw_unit)} at {case.currency} "
+                f"{policy.standard_price:.2f}"
+            )
+        question = (
+            f"Could you please let us know the quantity you require for {names}? "
+            "Better pricing is available for larger volumes."
+            if moq_rows
+            else f"Could you please confirm the required quantity for {names}?"
+        )
+    elif needs_quantity:
+        opening = (
+            f"Thank you for your quotation request for {case.product.name}."
+            if case.product is not None
+            else "Thank you for your quotation request."
+        )
+        reference_lines = []
+        if case.product is not None:
+            moq_rows = await _moq_price_rows(
+                session,
+                codes=[case.product.code],
+                currency=case.currency,
+            )
+            for product, policy in moq_rows:
+                raw_unit = (product.unit or "unit").strip() or "unit"
+                reference_lines.append(
+                    f"Our minimum order quantity is {policy.min_quantity} "
+                    f"{_pluralized_unit(raw_unit)} at {case.currency} "
+                    f"{policy.standard_price:.2f} per {raw_unit}."
+                )
+        if reference_lines:
+            question = (
+                "Could you please let us know the quantity you require? "
+                "Better pricing is available for larger volumes."
+            )
+        else:
+            question = (
+                f"Could you please confirm the required quantity in "
+                f"{_quantity_unit_label(case.product.unit if case.product is not None else None)}?"
+            )
+    else:
+        opening = (
+            f"Thank you for your quotation request for {analysis.quantity} kg."
+            if analysis.quantity is not None
+            else "Thank you for your quotation request."
+        )
+        reference_lines = []
         question = (
             "Could you please confirm the product name or Lanya product code, "
             "together with the required quantity?"
         )
-    closing = "Once confirmed, we will check the current availability and price."
-    business_lines = [greeting, "", opening, "", question, closing]
+    closing = "Once confirmed, we will confirm availability and prepare your quotation accordingly."
+    business_lines = [greeting, "", opening]
+    for line in reference_lines:
+        business_lines.extend(["", line])
+    business_lines.extend(["", question, closing])
     text = "\n".join([*business_lines, "", bundle.signature_text.strip()])
     html_body = (
         "<p>"
@@ -3947,6 +4495,358 @@ async def _maybe_send_quote_clarification(
                 "requested_quantity": analysis.quantity,
             },
         )
+    return True
+
+
+async def _maybe_send_multi_product_quote(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+) -> bool:
+    """Quote every explicitly named product in one deterministic reply.
+
+    The entire request goes to a human when any product is unknown, lacks a
+    price policy, has a missing quantity after clarification, or fails the
+    pricing/send gates. Partial quotations are never sent.
+    """
+    requests = [
+        line
+        for line in analysis.product_requests
+        if line.product_code
+    ]
+    if analysis.intent != Intent.QUOTE_REQUEST or len(requests) < 2:
+        return False
+    if case.product_id is not None:
+        return False
+
+    normalized_codes = list(
+        dict.fromkeys(product_text_key(line.product_code) for line in requests)
+    )
+    products = (
+        (
+            await session.execute(
+                select(Product).where(
+                    _product_lookup_conditions(
+                        list(
+                            dict.fromkeys(
+                                line.product_code for line in requests
+                            )
+                        )
+                    ),
+                    Product.active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    product_by_key = {
+        product_text_key(product.code): product for product in products
+    }
+    if len(product_by_key) != len(normalized_codes):
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.NEW_INQUIRY_REVIEW,
+            summary="Multi-product request names a product that is not active in the catalog",
+            facts={**analysis_facts, "unknown_product": True},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    # The same product may be mentioned more than once. Resolve every mention
+    # to its catalog row first, then keep one line per product only when all
+    # mentions agree on the same quantity. Missing or conflicting quantities
+    # are clarified instead of guessing, and duplicate rows can never violate
+    # the (case, round, product) uniqueness constraint.
+    grouped_quantities: dict[int, list[int | None]] = {}
+    product_by_id: dict[int, Product] = {}
+    for line in requests:
+        product = product_by_key.get(product_text_key(line.product_code))
+        if product is None:
+            continue
+        product_by_id[product.id] = product
+        grouped_quantities.setdefault(product.id, []).append(line.quantity)
+
+    missing_quantity_codes: list[str] = []
+    resolved_requests: list[tuple[Product, int]] = []
+    for product_id, quantities in grouped_quantities.items():
+        product = product_by_id[product_id]
+        distinct_quantities = set(quantities)
+        if len(distinct_quantities) == 1 and None not in distinct_quantities:
+            resolved_requests.append((product, next(iter(distinct_quantities))))
+        else:
+            missing_quantity_codes.append(product.code)
+    if missing_quantity_codes:
+        await _maybe_send_quote_clarification(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=analysis,
+            analysis_facts=analysis_facts,
+            missing_product_codes=missing_quantity_codes,
+        )
+        return True
+
+    codes = [product.code for product in product_by_key.values()]
+    settings = get_settings()
+    valid_until = standard_quote_valid_until(settings)
+    quote_rows: list[tuple[Product, PricePolicy, QuoteContext, Decimal, int, date]] = []
+    for product, quantity in resolved_requests:
+        context = await _commercial_quote_context(
+            session,
+            product_id=product.id,
+            currency=case.currency,
+            settings=settings,
+            requested_quantity=quantity,
+        )
+        if context is not None and context.status is QuoteContextStatus.UNAVAILABLE:
+            reason = (
+                HandoffReason.INVENTORY_UNAVAILABLE
+                if context.reason.startswith("INVENTORY")
+                else HandoffReason.NONSTANDARD
+            )
+            await create_handoff(
+                session,
+                case=case,
+                reason=reason,
+                summary=(
+                    f"Current commercial data cannot quote {product.code}: "
+                    f"{context.reason}"
+                ),
+                facts={
+                    **analysis_facts,
+                    "commercial_cycle_id": context.cycle.id,
+                    "product_pending": True,
+                    "requested_quantity": quantity,
+                },
+                source_email_id=email_row.id,
+            )
+            return True
+        policy_row = (
+            context.policy
+            if context is not None
+            else await active_policy(session, product.id, case.currency)
+        )
+        if policy_row is None:
+            await create_handoff(
+                session,
+                case=case,
+                reason=HandoffReason.NONSTANDARD,
+                summary=f"No standard price policy matched {product.code}",
+                facts={**analysis_facts, "product_pending": True},
+                source_email_id=email_row.id,
+            )
+            return True
+        price_decision = initial_quote(_pricing_policy(policy_row), quantity)
+        if not price_decision.approved or price_decision.unit_price is None:
+            reason = (
+                HandoffReason.BELOW_FLOOR
+                if price_decision.reason and "floor" in price_decision.reason
+                else HandoffReason.NONSTANDARD
+            )
+            await create_handoff(
+                session,
+                case=case,
+                reason=reason,
+                summary=f"Pricing engine rejected autonomous reply for {product.code}",
+                facts={
+                    **analysis_facts,
+                    "hard_minimum": str(price_decision.hard_minimum),
+                    "pricing_reason": price_decision.reason,
+                },
+                source_email_id=email_row.id,
+            )
+            return True
+        quote_rows.append(
+            (
+                product,
+                policy_row,
+                context,
+                price_decision.unit_price,
+                quantity,
+                valid_until,
+            )
+        )
+
+    currency_standard = analysis.currency is None or analysis.currency.upper() == case.currency
+    first_policy = quote_rows[0][1]
+    incoterm_standard = (
+        analysis.incoterm is None
+        or analysis.incoterm.upper() == first_policy.standard_incoterm.upper()
+    )
+    payment_standard = (
+        analysis.payment_term is None
+        or analysis.payment_term.casefold()
+        == first_policy.standard_payment_term.casefold()
+    )
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            product_confidence=1.0,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            currency_standard=currency_standard,
+            quantity_standard=True,
+            incoterm_standard=incoterm_standard,
+            payment_standard=payment_standard,
+            product_known=True,
+            prebook_requested=analysis.prebook_requested,
+            packaging_requested=analysis.packaging_requested,
+            delivery_requested=analysis.shipping_requested,
+            ready_stock_available=True,
+        ),
+        intent_threshold=settings.intent_confidence_threshold,
+        product_threshold=settings.product_confidence_threshold,
+        numeric_threshold=settings.numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await create_handoff(
+            session,
+            case=case,
+            reason=send_decision.reason or HandoffReason.NONSTANDARD,
+            summary="Multi-product quotation requires human review",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    bundle = load_content(settings.content_dir)
+    try:
+        plan = await AIClient().draft_plan(
+            {
+                "subject": email_row.subject,
+                "contact_name": case.contact.name,
+                "approved_product_key": quote_rows[0][0].approved_text_key,
+            }
+        )
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Reply drafting failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    availability_note = (
+        "Subject to confirmation at order placement"
+        if settings.quote_ignore_inventory
+        else "Ready stock"
+    )
+    lines = [
+        {
+            "product_name": product.name,
+            "quantity": quantity,
+            "unit": product.unit,
+            "unit_price": unit_price,
+            "incoterm": policy.standard_incoterm,
+            "payment_term": policy.standard_payment_term,
+            "taxes_included": policy.taxes_included,
+            "freight_included": policy.freight_included,
+        }
+        for product, policy, _context, unit_price, quantity, _valid_until in quote_rows
+    ]
+    text, html_body = render_multi_quote(
+        plan=plan,
+        bundle=bundle,
+        lines=lines,
+        currency=case.currency,
+        valid_until=valid_until,
+        availability_note=availability_note,
+    )
+    try:
+        source = _reply_source(email_row)
+        text, html_body = append_quoted_reply(
+            text,
+            html_body,
+            from_address=email_row.from_address,
+            source_body=source.body_text,
+            source_html=source.body_html,
+            occurred_at=email_row.received_at,
+        )
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Multi-product quotation rendering failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    latest_quote = await session.scalar(
+        select(Quote)
+        .where(Quote.case_id == case.id)
+        .order_by(Quote.round_number.desc(), Quote.id.desc())
+        .limit(1)
+    )
+    round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
+    created_quotes: list[Quote] = []
+    for product, policy, context, unit_price, quantity, valid_until in quote_rows:
+        quote = Quote(
+            case_id=case.id,
+            product_id=product.id,
+            price_policy_id=policy.id,
+            commercial_cycle_id=(
+                context.cycle.id if context is not None else None
+            ),
+            round_number=round_number,
+            unit_price=unit_price,
+            currency=policy.currency,
+            quantity=quantity,
+            incoterm=policy.standard_incoterm,
+            payment_term=policy.standard_payment_term,
+            valid_until=valid_until,
+            pricing_snapshot={
+                "hard_minimum": str(
+                    _pricing_policy(policy).absolute_floor
+                ),
+                "pricing_reason": "multi-product-autonomous",
+                "applied_markup_pct": "0",
+                "requested_price": str(analysis.requested_unit_price),
+            },
+        )
+        session.add(quote)
+        created_quotes.append(quote)
+    await session.flush()
+    case.negotiation_round = round_number
+    await freeze_outbox(
+        session,
+        case=case,
+        quote=created_quotes[0],
+        subject=f"Re: {email_row.subject}",
+        text_body=text,
+        html_body=html_body,
+        business_key=f"inbound-reply:{email_row.id}:multi-quote",
+        in_reply_to=email_row.message_id,
+        references=_reply_references(email_row),
+        inline_images=source.inline_images,
+    )
+    await audit(
+        session,
+        "inbound.multi_product_quote_queued",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "round_number": round_number,
+            "product_codes": codes,
+            "quote_ids": [quote.id for quote in created_quotes],
+        },
+    )
     return True
 
 
@@ -5202,7 +6102,21 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
-    if case.product_id is None and analysis.intent == Intent.QUOTE_REQUEST:
+    multi_product_request = (
+        len(
+            [
+                line
+                for line in analysis.product_requests
+                if line.product_code
+            ]
+        )
+        >= 2
+    )
+    if (
+        case.product_id is None
+        and analysis.intent == Intent.QUOTE_REQUEST
+        and not multi_product_request
+    ):
         analysis, context_conflict = await _augment_pending_quote_context(
             session,
             case=case,
@@ -5268,6 +6182,14 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         ):
             return
         if analysis.intent == Intent.QUOTE_REQUEST:
+            if await _maybe_send_multi_product_quote(
+                session,
+                case=case,
+                email_row=email_row,
+                analysis=analysis,
+                analysis_facts=analysis_facts,
+            ):
+                return
             if await _maybe_send_quote_clarification(
                 session,
                 case=case,
@@ -5351,6 +6273,14 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         return
     quantity = analysis.quantity or (latest_quote.quantity if latest_quote is not None else None)
     if quantity is None:
+        if await _maybe_send_quote_clarification(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=analysis,
+            analysis_facts=analysis_facts,
+        ):
+            return
         await create_handoff(
             session,
             case=case,
@@ -5472,11 +6402,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
-    valid_until = quote_valid_until(
-        quote_valid_days=policy_row.quote_valid_days,
-        quote_valid_weekday=policy_row.quote_valid_weekday,
-        today=datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date(),
-    )
+    valid_until = standard_quote_valid_until(settings)
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
         await create_handoff(
@@ -5527,6 +6453,11 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             valid_until=valid_until,
             taxes_included=policy_row.taxes_included,
             freight_included=policy_row.freight_included,
+            availability=(
+                "Subject to confirmation at order placement"
+                if settings.quote_ignore_inventory
+                else "Ready stock"
+            ),
         )
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(

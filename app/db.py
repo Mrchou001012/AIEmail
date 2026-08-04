@@ -340,9 +340,19 @@ class MailboxThrottle(Base):
 
 class Quote(Base):
     __tablename__ = "quotes"
-    __table_args__ = (UniqueConstraint("case_id", "round_number", name="uq_quote_case_round"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "case_id",
+            "round_number",
+            "product_id",
+            name="uq_quote_case_round_product",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int] = mapped_column(ForeignKey("cases.id"), index=True)
+    product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"), index=True
+    )
     price_policy_id: Mapped[int] = mapped_column(ForeignKey("price_policies.id"))
     commercial_cycle_id: Mapped[int | None] = mapped_column(
         ForeignKey("commercial_data_cycles.id", ondelete="SET NULL"), index=True
