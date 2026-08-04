@@ -262,6 +262,26 @@ class LocalDatabaseCommercialDataProvider:
                 "PRICE_CONFIRMATION_PENDING",
                 _next_check(self.settings, observed_at),
             )
+        if policy is None:
+            return QuoteContext(
+                cycle,
+                None,
+                inventory,
+                QuoteContextStatus.UNAVAILABLE,
+                "PRICE_POLICY_UNAVAILABLE",
+            )
+        if self.settings.quote_ignore_inventory:
+            # Quotation is a non-binding price offer; stock is confirmed only
+            # when the customer actually places an order. A quotation must
+            # never promise ready stock, so the rendered email carries a
+            # neutral "subject to confirmation" line instead.
+            return QuoteContext(
+                cycle,
+                policy,
+                inventory,
+                QuoteContextStatus.AVAILABLE,
+                "COMMERCIAL_DATA_AVAILABLE",
+            )
         if cycle.inventory_status.upper() != "CONFIRMED":
             return QuoteContext(
                 cycle,
@@ -270,14 +290,6 @@ class LocalDatabaseCommercialDataProvider:
                 QuoteContextStatus.WAITING,
                 "INVENTORY_CONFIRMATION_PENDING",
                 _next_check(self.settings, observed_at),
-            )
-        if policy is None:
-            return QuoteContext(
-                cycle,
-                None,
-                inventory,
-                QuoteContextStatus.UNAVAILABLE,
-                "PRICE_POLICY_UNAVAILABLE",
             )
         if inventory is None:
             return QuoteContext(

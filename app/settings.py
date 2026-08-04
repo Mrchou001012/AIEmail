@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     dingtalk_webhook_url: str | None = None
 
     commercial_gate_enabled: bool = True
+    quote_ignore_inventory: bool = False
     commercial_data_provider: Literal["database"] = "database"
     commercial_scope: str = "default"
     commercial_timezone: str = "Asia/Shanghai"

@@ -11,8 +11,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain import Intent
 from app.product_catalog import classify_category_interests
-from app.products import canonical_product_code, find_product_code
+from app.products import canonical_product_code, find_product_code, find_product_codes
 from app.settings import Settings, get_settings
+
+
+class ProductLine(BaseModel):
+    """One product explicitly requested in the email, with its own quantity."""
+
+    model_config = ConfigDict(
+        json_schema_mode_override="serialization",
+        json_schema_serialization_defaults_required=True,
+    )
+
+    product_code: str | None = None
+    quantity: int | None = Field(default=None, ge=1)
 
 
 class InboundAnalysis(BaseModel):
@@ -25,6 +37,7 @@ class InboundAnalysis(BaseModel):
     intent_confidence: float = Field(ge=0, le=1)
     product_code: str | None = None
     product_confidence: float = Field(ge=0, le=1)
+    product_requests: list[ProductLine] = Field(default_factory=list)
     quantity: int | None = Field(default=None, ge=1)
     requested_unit_price: Decimal | None = None
     currency: str | None = None
@@ -109,7 +122,11 @@ flags, and an empty list when there is no evidence or missing field.
 Classify as product_list_request when the customer asks for a product list, catalog,
 brochure, or full product range, or when they name only a product category (for example
 industrial silanes, pharmaceutical, or rubber and plastics products) without a specific
-product code. Leave product_code null for product-list requests.
+product code. Leave product_code null for product-list requests. When the email names
+several products, list every one in product_requests with its own quantity (for example
+"YAC-A110 100 kg and YAC-N113 200 kg" becomes two product_requests entries). A product
+without a stated quantity has quantity null. Keep product_code as the first/primary
+requested product.
 Return only the requested structured result."""
 
 DRAFT_PROMPT = """Create a conservative B2B email language plan. Do not invent prices, currencies,
@@ -428,6 +445,52 @@ def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> 
         }:
             product_code = canonical_product_code(candidate)
     quantity = extract_quantity_kg(text)
+    all_codes = find_product_codes(text)
+    for match in re.finditer(
+        r"\b(?:SKU|PRODUCT)\s*[:#-]?\s*([A-Z0-9][A-Z0-9_()%.\-]{1,63})",
+        text,
+        re.I,
+    ):
+        candidate = match.group(1).rstrip(".,;:!?")
+        if candidate.upper() in {
+            "LIST",
+            "CATALOG",
+            "CATALOGUE",
+            "BROCHURE",
+            "RANGE",
+            "PORTFOLIO",
+            "DATA",
+            "DETAIL",
+            "DETAILS",
+            "INFORMATION",
+            "INFO",
+            "SHEET",
+        }:
+            continue
+        if re.search(r"\d", candidate):
+            code = canonical_product_code(candidate)
+            if code not in all_codes:
+                all_codes.append(code)
+    if product_code is not None and product_code not in all_codes:
+        all_codes.append(product_code)
+    product_requests = []
+    lowered_text = text.casefold()
+    for code in all_codes:
+        position = lowered_text.find(code.casefold())
+        line_quantity = (
+            extract_quantity_kg(text[position : position + 300])
+            if position >= 0
+            else None
+        )
+        if line_quantity is None and len(all_codes) == 1:
+            # Single-product email: the email-wide quantity is authoritative.
+            line_quantity = quantity
+        product_requests.append(
+            ProductLine(
+                product_code=code,
+                quantity=line_quantity,
+            )
+        )
     price_match = re.search(
         r"(?<![A-Z0-9])(USD|EUR|CNY|INR|₹|RS\.?)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)\b|"
         r"\b([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,4})?)\s*(USD|EUR|CNY|INR|₹|RS\.?)(?![A-Z0-9])",
@@ -468,6 +531,7 @@ def stub_analyze(subject: str, body: str, attachments: list[dict[str, Any]]) -> 
             else 0.97 if intent != Intent.OTHER else 0.45
         ),
         product_code=product_code or None,
+        product_requests=product_requests,
         product_confidence=(
             0.98
             if product_code
@@ -530,6 +594,23 @@ class AIClient:
         if parsed_output.product_code:
             parsed_output = parsed_output.model_copy(
                 update={"product_code": canonical_product_code(parsed_output.product_code)}
+            )
+        if parsed_output.product_requests:
+            parsed_output = parsed_output.model_copy(
+                update={
+                    "product_requests": [
+                        line.model_copy(
+                            update={
+                                "product_code": (
+                                    canonical_product_code(line.product_code)
+                                    if line.product_code
+                                    else None
+                                )
+                            }
+                        )
+                        for line in parsed_output.product_requests
+                    ]
+                }
             )
         parsed_output = _normalize_quantity_revision(parsed_output, body)
         return parsed_output, {
