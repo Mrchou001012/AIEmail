@@ -622,10 +622,8 @@ async def test_manual_price_rejects_product_mismatch_with_case(
         await quote_with_manual_price(
             db_session,
             handoff_id=handoff.id,
-            product_id=other.id,
-            standard_price=Decimal("300.0000"),
+            lines=[(other.id, Decimal("300.0000"), 50)],
             currency="USD",
-            quantity=50,
             actor="admin",
         )
 
@@ -727,10 +725,8 @@ async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
     outbox = await quote_with_manual_price(
         db_session,
         handoff_id=handoff.id,
-        product_id=product.id,
-        standard_price=Decimal("450.0000"),
+        lines=[(product.id, Decimal("450.0000"), 50)],
         currency="USD",
-        quantity=50,
         actor="admin",
     )
     assert outbox.message_kind == "AUTO_QUOTE"
@@ -759,10 +755,8 @@ async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
         await quote_with_manual_price(
             db_session,
             handoff_id=handoff.id,
-            product_id=product.id,
-            standard_price=Decimal("450.0000"),
+            lines=[(product.id, Decimal("450.0000"), 50)],
             currency="USD",
-            quantity=50,
             actor="admin",
         )
 
@@ -798,3 +792,90 @@ async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
         row.standard_price == Decimal("450.0000") and row.active is False
         for row in history_rows
     )
+
+
+async def test_manual_price_quote_multiple_products_sends_one_email(
+    db_session: AsyncSession,
+) -> None:
+    await seed_demo_data(db_session)
+    first = Product(
+        code="WIDGET-400",
+        name="Industrial Widget 400",
+        unit="kg",
+        approved_text_key="widget_400",
+    )
+    second = Product(
+        code="WIDGET-500",
+        name="Industrial Widget 500",
+        unit="kg",
+        approved_text_key="widget_500",
+    )
+    db_session.add_all([first, second])
+    await db_session.commit()
+    email_row = await ingest_raw_email(
+        db_session,
+        _mime(
+            (
+                "Please quote PRODUCT WIDGET-400 50 kg and "
+                "PRODUCT WIDGET-500 60 kg."
+            ),
+            message_id="manual-price-multi-inquiry",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.NONSTANDARD.value
+    case = await db_session.get(SalesCase, handoff.case_id)
+    assert case is not None and case.product_id is None
+
+    outbox = await quote_with_manual_price(
+        db_session,
+        handoff_id=handoff.id,
+        lines=[
+            (first.id, Decimal("400.0000"), 50),
+            (second.id, Decimal("500.0000"), 60),
+        ],
+        currency="INR",
+        actor="admin",
+    )
+    assert outbox.message_kind == "AUTO_QUOTE"
+    assert "Industrial Widget 400" in outbox.raw_message
+    assert "Industrial Widget 500" in outbox.raw_message
+    quotes = (
+        (
+            await db_session.execute(
+                select(Quote).where(Quote.case_id == case.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(quotes) == 2
+    assert {quote.product_id for quote in quotes} == {first.id, second.id}
+    assert len({quote.round_number for quote in quotes}) == 1
+    policies = (
+        (
+            await db_session.execute(
+                select(PricePolicy).where(
+                    PricePolicy.product_id.in_([first.id, second.id])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(policies) == 2
+    assert all(policy.active is False for policy in policies)
+    assert {policy.standard_price for policy in policies} == {
+        Decimal("400.0000"),
+        Decimal("500.0000"),
+    }
+    await db_session.refresh(handoff)
+    assert handoff.status == "RESOLVED"
+    await db_session.refresh(case)
+    assert case.product_id is None

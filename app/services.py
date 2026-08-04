@@ -1791,59 +1791,16 @@ async def queue_human_reply(
     return outbox
 
 
-async def quote_with_manual_price(
+async def _manual_pricing_policy(
     session: AsyncSession,
     *,
-    handoff_id: int,
-    product_id: int,
-    standard_price: Decimal,
+    product: Product,
     currency: str,
-    quantity: int,
+    standard_price: Decimal,
+    handoff_id: int,
     actor: str,
-    note: str = "",
-) -> Outbox:
-    """Persist a human-set price and let the system send the quotation.
-
-    The price is stored as an inactive historical price policy (inheriting
-    commercial terms from the most recent policy of the same product when
-    available). Prices change frequently, so the record is for reference only:
-    the next inquiry for the same product still routes to a human, and the
-    review screen shows this stored price history.
-    """
-    handoff = await session.scalar(
-        select(Handoff).where(Handoff.id == handoff_id).with_for_update()
-    )
-    if handoff is None:
-        raise ValueError("handoff not found")
-    if handoff.status != "OPEN":
-        raise ValueError("handoff is already resolved")
-    if handoff.case_id is None or handoff.source_email_id is None:
-        raise ValueError("associate the handoff with a case before quoting")
-    case = await session.scalar(
-        select(SalesCase)
-        .options(selectinload(SalesCase.contact))
-        .where(SalesCase.id == handoff.case_id)
-    )
-    if case is None:
-        raise ValueError("handoff case no longer exists")
-    product = await session.scalar(
-        select(Product).where(Product.id == product_id, Product.active.is_(True))
-    )
-    if product is None:
-        raise ValueError("product is not active in the catalog")
-    if case.product_id is not None and case.product_id != product.id:
-        raise ValueError(
-            "the selected product does not match the case product; "
-            "choose the case product to price it"
-        )
-    currency = currency.strip().upper()
-    if not re.fullmatch(r"[A-Z]{3}", currency):
-        raise ValueError("currency must be a three-letter code")
-    if standard_price <= 0:
-        raise ValueError("standard price must be positive")
-    if quantity <= 0:
-        raise ValueError("quantity must be positive")
-
+    today: date,
+) -> PricePolicy:
     latest_policy = await session.scalar(
         select(PricePolicy)
         .where(
@@ -1853,7 +1810,6 @@ async def quote_with_manual_price(
         .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
         .limit(1)
     )
-    today = date.today()
     policy = PricePolicy(
         commercial_cycle_id=None,
         product_id=product.id,
@@ -1881,22 +1837,26 @@ async def quote_with_manual_price(
             latest_policy.tier_1_max_multiple if latest_policy is not None else None
         ),
         tier_1_markup_pct=(
-            latest_policy.tier_1_markup_pct if latest_policy is not None else Decimal("0")
+            latest_policy.tier_1_markup_pct
+            if latest_policy is not None
+            else Decimal("0")
         ),
         tier_2_max_multiple=(
             latest_policy.tier_2_max_multiple if latest_policy is not None else None
         ),
         tier_2_markup_pct=(
-            latest_policy.tier_2_markup_pct if latest_policy is not None else Decimal("0")
+            latest_policy.tier_2_markup_pct
+            if latest_policy is not None
+            else Decimal("0")
         ),
-        quote_valid_days=latest_policy.quote_valid_days if latest_policy is not None else 30,
+        quote_valid_days=(
+            latest_policy.quote_valid_days if latest_policy is not None else 30
+        ),
         quote_valid_weekday=(
             latest_policy.quote_valid_weekday if latest_policy is not None else None
         ),
         standard_incoterm=(
-            latest_policy.standard_incoterm
-            if latest_policy is not None
-            else "EXW"
+            latest_policy.standard_incoterm if latest_policy is not None else "EXW"
         ),
         allowed_incoterms=list(latest_policy.allowed_incoterms or ["EXW"])
         if latest_policy is not None
@@ -1906,7 +1866,9 @@ async def quote_with_manual_price(
             if latest_policy is not None
             else "100% before shipment"
         ),
-        allowed_payment_terms=list(latest_policy.allowed_payment_terms or ["100% before shipment"])
+        allowed_payment_terms=list(
+            latest_policy.allowed_payment_terms or ["100% before shipment"]
+        )
         if latest_policy is not None
         else ["100% before shipment"],
         taxes_included=latest_policy.taxes_included if latest_policy is not None else False,
@@ -1915,7 +1877,10 @@ async def quote_with_manual_price(
         ),
         valid_from=today,
         valid_to=None,
-        source_hash=f"manual-price:{handoff_id}:{actor}:{today.isoformat()}:{product.id}:{currency}",
+        source_hash=(
+            f"manual-price:{handoff_id}:{actor}:{today.isoformat()}:"
+            f"{product.id}:{currency}"
+        ),
         # Historical reference only: prices change frequently, so a
         # human-set price must never feed the next autonomous quotation.
         # The review screen shows this record; the next inquiry routes to a
@@ -1924,31 +1889,119 @@ async def quote_with_manual_price(
     )
     session.add(policy)
     await session.flush()
+    return policy
 
-    if case.product_id is None:
-        case.product_id = product.id
-        case.product = product
+
+async def quote_with_manual_price(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    lines: list[tuple[int, Decimal, int]],
+    currency: str,
+    actor: str,
+    note: str = "",
+) -> Outbox:
+    """Persist human-set prices and send one quotation covering every line.
+
+    Each price is stored as an inactive historical price policy (inheriting
+    commercial terms from the most recent policy of the same product when
+    available). Prices change frequently, so the records are for reference
+    only: the next inquiry for the same products still routes to a human, and
+    the review screen shows this stored price history. All lines are sent in
+    one quotation email with one round number; partial quotations are never
+    sent.
+    """
+    if not lines:
+        raise ValueError("at least one product line is required")
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.id == handoff_id).with_for_update()
+    )
+    if handoff is None:
+        raise ValueError("handoff not found")
+    if handoff.status != "OPEN":
+        raise ValueError("handoff is already resolved")
+    if handoff.case_id is None or handoff.source_email_id is None:
+        raise ValueError("associate the handoff with a case before quoting")
+    case = await session.scalar(
+        select(SalesCase)
+        .options(selectinload(SalesCase.contact))
+        .where(SalesCase.id == handoff.case_id)
+    )
+    if case is None:
+        raise ValueError("handoff case no longer exists")
+    currency = currency.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("currency must be a three-letter code")
+    product_ids = [line[0] for line in lines]
+    if len(set(product_ids)) != len(product_ids):
+        raise ValueError("the same product cannot be priced twice in one quotation")
+    products = (
+        (
+            await session.execute(
+                select(Product).where(
+                    Product.id.in_(product_ids),
+                    Product.active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    product_by_id = {product.id: product for product in products}
+    if len(product_by_id) != len(set(product_ids)):
+        raise ValueError("one or more products are not active in the catalog")
+    if case.product_id is not None:
+        if len(lines) != 1 or lines[0][0] != case.product_id:
+            raise ValueError(
+                "the selected product does not match the case product; "
+                "choose the case product to price it"
+            )
+    for _product_id, standard_price, quantity in lines:
+        if standard_price <= 0:
+            raise ValueError("standard price must be positive")
+        if quantity <= 0:
+            raise ValueError("quantity must be positive")
+
+    today = date.today()
+    policies: dict[int, PricePolicy] = {}
+    for product_id, standard_price, _quantity in lines:
+        policies[product_id] = await _manual_pricing_policy(
+            session,
+            product=product_by_id[product_id],
+            currency=currency,
+            standard_price=standard_price,
+            handoff_id=handoff_id,
+            actor=actor,
+            today=today,
+        )
+
+    if case.product_id is None and len(lines) == 1:
+        single_product = product_by_id[lines[0][0]]
+        case.product_id = single_product.id
+        case.product = single_product
     if case.currency != currency:
         case.currency = currency
     settings = get_settings()
     valid_until = standard_quote_valid_until(settings)
     bundle = load_content(settings.content_dir)
     try:
+        first_product = product_by_id[lines[0][0]]
         plan = await AIClient().draft_plan(
             {
                 "subject": "Quotation",
                 "contact_name": case.contact.name,
-                "approved_product_key": product.approved_text_key,
+                "approved_product_key": first_product.approved_text_key,
             }
         )
         source_email = await session.get(EmailMessage, handoff.source_email_id)
         if source_email is None:
             raise ValueError("handoff source email no longer exists")
         source = _reply_source(source_email)
-        text, html_body = render_multi_quote(
-            plan=plan,
-            bundle=bundle,
-            lines=[
+        rendered_lines = []
+        for product_id, standard_price, quantity in lines:
+            product = product_by_id[product_id]
+            policy = policies[product_id]
+            rendered_lines.append(
                 {
                     "product_name": product.name,
                     "quantity": quantity,
@@ -1959,7 +2012,11 @@ async def quote_with_manual_price(
                     "taxes_included": policy.taxes_included,
                     "freight_included": policy.freight_included,
                 }
-            ],
+            )
+        text, html_body = render_multi_quote(
+            plan=plan,
+            bundle=bundle,
+            lines=rendered_lines,
             currency=currency,
             valid_until=valid_until,
             availability_note="Subject to confirmation at order placement",
@@ -1982,32 +2039,37 @@ async def quote_with_manual_price(
         .limit(1)
     )
     round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
-    quote = Quote(
-        case_id=case.id,
-        product_id=product.id,
-        price_policy_id=policy.id,
-        commercial_cycle_id=None,
-        round_number=round_number,
-        unit_price=standard_price,
-        currency=currency,
-        quantity=quantity,
-        incoterm=policy.standard_incoterm,
-        payment_term=policy.standard_payment_term,
-        valid_until=valid_until,
-        pricing_snapshot={
-            "hard_minimum": str(standard_price),
-            "pricing_reason": "manual-price",
-            "applied_markup_pct": "0",
-            "requested_price": None,
-        },
-    )
-    session.add(quote)
+    created_quotes: list[Quote] = []
+    for product_id, standard_price, quantity in lines:
+        product = product_by_id[product_id]
+        policy = policies[product_id]
+        quote = Quote(
+            case_id=case.id,
+            product_id=product.id,
+            price_policy_id=policy.id,
+            commercial_cycle_id=None,
+            round_number=round_number,
+            unit_price=standard_price,
+            currency=currency,
+            quantity=quantity,
+            incoterm=policy.standard_incoterm,
+            payment_term=policy.standard_payment_term,
+            valid_until=valid_until,
+            pricing_snapshot={
+                "hard_minimum": str(standard_price),
+                "pricing_reason": "manual-price",
+                "applied_markup_pct": "0",
+                "requested_price": None,
+            },
+        )
+        session.add(quote)
+        created_quotes.append(quote)
     await session.flush()
     case.negotiation_round = round_number
     outbox = await freeze_outbox(
         session,
         case=case,
-        quote=quote,
+        quote=created_quotes[0],
         subject=f"Re: {source_email.subject}",
         text_body=text,
         html_body=html_body,
@@ -2019,10 +2081,14 @@ async def quote_with_manual_price(
     if outbox is None:
         raise ValueError("a quotation is already queued for this handoff")
     handoff.status = "RESOLVED"
-    handoff.resolution_note = (
-        note.strip()
-        or f"Priced by {actor} at {currency} {standard_price} for {quantity} {product.unit}"
+    priced_summary = "; ".join(
+        (
+            f"{product_by_id[product_id].code} {quantity} "
+            f"{product_by_id[product_id].unit} at {currency} {standard_price}"
+        )
+        for product_id, standard_price, quantity in lines
     )
+    handoff.resolution_note = note.strip() or f"Priced by {actor}: {priced_summary}"
     if handoff.dingtalk_status != "SENT":
         handoff.dingtalk_status = "CANCELLED"
     session.add(
@@ -2033,13 +2099,18 @@ async def quote_with_manual_price(
             data={
                 "handoff_id": handoff.id,
                 "outbox_id": outbox.id,
-                "product_id": product.id,
-                "product_code": product.code,
                 "currency": currency,
-                "standard_price": str(standard_price),
-                "quantity": quantity,
-                "policy_id": policy.id,
-                "quote_id": quote.id,
+                "lines": [
+                    {
+                        "product_id": product_id,
+                        "product_code": product_by_id[product_id].code,
+                        "standard_price": str(standard_price),
+                        "quantity": quantity,
+                        "policy_id": policies[product_id].id,
+                        "quote_id": created_quotes[index].id,
+                    }
+                    for index, (product_id, standard_price, quantity) in enumerate(lines)
+                ],
             },
         )
     )

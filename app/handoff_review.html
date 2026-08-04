@@ -132,19 +132,11 @@
       <aside>
         <article class="card" id="manual-price-card">
           <h2>快速定价并发送报价</h2>
-          <div class="sub" id="manual-price-help">输入一个价格，系统自动生成报价邮件发送，并把该价格保存为历史参考；下次同产品询价仍转人工，可在此查看历史价格。</div>
-          <div id="manual-price-history" class="file-list">暂无可参考的历史价格</div>
-          <label for="manual-price-product">产品</label>
-          <select id="manual-price-product"></select>
-          <div class="row">
-            <div>
-              <label for="manual-price-value">单价（INR/kg）</label>
-              <input id="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001">
-            </div>
-            <div>
-              <label for="manual-price-quantity">数量（kg）</label>
-              <input id="manual-price-quantity" type="number" min="1" step="1">
-            </div>
+          <div class="sub" id="manual-price-help">产品默认不预选；按需添加产品并填写单价、数量，可一次为多个产品定价，系统生成一封报价邮件发送，价格保存为历史参考；下次同产品询价仍转人工。</div>
+          <div id="manual-price-suggested" class="file-list"></div>
+          <div id="manual-price-lines"></div>
+          <div class="actions">
+            <button id="manual-price-add" type="button">添加产品</button>
           </div>
           <label for="manual-price-note">处理备注</label>
           <input id="manual-price-note" maxlength="2000" placeholder="例如：客户要 YAC-HMDS，人工定价后系统代发">
@@ -445,29 +437,83 @@
       $("#resolve").classList.toggle("hidden", deliverability);
       renderManualPrice(data);
     }
-    function renderManualPrice(data) {
-      const select = $("#manual-price-product");
-      select.innerHTML = "";
-      for (const product of data.products || []) {
+    const manualPriceProducts = [];
+    const manualPriceHistory = {};
+    let manualPriceOpen = false;
+    function manualPriceRow(productId, quantity) {
+      const row = document.createElement("div");
+      row.className = "card";
+      row.style.marginBottom = "8px";
+      row.style.padding = "8px";
+      row.innerHTML = `
+        <div class="row">
+          <select class="manual-price-product">
+            <option value="">选择产品…</option>
+          </select>
+          <input class="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001" placeholder="单价">
+          <input class="manual-price-quantity" type="number" min="1" step="1" placeholder="数量">
+          <button class="manual-price-remove" type="button" title="移除">×</button>
+        </div>
+        <div class="sub manual-price-history">暂无可参考的历史价格</div>`;
+      const select = row.querySelector(".manual-price-product");
+      for (const product of manualPriceProducts) {
         const option = document.createElement("option");
         option.value = product.id;
         option.textContent = `${product.code} · ${product.name}`;
         select.appendChild(option);
       }
-      const current = data.price_history_product;
-      if (current) {
-        select.value = String(current.id);
+      if (productId) select.value = String(productId);
+      if (quantity) row.querySelector(".manual-price-quantity").value = quantity;
+      select.addEventListener("change", () => updateManualPriceRowHistory(row));
+      row.querySelector(".manual-price-remove").addEventListener("click", () => {
+        row.remove();
+        updateManualPriceSendState();
+      });
+      updateManualPriceRowHistory(row);
+      return row;
+    }
+    function updateManualPriceRowHistory(row) {
+      const select = row.querySelector(".manual-price-product");
+      const node = row.querySelector(".manual-price-history");
+      const productId = Number(select.value);
+      if (!productId) {
+        node.textContent = "暂无可参考的历史价格";
+        return;
       }
-      const history = data.price_history || [];
-      const historyNode = $("#manual-price-history");
-      historyNode.textContent = history.length
-        ? history.map((row) => `${row.currency} ${row.price} · ${row.valid_from}${row.active ? "（现行）" : ""}`).join("；")
-        : (current ? `“${current.code}”暂无历史价格` : "暂无可参考的历史价格");
+      const history = manualPriceHistory[String(productId)] || [];
+      node.textContent = history.length
+        ? history.map((item) => `${item.currency} ${item.price} · ${item.valid_from}${item.active ? "（现行）" : ""}`).join("；")
+        : "该产品暂无历史价格";
+    }
+    function updateManualPriceSendState() {
+      const selects = [...document.querySelectorAll("#manual-price-lines .manual-price-product")];
+      $("#manual-price-send").disabled = !manualPriceOpen || !selects.some((select) => Number(select.value) > 0);
+    }
+    function renderManualPrice(data) {
+      manualPriceOpen = data.status === "OPEN";
+      manualPriceProducts.length = 0;
+      for (const product of data.products || []) manualPriceProducts.push(product);
+      for (const key of Object.keys(manualPriceHistory)) delete manualPriceHistory[key];
+      for (const [key, rows] of Object.entries(data.price_history_by_product || {})) {
+        manualPriceHistory[key] = rows;
+      }
+      const productById = new Map((data.products || []).map((product) => [String(product.id), product]));
+      const suggested = data.suggested_lines || [];
+      const suggestedNode = $("#manual-price-suggested");
+      suggestedNode.textContent = suggested.length
+        ? "该处理单涉及：" + suggested.map((line) => {
+            const product = productById.get(String(line.product_id));
+            return product
+              ? `${product.code}${line.quantity ? `（数量 ${line.quantity}）` : ""}`
+              : String(line.product_id);
+          }).join("、")
+        : "";
+      const container = $("#manual-price-lines");
+      container.innerHTML = "";
+      container.appendChild(manualPriceRow(null, null));
       const state = $("#manual-price-state");
       state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可定价发送。" : "";
-      $("#manual-price-send").disabled = data.status !== "OPEN" || !select.value;
-      $("#manual-price-value").value = "";
-      $("#manual-price-quantity").value = "";
+      updateManualPriceSendState();
     }
     async function load() {
       try {
@@ -569,27 +615,38 @@
         "案例产品已更新。"
       );
     });
+    $("#manual-price-add").addEventListener("click", () => {
+      $("#manual-price-lines").appendChild(manualPriceRow(null, null));
+      updateManualPriceSendState();
+    });
     $("#manual-price-send").addEventListener("click", async () => {
-      const productId = Number($("#manual-price-product").value);
-      const price = Number($("#manual-price-value").value);
-      const quantity = Number($("#manual-price-quantity").value);
-      if (!productId || !(price > 0) || !(quantity > 0)) {
-        notice("请填写产品、单价和数量。", "error");
+      const lines = [];
+      const labels = [];
+      for (const row of document.querySelectorAll("#manual-price-lines > .card")) {
+        const select = row.querySelector(".manual-price-product");
+        const productId = Number(select.value);
+        if (!productId) continue;
+        const price = Number(row.querySelector(".manual-price-value").value);
+        const quantity = Number(row.querySelector(".manual-price-quantity").value);
+        if (!(price > 0) || !(quantity > 0)) {
+          notice("请为每个已选产品填写单价和数量。", "error");
+          return;
+        }
+        labels.push(`${select.selectedOptions[0] ? select.selectedOptions[0].textContent : productId}：INR ${price} × ${quantity}`);
+        lines.push({product_id: productId, standard_price: price, quantity});
+      }
+      if (!lines.length) {
+        notice("请至少选择一个产品并填写单价和数量。", "error");
         return;
       }
-      const label = $("#manual-price-product").selectedOptions[0]
-        ? $("#manual-price-product").selectedOptions[0].textContent
-        : "";
-      if (!confirm(`确认以 INR ${price} 为“${label}”定价并自动发送报价？价格会保存为历史参考，不用于后续自动报价。`)) return;
+      if (!confirm(`确认按以下内容定价并自动发送一封报价邮件？\n${labels.join("\n")}\n价格会保存为历史参考，不用于后续自动报价。`)) return;
       $("#manual-price-send").disabled = true;
       try {
         await api(`/admin/handoffs/${id}/price-quote`, {
           method:"POST",
           body:JSON.stringify({
-            product_id:productId,
-            standard_price:price,
+            lines,
             currency:"INR",
-            quantity,
             note:$("#manual-price-note").value.trim(),
           }),
         });
@@ -597,7 +654,7 @@
         await load();
       } catch (error) {
         notice(error.message, "error");
-        $("#manual-price-send").disabled = false;
+        updateManualPriceSendState();
       }
     });
     $("#load-remote-images").addEventListener("click", () => {

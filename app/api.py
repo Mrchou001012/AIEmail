@@ -65,7 +65,7 @@ from app.mail import (
     parse_mime,
 )
 from app.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
-from app.products import canonical_product_code
+from app.products import canonical_product_code, product_text_key
 from app.reactivation import (
     ALLOWED_TEMPLATE_FIELDS,
     REPLY_FILTERS,
@@ -172,11 +172,15 @@ class HandoffReplyRequest(BaseModel):
     resume_automation: bool = False
 
 
-class ManualPriceQuoteRequest(BaseModel):
+class ManualPriceQuoteLine(BaseModel):
     product_id: int = Field(gt=0)
     standard_price: Decimal = Field(gt=0, le=1_000_000_000)
-    currency: str = Field(default="INR", min_length=3, max_length=3)
     quantity: int = Field(gt=0)
+
+
+class ManualPriceQuoteRequest(BaseModel):
+    lines: list[ManualPriceQuoteLine] = Field(min_length=1, max_length=20)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
     note: str = Field(default="", max_length=2_000)
 
 
@@ -2446,6 +2450,18 @@ async def handoff_review(handoff_id: int, _: Admin, session: Session) -> HTMLRes
     )
 
 
+def _price_history_payload(row: PricePolicy) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "price": str(row.standard_price),
+        "currency": row.currency,
+        "valid_from": row.valid_from.isoformat(),
+        "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+        "active": row.active,
+        "created_at": (row.created_at.isoformat() if row.created_at else None),
+    }
+
+
 @router.get("/admin/handoffs/{handoff_id}")
 async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[str, Any]:
     handoff = await session.get(Handoff, handoff_id)
@@ -2559,20 +2575,90 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
             .scalars()
             .all()
         )
-        price_history = [
+        price_history = [_price_history_payload(row) for row in history_rows]
+
+    suggested_lines: list[dict[str, Any]] = []
+    requested_quantity = handoff.extracted_facts.get("requested_quantity")
+    if case is not None and case.product_id is not None:
+        suggested_lines.append(
             {
-                "id": row.id,
-                "price": str(row.standard_price),
-                "currency": row.currency,
-                "valid_from": row.valid_from.isoformat(),
-                "valid_to": row.valid_to.isoformat() if row.valid_to else None,
-                "active": row.active,
-                "created_at": (
-                    row.created_at.isoformat() if row.created_at else None
+                "product_id": case.product_id,
+                "quantity": (
+                    int(requested_quantity)
+                    if isinstance(requested_quantity, int)
+                    else None
                 ),
             }
-            for row in history_rows
-        ]
+        )
+    else:
+        code_quantities: dict[str, int | None] = {}
+        for item in handoff.extracted_facts.get("product_requests") or []:
+            if isinstance(item, dict) and item.get("product_code"):
+                qty = item.get("quantity")
+                code_quantities.setdefault(
+                    str(item["product_code"]),
+                    int(qty) if isinstance(qty, int) else None,
+                )
+        for item in handoff.extracted_facts.get("product_codes") or []:
+            code_quantities.setdefault(str(item), None)
+        if not code_quantities and handoff.extracted_facts.get("product_code"):
+            code_quantities[str(handoff.extracted_facts["product_code"])] = (
+                int(requested_quantity)
+                if isinstance(requested_quantity, int)
+                else None
+            )
+        if code_quantities:
+            suggested_rows = (
+                (
+                    await session.execute(
+                        select(Product)
+                        .where(
+                            _product_lookup_conditions(list(code_quantities)),
+                            Product.active.is_(True),
+                        )
+                        .order_by(Product.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            suggested_by_key = {
+                product_text_key(product.code): product
+                for product in suggested_rows
+            }
+            seen_product_ids: set[int] = set()
+            for code, quantity in code_quantities.items():
+                product = suggested_by_key.get(product_text_key(code))
+                if product is None or product.id in seen_product_ids:
+                    continue
+                seen_product_ids.add(product.id)
+                suggested_lines.append(
+                    {"product_id": product.id, "quantity": quantity}
+                )
+
+    price_history_by_product: dict[str, list[dict[str, Any]]] = {}
+    suggested_product_ids = [
+        int(line["product_id"]) for line in suggested_lines
+    ]
+    if suggested_product_ids:
+        suggested_history_rows = (
+            (
+                await session.execute(
+                    select(PricePolicy)
+                    .where(PricePolicy.product_id.in_(suggested_product_ids))
+                    .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for product_id in suggested_product_ids:
+            rows_for_product = [
+                row for row in suggested_history_rows if row.product_id == product_id
+            ][:10]
+            price_history_by_product[str(product_id)] = [
+                _price_history_payload(row) for row in rows_for_product
+            ]
     return {
         "id": handoff.id,
         "case_id": handoff.case_id,
@@ -2627,6 +2713,8 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
             else None
         ),
         "price_history": price_history,
+        "suggested_lines": suggested_lines,
+        "price_history_by_product": price_history_by_product,
         "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
         "approved_outbox": (
             {
@@ -2835,10 +2923,11 @@ async def send_manual_price_quote(
         outbox = await quote_with_manual_price(
             session,
             handoff_id=handoff_id,
-            product_id=request.product_id,
-            standard_price=request.standard_price,
+            lines=[
+                (line.product_id, line.standard_price, line.quantity)
+                for line in request.lines
+            ],
             currency=request.currency,
-            quantity=request.quantity,
             actor=admin,
             note=request.note,
         )
@@ -2848,7 +2937,7 @@ async def send_manual_price_quote(
         "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
         "outbox_id": outbox.id,
         "status": outbox.status.value,
-        "product_id": request.product_id,
+        "product_ids": [line.product_id for line in request.lines],
     }
 
 
