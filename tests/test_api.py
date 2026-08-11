@@ -2,6 +2,7 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
+from bs4 import BeautifulSoup
 
 from app.api import (
     COMMERCIAL_UPDATE_PATH,
@@ -9,6 +10,7 @@ from app.api import (
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
     REACTIVATION_PATH,
+    RECORDS_PATH,
     HandoffCaseRequest,
     _dashboard_headers,
     _suggested_handoff_reply,
@@ -18,6 +20,7 @@ from app.api import (
     favicon,
     health,
     reactivation_page,
+    record_statuses,
     stream_handoff_preview,
 )
 from app.db import Handoff
@@ -55,6 +58,38 @@ async def test_favicon_is_public_and_served_as_an_icon() -> None:
     assert FAVICON_PATH.exists()
     assert response.media_type == "image/x-icon"
     assert response.headers["cache-control"] == "public, max-age=86400"
+
+
+@pytest.mark.asyncio
+async def test_record_status_metadata_includes_claimed_outbox_state() -> None:
+    statuses = await record_statuses("admin")
+
+    assert "CLAIMED" in statuses["outbox"]
+    assert statuses["handoffs"] == ["OPEN", "RESOLVED"]
+
+
+def test_records_page_exposes_accessible_tab_semantics() -> None:
+    page = BeautifulSoup(RECORDS_PATH.read_text(encoding="utf-8"), "html.parser")
+    tablist = page.select_one('[role="tablist"]')
+    tabs = page.select('[role="tab"]')
+    panel = page.select_one('[role="tabpanel"]')
+
+    assert tablist is not None
+    assert [tab.get("data-tab") for tab in tabs] == ["handoffs", "outbox", "jobs"]
+    assert panel is not None and panel.get("id") == "records-panel"
+    assert all(tab.get("aria-controls") == "records-panel" for tab in tabs)
+
+
+def test_handoff_page_exposes_explicit_forward_allowlist_disabled_state() -> None:
+    source = HANDOFF_REVIEW_PATH.read_text(encoding="utf-8")
+    page = BeautifulSoup(source, "html.parser")
+
+    assert page.select_one("#forward-recipient") is not None
+    assert page.select_one("#forward-send") is not None
+    assert page.select_one("#forward-state") is not None
+    assert "Boolean(data.forwarding_enabled)" in source
+    assert "内部转发未配置" in source
+    assert "await loadForwardRecipients()" in source
 
 
 def test_handoff_suggestion_does_not_duplicate_the_automatic_signature() -> None:

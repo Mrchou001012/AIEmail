@@ -11,9 +11,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+import app.services as services
 from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
 from app.db import (
     AIInvocation,
+    AuditEvent,
     CaseStage,
     CaseStatus,
     Contact,
@@ -265,6 +267,49 @@ async def test_crm_interest_triggers_automatic_product_list_reply(
     assert outbox.status == DeliveryStatus.SENT
     outbox_dir = get_settings().runtime_dir / "demo_outbox"
     assert any(outbox_dir.glob("*.eml"))
+
+
+async def test_product_list_failure_after_staging_rolls_back_outbox_email_and_audit(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product list atomicity",
+            "Please send us your product list for industrial silane.",
+            message_id="product-list-post-stage-failure@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None
+    models = (Outbox, DBEmailMessage, AuditEvent, AIInvocation)
+    before = {
+        model.__name__: int(
+            await db_session.scalar(select(func.count()).select_from(model)) or 0
+        )
+        for model in models
+    }
+    real_stage = services.stage_outbox
+
+    async def staged_then_failed(*args: object, **kwargs: object) -> Outbox | None:
+        row = await real_stage(*args, **kwargs)  # type: ignore[arg-type]
+        assert kwargs.get("message_kind") == "PRODUCT_LIST"
+        assert row is not None
+        raise RuntimeError("injected product-list post-stage failure")
+
+    monkeypatch.setattr(services, "stage_outbox", staged_then_failed)
+    with pytest.raises(RuntimeError, match="product-list post-stage"):
+        await process_inbound(db_session, email_row.id)
+
+    after = {
+        model.__name__: int(
+            await db_session.scalar(select(func.count()).select_from(model)) or 0
+        )
+        for model in models
+    }
+    assert after == before
 
 
 async def test_excel_cas_request_attaches_verified_catalog_workbook(

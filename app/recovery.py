@@ -752,6 +752,7 @@ async def recover_false_counteroffer(
             )
             async with atomic_sessions() as session:
                 await process_inbound(session, request.email_id)
+                await session.commit()
             return await _verify_false_counteroffer_recovery(
                 request,
                 archive_path,

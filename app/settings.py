@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.deliverability import validate_address_format
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
@@ -77,6 +79,7 @@ class Settings(BaseSettings):
     safe_mode: bool = True
     auto_send_enabled: bool = False
     recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
+    forward_recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
     max_sends_per_hour: int = 5
     max_sends_per_day: int = 20
     min_send_interval_seconds: int = 120
@@ -110,12 +113,24 @@ class Settings(BaseSettings):
     def normalize_mode(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
 
-    @field_validator("recipient_allowlist", mode="before")
+    @field_validator("recipient_allowlist", "forward_recipient_allowlist", mode="before")
     @classmethod
     def split_allowlist(cls, value: object) -> object:
         if isinstance(value, str):
-            return [part.strip().lower() for part in value.split(",") if part.strip()]
+            return [part.strip() for part in value.split(",") if part.strip()]
         return value
+
+    @field_validator("recipient_allowlist", "forward_recipient_allowlist")
+    @classmethod
+    def normalize_allowlist_addresses(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for address in value:
+            result = validate_address_format(address)
+            if not result.valid:
+                raise ValueError(f"allowlist entry must be a valid email address: {address}")
+            if result.normalized not in normalized:
+                normalized.append(result.normalized)
+        return normalized
 
     @field_validator("gmail_app_password", mode="before")
     @classmethod

@@ -5,12 +5,13 @@ import json
 import logging
 import re
 import smtplib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email.utils import parseaddr
-from typing import Any
+from functools import wraps
+from typing import Any, Concatenate
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -214,6 +215,45 @@ class CaseLessReactivationParent:
     sender_changed: bool = False
     reply_contact_created: bool = False
     matched_domain: str | None = None
+
+
+@dataclass(frozen=True)
+class HumanApproval:
+    handoff_id: int
+    approved_by: str
+    approved_at: datetime
+
+
+def _human_approval_from_outbox(row: Outbox) -> HumanApproval | None:
+    """Return the one authoritative approval value for an outbox row."""
+    approved_by = (row.human_approved_by or "").strip()
+    if (
+        row.approval_handoff_id is None
+        or not approved_by
+        or row.human_approved_at is None
+    ):
+        return None
+    return HumanApproval(
+        handoff_id=row.approval_handoff_id,
+        approved_by=approved_by,
+        approved_at=row.human_approved_at,
+    )
+
+
+def _atomic_business_operation[**P, T](
+    operation: Callable[Concatenate[AsyncSession, P], Awaitable[T]],
+) -> Callable[Concatenate[AsyncSession, P], Awaitable[T]]:
+    """Roll back all staged business state when a top-level operation fails."""
+
+    @wraps(operation)
+    async def wrapped(session: AsyncSession, *args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return await operation(session, *args, **kwargs)
+        except BaseException:
+            await session.rollback()
+            raise
+
+    return wrapped
 
 
 class JobDeferred(RuntimeError):
@@ -819,6 +859,24 @@ async def _final_recipient_delivery_guard(
     if current is None or current.status != DeliveryStatus.CLAIMED:
         await session.commit()
         return False
+
+    if current.message_kind == "FORWARD":
+        complete_approval = _human_approval_from_outbox(current) is not None
+        try:
+            normalized_forward_recipient = _authorize_forward_recipient(
+                current.recipient,
+                settings,
+            )
+        except ValueError as exc:
+            current.status = DeliveryStatus.CANCELLED
+            current.last_error = f"final forward authorization failed: {exc}"[:2000]
+            await session.commit()
+            return False
+        if not complete_approval or normalized_forward_recipient != current.recipient:
+            current.status = DeliveryStatus.CANCELLED
+            current.last_error = "final forward gate requires complete human approval metadata"
+            await session.commit()
+            return False
 
     address_status = await _email_address_status(session, current.recipient)
     if address_status.suppressed:
@@ -1894,6 +1952,7 @@ async def _manual_pricing_policy(
     return policy
 
 
+@_atomic_business_operation
 async def quote_with_manual_price(
     session: AsyncSession,
     *,
@@ -1926,11 +1985,28 @@ async def quote_with_manual_price(
         raise ValueError("associate the handoff with a case before quoting")
     case = await session.scalar(
         select(SalesCase)
-        .options(selectinload(SalesCase.contact))
+        .options(
+            selectinload(SalesCase.customer),
+            selectinload(SalesCase.contact),
+        )
         .where(SalesCase.id == handoff.case_id)
     )
     if case is None:
         raise ValueError("handoff case no longer exists")
+    source_email = await session.get(EmailMessage, handoff.source_email_id)
+    if source_email is None:
+        raise ValueError("handoff source email no longer exists")
+    if source_email.direction != "INBOUND":
+        raise ValueError("manual quotation requires an inbound source email")
+    if source_email.from_address.casefold() != case.contact.email.casefold():
+        raise ValueError("source sender does not match the associated case contact")
+    if case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+        raise ValueError("closed case cannot send a reviewed quotation")
+    if case.customer.do_not_contact or case.contact.suppressed:
+        raise ValueError("recipient is suppressed or marked do-not-contact")
+    address_status = await session.get(EmailAddressStatus, case.contact.email.casefold())
+    if address_status is not None and address_status.suppressed:
+        raise ValueError("recipient address is permanently suppressed")
     currency = currency.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", currency):
         raise ValueError("currency must be a three-letter code")
@@ -1961,8 +2037,8 @@ async def quote_with_manual_price(
     for _product_id, standard_price, quantity in lines:
         if standard_price <= 0:
             raise ValueError("standard price must be positive")
-        if quantity <= 0:
-            raise ValueError("quantity must be positive")
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("quantity must be a positive integer")
 
     today = date.today()
     policies: dict[int, PricePolicy] = {}
@@ -1995,9 +2071,6 @@ async def quote_with_manual_price(
                 "approved_product_key": first_product.approved_text_key,
             }
         )
-        source_email = await session.get(EmailMessage, handoff.source_email_id)
-        if source_email is None:
-            raise ValueError("handoff source email no longer exists")
         source = _reply_source(source_email)
         rendered_lines = []
         for product_id, standard_price, quantity in lines:
@@ -2068,10 +2141,12 @@ async def quote_with_manual_price(
         created_quotes.append(quote)
     await session.flush()
     case.negotiation_round = round_number
-    outbox = await freeze_outbox(
+    approved_at = datetime.now(UTC)
+    outbox = await stage_outbox(
         session,
         case=case,
         quote=created_quotes[0],
+        message_kind="HUMAN_QUOTE",
         subject=f"Re: {source_email.subject}",
         text_body=text,
         html_body=html_body,
@@ -2079,6 +2154,11 @@ async def quote_with_manual_price(
         in_reply_to=source_email.message_id,
         references=_reply_references(source_email),
         inline_images=source.inline_images,
+        approval=HumanApproval(
+            handoff_id=handoff.id,
+            approved_by=actor[:128],
+            approved_at=approved_at,
+        ),
     )
     if outbox is None:
         raise ValueError("a quotation is already queued for this handoff")
@@ -2120,8 +2200,55 @@ async def quote_with_manual_price(
     return outbox
 
 
-def _forward_recipient_email_ok(value: str) -> bool:
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()))
+def _normalize_forward_recipient(value: str) -> str:
+    result = validate_address_format(value)
+    if not result.valid:
+        raise ValueError("recipient must be a valid email address")
+    return result.normalized
+
+
+def _authorize_forward_recipient(value: str, settings: Settings) -> str:
+    normalized = _normalize_forward_recipient(value)
+    if normalized not in settings.forward_recipient_allowlist:
+        raise ValueError("recipient is not authorized for internal forwarding")
+    return normalized
+
+
+async def _touch_forward_recipient(
+    session: AsyncSession,
+    *,
+    email: str,
+    name: str = "",
+) -> ForwardRecipient:
+    now = datetime.now(UTC)
+    row = await session.scalar(
+        select(ForwardRecipient)
+        .where(ForwardRecipient.email == email)
+        .with_for_update()
+    )
+    if row is None:
+        try:
+            async with session.begin_nested():
+                row = ForwardRecipient(
+                    email=email,
+                    name=name.strip() or None,
+                    last_used_at=now,
+                )
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            row = await session.scalar(
+                select(ForwardRecipient)
+                .where(ForwardRecipient.email == email)
+                .with_for_update()
+            )
+            if row is None:
+                raise
+    if name.strip():
+        row.name = name.strip()
+    row.last_used_at = now
+    await session.flush()
+    return row
 
 
 def _extract_forward_attachments(raw: bytes) -> tuple[OutboundAttachment, ...]:
@@ -2214,42 +2341,49 @@ async def list_forward_recipients(
     query: str = "",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    conditions = []
-    q = query.strip()
-    if q:
-        pattern = f"%{q}%"
-        conditions.append(
-            or_(
-                ForwardRecipient.email.ilike(pattern),
-                ForwardRecipient.name.ilike(pattern),
-            )
-        )
+    allowlist = get_settings().forward_recipient_allowlist
+    if not allowlist:
+        return []
+    q = query.strip().casefold()
     rows = (
         (
             await session.execute(
                 select(ForwardRecipient)
-                .where(*conditions)
+                .where(ForwardRecipient.email.in_(allowlist))
                 .order_by(
                     ForwardRecipient.last_used_at.desc().nullslast(),
                     ForwardRecipient.id.desc(),
                 )
-                .limit(max(1, min(limit, 50)))
             )
         )
         .scalars()
         .all()
     )
-    return [
-        {
-            "id": row.id,
-            "email": row.email,
-            "name": row.name,
+    by_email = {row.email: row for row in rows}
+    configured_rows: list[dict[str, Any]] = []
+    for email in allowlist:
+        row = by_email.get(email)
+        name = row.name if row is not None else None
+        if q and q not in email.casefold() and q not in (name or "").casefold():
+            continue
+        configured_rows.append({
+            "id": row.id if row is not None else None,
+            "email": email,
+            "name": name,
             "last_used_at": (
-                row.last_used_at.isoformat() if row.last_used_at else None
+                row.last_used_at.isoformat()
+                if row is not None and row.last_used_at
+                else None
             ),
-        }
-        for row in rows
-    ]
+        })
+    configured_rows.sort(
+        key=lambda item: (
+            item["last_used_at"] is not None,
+            item["last_used_at"] or "",
+        ),
+        reverse=True,
+    )
+    return configured_rows[: max(1, min(limit, 50))]
 
 
 async def save_forward_recipient(
@@ -2258,27 +2392,17 @@ async def save_forward_recipient(
     email: str,
     name: str = "",
 ) -> dict[str, Any]:
-    normalized = email.strip().casefold()
-    if not _forward_recipient_email_ok(normalized):
-        raise ValueError("recipient must be a valid email address")
-    row = await session.scalar(
-        select(ForwardRecipient).where(ForwardRecipient.email == normalized)
+    normalized = _authorize_forward_recipient(email, get_settings())
+    row = await _touch_forward_recipient(
+        session,
+        email=normalized,
+        name=name,
     )
-    if row is None:
-        row = ForwardRecipient(
-            email=normalized,
-            name=name.strip() or None,
-            last_used_at=datetime.now(UTC),
-        )
-        session.add(row)
-    else:
-        if name.strip():
-            row.name = name.strip()
-        row.last_used_at = datetime.now(UTC)
     await session.commit()
     return {"id": row.id, "email": row.email, "name": row.name}
 
 
+@_atomic_business_operation
 async def forward_handoff_email(
     session: AsyncSession,
     *,
@@ -2310,14 +2434,14 @@ async def forward_handoff_email(
     )
     if case is None:
         raise ValueError("handoff case no longer exists")
-    recipient = recipient.strip()
-    if not _forward_recipient_email_ok(recipient):
-        raise ValueError("recipient must be a valid email address")
     source_email = await session.get(EmailMessage, handoff.source_email_id)
     if source_email is None:
         raise ValueError("handoff source email no longer exists")
-
     settings = get_settings()
+    recipient = _authorize_forward_recipient(recipient, settings)
+    address_status = await session.get(EmailAddressStatus, recipient)
+    if address_status is not None and address_status.suppressed:
+        raise ValueError("recipient address is permanently suppressed")
     archive_folder = "mail_archive" if source_email.is_history else "inbound_archive"
     archive_path = (
         settings.runtime_dir / archive_folder / f"{source_email.raw_sha256}.eml"
@@ -2351,7 +2475,8 @@ async def forward_handoff_email(
         if source_email.subject
         else "Fwd: (no subject)"
     )
-    outbox = await freeze_outbox(
+    approved_at = datetime.now(UTC)
+    outbox = await stage_outbox(
         session,
         case=case,
         message_kind="FORWARD",
@@ -2364,23 +2489,17 @@ async def forward_handoff_email(
         references=[],
         inline_images=source.inline_images,
         attachments=attachments,
+        approval=HumanApproval(
+            handoff_id=handoff.id,
+            approved_by=actor[:128],
+            approved_at=approved_at,
+        ),
     )
     if outbox is None:
         raise ValueError("a forward is already queued for this handoff")
 
-    normalized = recipient.casefold()
-    recipient_row = await session.scalar(
-        select(ForwardRecipient).where(ForwardRecipient.email == normalized)
-    )
-    if recipient_row is None:
-        recipient_row = ForwardRecipient(
-            email=normalized,
-            name=None,
-            last_used_at=datetime.now(UTC),
-        )
-        session.add(recipient_row)
-    else:
-        recipient_row.last_used_at = datetime.now(UTC)
+    normalized = recipient
+    await _touch_forward_recipient(session, email=normalized)
 
     handoff.status = "RESOLVED"
     handoff.resolution_note = (
@@ -2664,7 +2783,7 @@ def standard_quote_valid_until(
     return today + timedelta(days=days_until_monday)
 
 
-async def freeze_outbox(
+async def stage_outbox(
     session: AsyncSession,
     *,
     case: SalesCase,
@@ -2679,7 +2798,9 @@ async def freeze_outbox(
     references: list[str] | None = None,
     inline_images: tuple[InlineImageAsset, ...] = (),
     attachments: tuple[OutboundAttachment, ...] = (),
+    approval: HumanApproval | None = None,
 ) -> Outbox | None:
+    """Stage immutable outbound records without owning the caller transaction."""
     mail_recipient = recipient or case.contact.email
     message_id, raw = build_message(
         from_address=get_settings().mail_from,
@@ -2704,6 +2825,9 @@ async def freeze_outbox(
                 message_id=message_id,
                 recipient=mail_recipient,
                 raw_message=raw,
+                approval_handoff_id=(approval.handoff_id if approval else None),
+                human_approved_by=(approval.approved_by if approval else None),
+                human_approved_at=(approval.approved_at if approval else None),
             )
             session.add(row)
             await session.flush()
@@ -2725,35 +2849,36 @@ async def freeze_outbox(
                     raw_sha256=parsed_outbound.raw_sha256,
                 )
             )
-        await audit(
-            session,
-            "outbox.frozen",
-            case_id=case.id,
-            actor="system",
-            data={
-                "outbox_id": row.id,
-                "message_id": message_id,
-                "message_kind": message_kind,
-                "attachments": [
-                    {
-                        "filename": item["filename"],
-                        "content_type": item["content_type"],
-                        "size": item["size"],
-                        "sha256": item["sha256"],
-                    }
-                    for item in parsed_outbound.attachments
-                    if item.get("disposition") == "attachment"
-                ],
-                **({"quote_id": quote.id} if quote is not None else {}),
-            },
-        )
-        await session.commit()
+            await audit(
+                session,
+                "outbox.frozen",
+                case_id=case.id,
+                actor="system",
+                data={
+                    "outbox_id": row.id,
+                    "message_id": message_id,
+                    "message_kind": message_kind,
+                    "approval_handoff_id": approval.handoff_id if approval else None,
+                    "attachments": [
+                        {
+                            "filename": item["filename"],
+                            "content_type": item["content_type"],
+                            "size": item["size"],
+                            "sha256": item["sha256"],
+                        }
+                        for item in parsed_outbound.attachments
+                        if item.get("disposition") == "attachment"
+                    ],
+                    **({"quote_id": quote.id} if quote is not None else {}),
+                },
+            )
+            await session.flush()
         return row
     except IntegrityError:
-        await session.rollback()
         return None
 
 
+@_atomic_business_operation
 async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -> None:
     ids = await seed_demo_data(session)
     customer = await session.get(Customer, ids["customer_id"])
@@ -2840,7 +2965,7 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
         taxes_included=policy_row.taxes_included,
         freight_included=policy_row.freight_included,
     )
-    await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         quote=quote,
@@ -2849,8 +2974,11 @@ async def create_demo_outreach(session: AsyncSession, payload: dict[str, Any]) -
         html_body=html_body,
         business_key=business_key,
     )
+    if outbox is None:
+        await session.rollback()
 
 
+@_atomic_business_operation
 async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -> None:
     case_id = int(payload["case_id"])
     quantity = int(payload.get("quantity") or 1)
@@ -3052,7 +3180,7 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
     await session.flush()
     subject = f"{case.product.name} quotation"
     case.subject_key = subject.lower()
-    await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         quote=quote,
@@ -3061,6 +3189,8 @@ async def create_case_outreach(session: AsyncSession, payload: dict[str, Any]) -
         html_body=html_body,
         business_key=business_key,
     )
+    if outbox is None:
+        await session.rollback()
 
 
 async def _ensure_inbound_follow_up(
@@ -4834,7 +4964,7 @@ async def _maybe_send_quote_clarification(
         )
         return True
 
-    outbox = await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         message_kind="QUOTE_CLARIFICATION",
@@ -4846,6 +4976,9 @@ async def _maybe_send_quote_clarification(
         references=_reply_references(email_row),
         inline_images=source.inline_images,
     )
+    if outbox is None:
+        await session.rollback()
+        return True
     if outbox is not None:
         await audit(
             session,
@@ -5186,7 +5319,7 @@ async def _maybe_send_multi_product_quote(
         created_quotes.append(quote)
     await session.flush()
     case.negotiation_round = round_number
-    await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         quote=created_quotes[0],
@@ -5198,6 +5331,9 @@ async def _maybe_send_multi_product_quote(
         references=_reply_references(email_row),
         inline_images=source.inline_images,
     )
+    if outbox is None:
+        await session.rollback()
+        return True
     await audit(
         session,
         "inbound.multi_product_quote_queued",
@@ -5716,7 +5852,7 @@ async def _maybe_send_product_list(
         if email_row.subject.strip()
         else f"Our {category.name} product list"
     )
-    outbox = await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         message_kind="PRODUCT_LIST",
@@ -5730,6 +5866,7 @@ async def _maybe_send_product_list(
         attachments=attachments,
     )
     if outbox is None:
+        await session.rollback()
         return True
     await audit(
         session,
@@ -5748,6 +5885,7 @@ async def _maybe_send_product_list(
     return True
 
 
+@_atomic_business_operation
 async def backfill_product_list_requests(
     session: AsyncSession,
     *,
@@ -6296,7 +6434,7 @@ async def backfill_product_list_requests(
             source.customer_id = customer.id
             source.contact_id = contact.id
             handoff.case_id = sales_case.id
-            existing_product_list = await freeze_outbox(
+            existing_product_list = await stage_outbox(
                 session,
                 case=sales_case,
                 message_kind="PRODUCT_LIST",
@@ -6324,6 +6462,7 @@ async def backfill_product_list_requests(
                         "reason": "OUTBOX_IDEMPOTENCY_CONFLICT",
                     }
                 )
+                await session.rollback()
                 continue
 
         if sales_case is not None and sales_case.status == CaseStatus.WAITING_HUMAN:
@@ -6382,6 +6521,7 @@ async def backfill_product_list_requests(
     }
 
 
+@_atomic_business_operation
 async def process_inbound(session: AsyncSession, email_id: int) -> None:
     email_row = await session.get(EmailMessage, email_id)
     if email_row is None:
@@ -6392,7 +6532,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     # A reply to a reactivation is business-significant even when a mail client
     # omitted thread headers and the normal case matcher could not link it.
     if not email_row.is_automated_reply:
-        await record_reactivation_reply(session, email_row)
+        await record_reactivation_reply(session, email_row, commit=False)
     if email_row.case_id is None:
         return
     case = await session.get(SalesCase, email_row.case_id)
@@ -6869,7 +7009,7 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     )
     session.add(quote)
     await session.flush()
-    await freeze_outbox(
+    outbox = await stage_outbox(
         session,
         case=case,
         quote=quote,
@@ -6885,6 +7025,8 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         references=_reply_references(email_row),
         inline_images=source.inline_images,
     )
+    if outbox is None:
+        await session.rollback()
 
 
 async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
@@ -7121,13 +7263,27 @@ async def send_one_outbox(
             await session.commit()
             return True
     case: SalesCase | None = None
-    human_approved = bool(
-        row.approval_handoff_id is not None
-        and row.human_approved_by
-        and row.human_approved_at is not None
-    )
+    human_approved = _human_approval_from_outbox(row) is not None
     is_forward = row.message_kind == "FORWARD"
-    internal_message = human_approved or is_forward
+    authorized_forward = False
+    if is_forward:
+        try:
+            normalized_forward_recipient = _authorize_forward_recipient(
+                row.recipient,
+                settings,
+            )
+        except ValueError as exc:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = f"forward authorization failed: {exc}"[:2000]
+            await session.commit()
+            return True
+        if not human_approved or normalized_forward_recipient != row.recipient:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = "forward requires complete human approval metadata"
+            await session.commit()
+            return True
+        authorized_forward = True
+    internal_message = human_approved
     if row.message_kind == "REACTIVATION":
         guard = await reactivation_send_guard(session, row, settings=settings, at=now)
         if guard.action == "DEFER":
@@ -7152,7 +7308,7 @@ async def send_one_outbox(
         row.last_error = "commercial gate deferred automated mail until Monday"
         await session.commit()
         return True
-    if row.case_id and not is_forward:
+    if row.case_id:
         case = await session.scalar(
             select(SalesCase)
             .options(
@@ -7161,23 +7317,27 @@ async def send_one_outbox(
             )
             .where(SalesCase.id == row.case_id)
         )
-        if (
-            case is None
-            or case.contact.suppressed
-            or case.customer.do_not_contact
-            or case.contact.email.lower() != row.recipient.lower()
-            or (
-                human_approved
-                and case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
-            )
-            or (
-                not human_approved
-                and (
-                    case.status != CaseStatus.ACTIVE
-                    or not case.customer.auto_send_allowed
+        customer_ineligible = bool(
+            not authorized_forward
+            and case is not None
+            and (
+                case.contact.suppressed
+                or case.customer.do_not_contact
+                or case.contact.email.lower() != row.recipient.lower()
+                or (
+                    human_approved
+                    and case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
+                )
+                or (
+                    not human_approved
+                    and (
+                        case.status != CaseStatus.ACTIVE
+                        or not case.customer.auto_send_allowed
+                    )
                 )
             )
-        ):
+        )
+        if case is None or customer_ineligible:
             row.status = DeliveryStatus.CANCELLED
             row.last_error = "case/contact eligibility changed after message was queued"
             await session.commit()
@@ -7235,75 +7395,74 @@ async def send_one_outbox(
             return True
     if settings.mail_transport == "smtp":
         recipient = row.recipient.lower()
-        if not is_forward:
-            if settings.safe_mode and recipient not in settings.recipient_allowlist:
-                row.status = DeliveryStatus.CANCELLED
-                row.last_error = "SAFE_MODE blocked recipient not on allowlist"
-                await audit(
-                    session,
-                    "outbox.blocked_safe_mode",
-                    case_id=row.case_id,
-                    actor="policy",
-                    data={"recipient": recipient},
-                )
-                await session.commit()
-                return True
-            if not settings.auto_send_enabled and not human_approved:
-                row.status = DeliveryStatus.CANCELLED
-                row.last_error = "AUTO_SEND_ENABLED is false"
-                await session.commit()
-                return True
-            preflight_outcome, preflight_detail, preflight_facts = await _recipient_preflight(
-                session,
-                recipient,
-                settings,
-            )
-            if preflight_outcome == "DEFER":
-                row.status = DeliveryStatus.PENDING
-                row.available_at = now + timedelta(minutes=settings.mx_temporary_retry_minutes)
-                row.last_error = f"recipient preflight deferred: {preflight_detail}"[:2000]
-                await audit(
-                    session,
-                    "outbox.preflight_deferred",
-                    case_id=row.case_id,
-                    actor="dns",
-                    data={"outbox_id": row.id, **preflight_facts},
-                )
-                await session.commit()
-                return True
-            if preflight_outcome == "BLOCK":
-                row.status = DeliveryStatus.CANCELLED
-                row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
-                auto_suppressed = bool(preflight_facts.get("auto_suppressed"))
-                if auto_suppressed and case is not None and case.status not in {
-                    CaseStatus.CLOSED_WON,
-                    CaseStatus.CLOSED_LOST,
-                }:
-                    case.status = CaseStatus.PAUSED
-                await audit(
-                    session,
-                    "outbox.preflight_blocked",
-                    case_id=row.case_id,
-                    actor="policy",
-                    data={"outbox_id": row.id, **preflight_facts},
-                )
-                await session.commit()
-                if case is not None and not auto_suppressed:
-                    await create_handoff(
-                        session,
-                        case=case,
-                        reason=HandoffReason.EMAIL_DELIVERABILITY,
-                        summary=f"Recipient preflight blocked {recipient}: {preflight_detail}",
-                        facts={"outbox_id": row.id, **preflight_facts},
-                    )
-                return True
+        if settings.safe_mode and recipient not in settings.recipient_allowlist:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = "SAFE_MODE blocked recipient not on allowlist"
             await audit(
                 session,
-                "outbox.preflight_passed",
+                "outbox.blocked_safe_mode",
+                case_id=row.case_id,
+                actor="policy",
+                data={"recipient": recipient},
+            )
+            await session.commit()
+            return True
+        if not settings.auto_send_enabled and not human_approved:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = "AUTO_SEND_ENABLED is false"
+            await session.commit()
+            return True
+        preflight_outcome, preflight_detail, preflight_facts = await _recipient_preflight(
+            session,
+            recipient,
+            settings,
+        )
+        if preflight_outcome == "DEFER":
+            row.status = DeliveryStatus.PENDING
+            row.available_at = now + timedelta(minutes=settings.mx_temporary_retry_minutes)
+            row.last_error = f"recipient preflight deferred: {preflight_detail}"[:2000]
+            await audit(
+                session,
+                "outbox.preflight_deferred",
                 case_id=row.case_id,
                 actor="dns",
                 data={"outbox_id": row.id, **preflight_facts},
             )
+            await session.commit()
+            return True
+        if preflight_outcome == "BLOCK":
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = f"recipient preflight blocked: {preflight_detail}"[:2000]
+            auto_suppressed = bool(preflight_facts.get("auto_suppressed"))
+            if auto_suppressed and case is not None and case.status not in {
+                CaseStatus.CLOSED_WON,
+                CaseStatus.CLOSED_LOST,
+            }:
+                case.status = CaseStatus.PAUSED
+            await audit(
+                session,
+                "outbox.preflight_blocked",
+                case_id=row.case_id,
+                actor="policy",
+                data={"outbox_id": row.id, **preflight_facts},
+            )
+            await session.commit()
+            if case is not None and not auto_suppressed:
+                await create_handoff(
+                    session,
+                    case=case,
+                    reason=HandoffReason.EMAIL_DELIVERABILITY,
+                    summary=f"Recipient preflight blocked {recipient}: {preflight_detail}",
+                    facts={"outbox_id": row.id, **preflight_facts},
+                )
+            return True
+        await audit(
+            session,
+            "outbox.preflight_passed",
+            case_id=row.case_id,
+            actor="dns",
+            data={"outbox_id": row.id, **preflight_facts},
+        )
         since_hour = now - timedelta(hours=1)
         since_day = now - timedelta(days=1)
         sent_events = await _mailbox_sent_events_since(session, mailbox, since_day, now)
@@ -7517,6 +7676,21 @@ async def claim_and_run_job(
         job.last_error = f"DEFERRED: {exc.reason}"[:2000]
         job.updated_at = datetime.now(UTC)
         await session.commit()
+    except asyncio.CancelledError:
+        # Cancellation must not leave handler state pending in a reusable
+        # session or hold the durable job lease until it expires.
+        await session.rollback()
+        job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+        if job is not None:
+            job.status = JobStatus.PENDING
+            job.attempts = max(0, job.attempts - 1)
+            job.available_at = datetime.now(UTC)
+            job.locked_at = None
+            job.locked_by = None
+            job.last_error = "CANCELLED: worker task was interrupted"
+            job.updated_at = datetime.now(UTC)
+            await session.commit()
+        raise
     except Exception as exc:
         logger.exception("job %s failed", job_id)
         error = f"{type(exc).__name__}: {exc}"[:2000]

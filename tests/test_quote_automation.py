@@ -1,5 +1,6 @@
+import asyncio
 import hashlib
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from email import policy
 from email.message import EmailMessage as MIMEMessage
@@ -9,15 +10,24 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.services as services
 from app.ai import InboundAnalysis, ProductLine
-from app.api import _admin_latest_quote_rows
+from app.api import _admin_latest_quote_rows, _price_history_by_product
 from app.commercial import get_or_create_current_cycle
 from app.db import (
+    AIInvocation,
+    AuditEvent,
     CaseStage,
     CaseStatus,
+    Contact,
+    Customer,
+    DeliveryStatus,
+    EmailAddressStatus,
     EmailMessage,
     Handoff,
     InventorySnapshot,
+    Job,
+    JobStatus,
     Outbox,
     PricePolicy,
     Product,
@@ -27,10 +37,13 @@ from app.db import (
 from app.domain import HandoffReason, Intent
 from app.services import (
     active_policy,
+    claim_and_run_job,
+    enqueue_job,
     ingest_raw_email,
     process_inbound,
     quote_with_manual_price,
     seed_demo_data,
+    send_one_outbox,
     standard_quote_valid_until,
 )
 from app.settings import Settings, get_settings
@@ -122,6 +135,38 @@ async def _add_quoteable_product(
     )
     await session.commit()
     return product
+
+
+async def _manual_quote_fixture(
+    session: AsyncSession,
+) -> tuple[SalesCase, Handoff, Outbox]:
+    case = await _seed_case(session)
+    source = await _add_inbound(
+        session,
+        case,
+        "Please send the reviewed quotation for 25 kg.",
+        suffix="manual-delivery-policy",
+    )
+    case.status = CaseStatus.WAITING_HUMAN
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=source.id,
+        reason_code=HandoffReason.NONSTANDARD.value,
+        summary="manual delivery policy fixture",
+        extracted_facts={},
+        status="OPEN",
+    )
+    session.add(handoff)
+    await session.commit()
+    assert case.product_id is not None
+    outbox = await quote_with_manual_price(
+        session,
+        handoff_id=handoff.id,
+        lines=[(case.product_id, Decimal("325.0000"), 25)],
+        currency="USD",
+        actor="reviewer",
+    )
+    return case, handoff, outbox
 
 
 async def test_quote_missing_quantity_asks_then_quotes(db_session: AsyncSession) -> None:
@@ -729,8 +774,23 @@ async def test_manual_price_quote_sends_now_and_keeps_price_as_history_only(
         currency="USD",
         actor="admin",
     )
-    assert outbox.message_kind == "AUTO_QUOTE"
+    assert outbox.message_kind == "HUMAN_QUOTE"
+    assert outbox.approval_handoff_id == handoff.id
+    assert outbox.human_approved_by == "admin"
+    assert outbox.human_approved_at is not None
     assert "Industrial Widget 300" in outbox.raw_message
+
+    case = await db_session.get(SalesCase, handoff.case_id)
+    assert case is not None and case.status == CaseStatus.WAITING_HUMAN
+    assert await send_one_outbox(
+        db_session,
+        get_settings(),
+        at=datetime.now(UTC),
+    ) is True
+    await db_session.refresh(outbox)
+    assert outbox.status == DeliveryStatus.SENT
+    await db_session.refresh(case)
+    assert case.status == CaseStatus.WAITING_HUMAN
 
     policy = await db_session.scalar(
         select(PricePolicy).where(
@@ -843,7 +903,8 @@ async def test_manual_price_quote_multiple_products_sends_one_email(
         currency="INR",
         actor="admin",
     )
-    assert outbox.message_kind == "AUTO_QUOTE"
+    assert outbox.message_kind == "HUMAN_QUOTE"
+    assert outbox.approval_handoff_id == handoff.id
     assert "Industrial Widget 400" in outbox.raw_message
     assert "Industrial Widget 500" in outbox.raw_message
     quotes = (
@@ -879,3 +940,324 @@ async def test_manual_price_quote_multiple_products_sends_one_email(
     assert handoff.status == "RESOLVED"
     await db_session.refresh(case)
     assert case.product_id is None
+
+
+async def test_price_history_query_returns_only_recent_rows_per_product(
+    db_session: AsyncSession,
+) -> None:
+    products = [
+        Product(
+            code=f"HISTORY-{index}",
+            name=f"History Product {index}",
+            unit="kg",
+            approved_text_key=f"history_{index}",
+        )
+        for index in range(3)
+    ]
+    db_session.add_all(products)
+    await db_session.flush()
+    for product in products:
+        for version in range(25):
+            price = Decimal(100 + version)
+            db_session.add(
+                PricePolicy(
+                    product_id=product.id,
+                    currency="USD",
+                    standard_price=price,
+                    absolute_floor=price,
+                    valid_from=date.today(),
+                    source_hash=f"history-{product.id}-{version}",
+                    active=False,
+                )
+            )
+    await db_session.commit()
+
+    payload = await _price_history_by_product(
+        db_session,
+        [product.id for product in products],
+    )
+
+    assert set(payload) == {str(product.id) for product in products}
+    assert all(len(rows) == 10 for rows in payload.values())
+    assert all(
+        [Decimal(row["price"]) for row in rows]
+        == [Decimal(value) for value in range(124, 114, -1)]
+        for rows in payload.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy_case", "expected_status"),
+    [
+        ("allowed", DeliveryStatus.SENT),
+        ("do_not_contact", DeliveryStatus.CANCELLED),
+        ("contact_suppressed", DeliveryStatus.CANCELLED),
+        ("address_suppressed", DeliveryStatus.CANCELLED),
+        ("closed", DeliveryStatus.CANCELLED),
+        ("wrong_recipient", DeliveryStatus.CANCELLED),
+        ("safe_mode", DeliveryStatus.CANCELLED),
+    ],
+)
+async def test_manual_quote_delivery_policy_matrix(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_case: str,
+    expected_status: DeliveryStatus,
+) -> None:
+    case, _handoff, outbox = await _manual_quote_fixture(db_session)
+    customer = await db_session.get(Customer, case.customer_id)
+    contact = await db_session.get(Contact, case.contact_id)
+    assert customer is not None and contact is not None
+    if policy_case == "do_not_contact":
+        customer.do_not_contact = True
+    elif policy_case == "contact_suppressed":
+        contact.suppressed = True
+    elif policy_case == "address_suppressed":
+        db_session.add(
+            EmailAddressStatus(
+                email=contact.email.casefold(),
+                domain="example.com",
+                suppressed=True,
+                suppression_reason="TEST",
+                suppressed_at=datetime.now(UTC),
+            )
+        )
+    elif policy_case == "closed":
+        case.status = CaseStatus.CLOSED_LOST
+    elif policy_case == "wrong_recipient":
+        outbox.recipient = "wrong-recipient@example.com"
+    await db_session.commit()
+
+    settings = Settings(
+        mail_transport="smtp",
+        safe_mode=True,
+        auto_send_enabled=False,
+        recipient_allowlist=(
+            [] if policy_case == "safe_mode" else ["internal@example.com"]
+        ),
+        forward_recipient_allowlist=[],
+        commercial_gate_enabled=False,
+        email_preflight_enabled=True,
+        mx_check_enabled=False,
+        min_send_interval_seconds=0,
+        send_interval_jitter_seconds=0,
+    )
+
+    async def allow_preflight(
+        _session: AsyncSession,
+        recipient: str,
+        _settings: Settings,
+    ) -> tuple[str, str, dict[str, object]]:
+        return "ALLOW", "test preflight passed", {"recipient": recipient}
+
+    sent: list[str] = []
+
+    class CapturingTransport:
+        def send(self, raw_message: str, message_id: str, recipient: str) -> None:
+            sent.append(recipient)
+
+    monkeypatch.setattr(services, "_recipient_preflight", allow_preflight)
+    monkeypatch.setattr(services, "transport_for", lambda _settings: CapturingTransport())
+
+    assert await send_one_outbox(db_session, settings, at=datetime.now(UTC)) is True
+    await db_session.refresh(outbox)
+    assert outbox.status == expected_status
+    assert sent == (["internal@example.com"] if expected_status == DeliveryStatus.SENT else [])
+
+
+async def test_manual_quote_failure_during_staging_is_fully_atomic(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session)
+    source = await _add_inbound(
+        db_session,
+        case,
+        "Please quote 25 kg.",
+        suffix="manual-atomic-failure",
+    )
+    case.status = CaseStatus.WAITING_HUMAN
+    handoff = Handoff(
+        case_id=case.id,
+        source_email_id=source.id,
+        reason_code=HandoffReason.NONSTANDARD.value,
+        summary="manual atomicity fixture",
+        extracted_facts={},
+        status="OPEN",
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+    assert case.product_id is not None
+    case_id = case.id
+    handoff_id = handoff.id
+    product_id = case.product_id
+
+    models = (Quote, Outbox, EmailMessage, PricePolicy, AuditEvent)
+    before = {
+        model.__name__: await db_session.scalar(select(func.count()).select_from(model))
+        for model in models
+    }
+
+    async def fail_audit(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected audit failure")
+
+    monkeypatch.setattr(services, "audit", fail_audit)
+    with pytest.raises(RuntimeError, match="injected audit failure"):
+        await quote_with_manual_price(
+            db_session,
+            handoff_id=handoff_id,
+            lines=[(product_id, Decimal("325.0000"), 25)],
+            currency="USD",
+            actor="reviewer",
+        )
+
+    after = {
+        model.__name__: await db_session.scalar(select(func.count()).select_from(model))
+        for model in models
+    }
+    assert after == before
+    stored_handoff = await db_session.get(Handoff, handoff_id)
+    stored_case = await db_session.get(SalesCase, case_id)
+    assert stored_handoff is not None and stored_handoff.status == "OPEN"
+    assert stored_case is not None
+    assert stored_case.status == CaseStatus.WAITING_HUMAN
+    assert stored_case.negotiation_round == 0
+
+
+async def _fail_after_outbox_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    expected_kind: str,
+    error: BaseException,
+) -> None:
+    real_stage = services.stage_outbox
+
+    async def staged_then_failed(*args: object, **kwargs: object) -> Outbox | None:
+        row = await real_stage(*args, **kwargs)  # type: ignore[arg-type]
+        assert kwargs.get("message_kind", "AUTO_QUOTE") == expected_kind
+        assert row is not None
+        raise error
+
+    monkeypatch.setattr(services, "stage_outbox", staged_then_failed)
+
+
+async def _business_counts(session: AsyncSession) -> dict[str, int]:
+    models = (Quote, Outbox, EmailMessage, AuditEvent, AIInvocation)
+    return {
+        model.__name__: int(
+            await session.scalar(select(func.count()).select_from(model)) or 0
+        )
+        for model in models
+    }
+
+
+async def test_auto_quote_cancelled_after_staging_rolls_back_and_session_recovers(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        suffix="auto-quote-cancelled-after-stage",
+    )
+    case_id = case.id
+    before = await _business_counts(db_session)
+    await _fail_after_outbox_staging(
+        monkeypatch,
+        expected_kind="AUTO_QUOTE",
+        error=asyncio.CancelledError(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await process_inbound(db_session, email_row.id)
+
+    assert await _business_counts(db_session) == before
+    assert await db_session.scalar(
+        select(SalesCase.id).where(SalesCase.id == case_id)
+    ) == case_id
+
+
+async def test_cancelled_job_releases_lease_without_consuming_retry(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await enqueue_job(
+        db_session,
+        "cancelled-atomic-probe",
+        {},
+        "cancelled-atomic-probe",
+    )
+    assert job is not None
+    job_id = job.id
+
+    async def cancel_handler(_session: AsyncSession, _payload: dict[str, object]) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setitem(
+        services.JOB_HANDLERS,
+        "cancelled-atomic-probe",
+        cancel_handler,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await claim_and_run_job(db_session, "cancel-test-worker")
+
+    stored = await db_session.get(Job, job_id)
+    assert stored is not None
+    assert stored.status == JobStatus.PENDING
+    assert stored.attempts == 0
+    assert stored.locked_at is None
+    assert stored.locked_by is None
+
+
+async def test_quote_clarification_failure_after_staging_rolls_back_everything(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote.",
+        suffix="clarification-failure-after-stage",
+    )
+    before = await _business_counts(db_session)
+    await _fail_after_outbox_staging(
+        monkeypatch,
+        expected_kind="QUOTE_CLARIFICATION",
+        error=RuntimeError("injected clarification post-stage failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="clarification post-stage"):
+        await process_inbound(db_session, email_row.id)
+
+    assert await _business_counts(db_session) == before
+
+
+async def test_initial_outreach_failure_after_staging_rolls_back_quote_and_case_state(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = await _seed_case(db_session)
+    case_id = case.id
+    before = await _business_counts(db_session)
+    before_round = case.negotiation_round
+    before_subject = case.subject_key
+    await _fail_after_outbox_staging(
+        monkeypatch,
+        expected_kind="AUTO_QUOTE",
+        error=RuntimeError("injected initial outreach post-stage failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="initial outreach post-stage"):
+        await services.create_case_outreach(
+            db_session,
+            {"case_id": case_id, "quantity": 100},
+        )
+
+    assert await _business_counts(db_session) == before
+    stored_case = await db_session.get(SalesCase, case_id)
+    assert stored_case is not None
+    assert stored_case.negotiation_round == before_round
+    assert stored_case.subject_key == before_subject

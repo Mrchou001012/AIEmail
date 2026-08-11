@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -111,8 +112,11 @@ class ForwardRecipient(Base, TimestampMixin):
     """Known salesperson addresses used for human takeover forwards."""
 
     __tablename__ = "forward_recipients"
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_forward_recipients_email"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    email: Mapped[str] = mapped_column(String(320))
     name: Mapped[str | None] = mapped_column(String(255))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -417,6 +421,14 @@ class Outbox(Base):
     __table_args__ = (
         UniqueConstraint("business_key", name="uq_outbox_business_key"),
         UniqueConstraint("message_id", name="uq_outbox_message_id"),
+        CheckConstraint(
+            "(approval_handoff_id IS NULL AND human_approved_by IS NULL "
+            "AND human_approved_at IS NULL) OR "
+            "(approval_handoff_id IS NOT NULL AND human_approved_by IS NOT NULL "
+            "AND human_approved_at IS NOT NULL "
+            "AND length(trim(human_approved_by)) > 0)",
+            name="ck_outbox_human_approval_complete",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), index=True)

@@ -112,6 +112,8 @@ REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
 CONTACTS_PATH = Path(__file__).with_name("contacts.html")
 RECORDS_PATH = Path(__file__).with_name("records.html")
 ADMIN_SHARED_CSS_PATH = Path(__file__).with_name("admin_shared.css")
+HANDOFF_PRICE_LINES_JS_PATH = Path(__file__).with_name("handoff_price_lines.js")
+RECORDS_REQUESTS_JS_PATH = Path(__file__).with_name("records_requests.js")
 MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
 
 
@@ -307,6 +309,24 @@ async def admin_shared_css() -> FileResponse:
     return FileResponse(
         ADMIN_SHARED_CSS_PATH,
         media_type="text/css",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/admin/static/handoff-price-lines.js", include_in_schema=False)
+async def handoff_price_lines_js() -> FileResponse:
+    return FileResponse(
+        HANDOFF_PRICE_LINES_JS_PATH,
+        media_type="text/javascript",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/admin/static/records-requests.js", include_in_schema=False)
+async def records_requests_js() -> FileResponse:
+    return FileResponse(
+        RECORDS_REQUESTS_JS_PATH,
+        media_type="text/javascript",
         headers={"Cache-Control": "public, max-age=3600"},
     )
 
@@ -2448,8 +2468,17 @@ async def _handoff_case_payload(session: AsyncSession, case_id: int | None) -> d
     }
 
 
-@router.get("/admin/handoffs")
-async def list_handoffs(
+@router.get("/admin/record-statuses")
+async def record_statuses(_: Admin) -> dict[str, list[str]]:
+    return {
+        "handoffs": ["OPEN", "RESOLVED"],
+        "outbox": [status.value for status in DeliveryStatus],
+        "jobs": [status.value for status in JobStatus],
+    }
+
+
+@router.get("/admin/handoff-records")
+async def list_handoff_records(
     _: Admin,
     session: Session,
     status: str | None = None,
@@ -2495,6 +2524,27 @@ async def list_handoffs(
             for row in rows
         ],
     }
+
+
+@router.get("/admin/handoffs")
+async def list_handoffs(_: Admin, session: Session) -> list[dict[str, Any]]:
+    """Preserve the original unpaginated handoff-list contract for old clients."""
+    rows = (
+        (await session.execute(select(Handoff).order_by(Handoff.id.desc())))
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "case_id": row.case_id,
+            "reason": row.reason_code,
+            "summary": row.summary,
+            "status": row.status,
+            "dingtalk_status": row.dingtalk_status,
+        }
+        for row in rows
+    ]
 
 
 @router.get("/admin/outbox")
@@ -2625,6 +2675,48 @@ def _price_history_payload(row: PricePolicy) -> dict[str, Any]:
         "active": row.active,
         "created_at": (row.created_at.isoformat() if row.created_at else None),
     }
+
+
+async def _price_history_by_product(
+    session: AsyncSession,
+    product_ids: list[int],
+    *,
+    limit: int = 10,
+) -> dict[str, list[dict[str, Any]]]:
+    unique_ids = list(dict.fromkeys(product_ids))
+    result: dict[str, list[dict[str, Any]]] = {
+        str(product_id): [] for product_id in unique_ids
+    }
+    if not unique_ids:
+        return result
+    history_rank = func.row_number().over(
+        partition_by=PricePolicy.product_id,
+        order_by=(PricePolicy.valid_from.desc(), PricePolicy.id.desc()),
+    ).label("history_rank")
+    ranked = (
+        select(PricePolicy.id.label("policy_id"), history_rank)
+        .where(PricePolicy.product_id.in_(unique_ids))
+        .subquery()
+    )
+    rows = (
+        (
+            await session.execute(
+                select(PricePolicy)
+                .join(ranked, ranked.c.policy_id == PricePolicy.id)
+                .where(ranked.c.history_rank <= max(1, limit))
+                .order_by(
+                    PricePolicy.product_id,
+                    PricePolicy.valid_from.desc(),
+                    PricePolicy.id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        result[str(row.product_id)].append(_price_history_payload(row))
+    return result
 
 
 @router.get("/admin/handoffs/{handoff_id}")
@@ -2803,27 +2895,11 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
                     {"product_id": product.id, "quantity": quantity}
                 )
 
-    price_history_by_product: dict[str, list[dict[str, Any]]] = {}
     selectable_product_ids = [int(product.id) for product in products]
-    if selectable_product_ids:
-        selectable_history_rows = (
-            (
-                await session.execute(
-                    select(PricePolicy)
-                    .where(PricePolicy.product_id.in_(selectable_product_ids))
-                    .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for product_id in selectable_product_ids:
-            rows_for_product = [
-                row for row in selectable_history_rows if row.product_id == product_id
-            ][:10]
-            price_history_by_product[str(product_id)] = [
-                _price_history_payload(row) for row in rows_for_product
-            ]
+    price_history_by_product = await _price_history_by_product(
+        session,
+        selectable_product_ids,
+    )
     return {
         "id": handoff.id,
         "case_id": handoff.case_id,
@@ -2881,6 +2957,7 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
         "suggested_lines": suggested_lines,
         "price_history_by_product": price_history_by_product,
         "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
+        "forwarding_enabled": bool(get_settings().forward_recipient_allowlist),
         "approved_outbox": (
             {
                 "id": approved_outbox.id,

@@ -223,6 +223,7 @@
       </aside>
     </div>
   </main>
+  <script src="/admin/static/handoff-price-lines.js"></script>
   <script>
     const id = Number(location.pathname.match(/handoffs\/(\d+)\/review/)?.[1]);
     const $ = (selector) => document.querySelector(selector);
@@ -476,6 +477,7 @@
     function manualPriceRow(productId, quantity) {
       const row = document.createElement("div");
       row.className = "price-line";
+      row.dataset.priceLine = "";
       row.innerHTML = `
         <select class="manual-price-product" aria-label="产品">
           <option value="">选择产品…</option>
@@ -558,10 +560,16 @@
       state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可定价发送。" : "";
       updateManualPriceSendState();
     }
+    let forwardingEnabled = false;
     function renderForward(data) {
+      forwardingEnabled = Boolean(data.forwarding_enabled);
       const state = $("#forward-state");
-      state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可转发。" : "";
-      $("#forward-send").disabled = data.status !== "OPEN";
+      state.textContent = !forwardingEnabled
+        ? "内部转发未配置：请先设置 FORWARD_RECIPIENT_ALLOWLIST。"
+        : (data.status !== "OPEN" ? "处理单已关闭，不可转发。" : "");
+      $("#forward-recipient").disabled = !forwardingEnabled || data.status !== "OPEN";
+      $("#forward-note").disabled = !forwardingEnabled || data.status !== "OPEN";
+      $("#forward-send").disabled = !forwardingEnabled || data.status !== "OPEN";
     }
     let forwardRecipientTimer = null;
     async function loadForwardRecipients() {
@@ -585,6 +593,7 @@
         const data = await api(`/admin/handoffs/${id}`);
         render(data);
         await renderSourceEmail(data.source_email);
+        await loadForwardRecipients();
         const lookupKey = data.source_email && !(data.matching_contacts || []).length && !data.case
           ? `${data.id}:${String(data.source_email.from).toLowerCase()}`
           : "";
@@ -685,9 +694,15 @@
       updateManualPriceSendState();
     });
     $("#manual-price-send").addEventListener("click", async () => {
+      try {
+        AdminPriceLines.collectPriceLines($("#manual-price-lines"));
+      } catch (error) {
+        notice(error.message, "error");
+        return;
+      }
       const lines = [];
       const labels = [];
-      for (const row of document.querySelectorAll("#manual-price-lines > .card")) {
+      for (const row of document.querySelectorAll("#manual-price-lines > [data-price-line]")) {
         const select = row.querySelector(".manual-price-product");
         const productId = Number(select.value);
         if (!productId) continue;
@@ -744,7 +759,7 @@
         await load();
       } catch (error) {
         notice(error.message, "error");
-        $("#forward-send").disabled = false;
+        $("#forward-send").disabled = !forwardingEnabled || state?.status !== "OPEN";
       }
     });
     $("#load-remote-images").addEventListener("click", () => {

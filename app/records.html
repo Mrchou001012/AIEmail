@@ -37,10 +37,10 @@
     <section class="main-card">
       <div class="card-header">
         <h2>记录类型</h2>
-        <div class="segmented-control" id="tabs">
-          <button class="segmented-item" data-tab="handoffs" type="button">人工处理单</button>
-          <button class="segmented-item" data-tab="outbox" type="button">发件队列</button>
-          <button class="segmented-item" data-tab="jobs" type="button">后台任务</button>
+        <div class="segmented-control" id="tabs" role="tablist" aria-label="记录类型">
+          <button class="segmented-item" id="tab-handoffs" data-tab="handoffs" type="button" role="tab" aria-controls="records-panel" aria-selected="true" tabindex="0">人工处理单</button>
+          <button class="segmented-item" id="tab-outbox" data-tab="outbox" type="button" role="tab" aria-controls="records-panel" aria-selected="false" tabindex="-1">发件队列</button>
+          <button class="segmented-item" id="tab-jobs" data-tab="jobs" type="button" role="tab" aria-controls="records-panel" aria-selected="false" tabindex="-1">后台任务</button>
         </div>
       </div>
 
@@ -53,7 +53,7 @@
         <div class="record-count" id="record-count">共 <strong>0</strong> 条记录</div>
       </div>
 
-      <div class="table-scroll">
+      <div class="table-scroll" id="records-panel" role="tabpanel" aria-labelledby="tab-handoffs" tabindex="0">
         <table class="records-table">
           <thead id="head"></thead>
           <tbody id="rows"><tr><td colspan="6" class="empty">正在加载…</td></tr></tbody>
@@ -67,14 +67,15 @@
     </section>
   </main>
 
+  <script src="/admin/static/records-requests.js"></script>
   <script>
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const pageSize = 100;
     const tabs = ["handoffs", "outbox", "jobs"];
-    const filterOptions = {
+    let filterOptions = {
       handoffs: ["OPEN", "RESOLVED"],
-      outbox: ["PENDING", "SENT", "FAILED", "CANCELLED", "UNKNOWN"],
+      outbox: ["PENDING", "CLAIMED", "SENT", "FAILED", "CANCELLED", "UNKNOWN"],
       jobs: ["PENDING", "RUNNING", "DONE", "FAILED"],
     };
     const columns = {
@@ -98,6 +99,12 @@
     };
     let current = "handoffs";
     let lastData = null;
+    const requestCoordinator = AdminRecordsRequests.createRequestCoordinator();
+    const recordEndpoints = {
+      handoffs: "/admin/handoff-records",
+      outbox: "/admin/outbox",
+      jobs: "/admin/jobs",
+    };
 
     function activeFromHash() {
       const value = location.hash.replace("#", "");
@@ -144,7 +151,11 @@
     }
     function renderTabs() {
       document.querySelectorAll(".segmented-item").forEach((button) => {
-        button.classList.toggle("active", button.dataset.tab === current);
+        const active = button.dataset.tab === current;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+        if (active) $("#records-panel").setAttribute("aria-labelledby", button.id);
       });
     }
     function renderFilter() {
@@ -156,8 +167,8 @@
     function renderHead() {
       $("#head").innerHTML = "<tr>" + columns[current].map(([name, cls]) => `<th class="${cls}">${name}</th>`).join("") + "</tr>";
     }
-    function renderRow(row) {
-      if (current === "handoffs") {
+    function renderRow(row, tab) {
+      if (tab === "handoffs") {
         const summary = String(row.summary || "");
         return `<tr>
           <td class="col-time">${timeCell(row.created_at)}</td>
@@ -168,7 +179,7 @@
           <td class="col-updated">${timeCell(row.updated_at)}</td>
         </tr>`;
       }
-      if (current === "outbox") {
+      if (tab === "outbox") {
         const recipient = String(row.recipient || "");
         return `<tr>
           <td class="col-time">${timeCell(row.created_at)}</td>
@@ -202,50 +213,50 @@
       }
       return output;
     }
-    function renderPagination() {
-      const total = lastData ? lastData.total : 0;
-      const items = (lastData && lastData.items) || [];
+    function renderPagination(data, tab) {
+      const total = data ? data.total : 0;
+      const items = (data && data.items) || [];
       $("#record-count").innerHTML = `共 <strong>${total}</strong> 条记录`;
-      if (!lastData) {
+      if (!data) {
         $("#page-range").textContent = "—";
         $("#page-buttons").innerHTML = "";
         return;
       }
-      const currentPage = Math.floor(lastData.offset / pageSize) + 1;
+      const currentPage = Math.floor(data.offset / pageSize) + 1;
       const totalPages = Math.max(1, Math.ceil(total / pageSize));
-      const start = total === 0 ? 0 : lastData.offset + 1;
-      const end = total === 0 ? 0 : lastData.offset + items.length;
+      const start = total === 0 ? 0 : data.offset + 1;
+      const end = total === 0 ? 0 : data.offset + items.length;
       $("#page-range").textContent = total === 0
         ? "共 0 条记录"
         : `显示第 ${start}–${end} 条，共 ${total} 条`;
       const buttons = [];
-      buttons.push(`<button class="page-button" id="page-prev" type="button" ${lastData.offset <= 0 ? "disabled" : ""}>上一页</button>`);
+      buttons.push(`<button class="page-button" id="page-prev" type="button" ${data.offset <= 0 ? "disabled" : ""}>上一页</button>`);
       for (const page of pageNumbers(totalPages, currentPage)) {
         if (page === "…") {
           buttons.push('<span class="page-ellipsis">…</span>');
         } else {
-          buttons.push(`<button class="page-button ${page === currentPage ? "active" : ""}" data-page="${page}" type="button">${page}</button>`);
+          buttons.push(`<button class="page-button ${page === currentPage ? "active" : ""}" data-page="${page}" type="button" ${page === currentPage ? 'aria-current="page"' : ""}>${page}</button>`);
         }
       }
-      buttons.push(`<button class="page-button" id="page-next" type="button" ${lastData.offset + items.length >= total ? "disabled" : ""}>下一页</button>`);
+      buttons.push(`<button class="page-button" id="page-next" type="button" ${data.offset + items.length >= total ? "disabled" : ""}>下一页</button>`);
       $("#page-buttons").innerHTML = buttons.join("");
       document.querySelectorAll("#page-buttons [data-page]").forEach((button) => {
         button.addEventListener("click", () => {
-          state[current].offset = (Number(button.dataset.page) - 1) * pageSize;
+          state[tab].offset = (Number(button.dataset.page) - 1) * pageSize;
           load();
         });
       });
       $("#page-prev").addEventListener("click", () => {
-        state[current].offset = Math.max(0, state[current].offset - pageSize);
+        state[tab].offset = Math.max(0, state[tab].offset - pageSize);
         load();
       });
       $("#page-next").addEventListener("click", () => {
-        state[current].offset = Math.min((totalPages - 1) * pageSize, state[current].offset + pageSize);
+        state[tab].offset = Math.min((totalPages - 1) * pageSize, state[tab].offset + pageSize);
         load();
       });
     }
-    async function api(path) {
-      const response = await fetch(path);
+    async function api(path, options = {}) {
+      const response = await fetch(path, options);
       if (!response.ok) {
         let message = `${response.status} ${response.statusText}`;
         try { message = (await response.json()).detail || message; } catch (_) {}
@@ -254,27 +265,50 @@
       return response.json();
     }
     async function load() {
+      const request = requestCoordinator.begin({
+        tab: current,
+        status: state[current].status,
+        offset: state[current].offset,
+      });
       renderTabs();
       renderFilter();
       renderHead();
       const params = new URLSearchParams({
-        offset: String(state[current].offset),
+        offset: String(request.snapshot.offset),
         limit: String(pageSize),
       });
-      if (state[current].status) params.set("status", state[current].status);
+      if (request.snapshot.status) params.set("status", request.snapshot.status);
       try {
-        lastData = await api(`/admin/${current}?${params}`);
+        const data = await api(`${recordEndpoints[request.snapshot.tab]}?${params}`, {
+          signal: request.signal,
+        });
+        if (!requestCoordinator.isCurrent(request) || current !== request.snapshot.tab) return;
+        lastData = data;
         $("#rows").innerHTML = (lastData.items || []).length
-          ? lastData.items.map(renderRow).join("")
+          ? lastData.items.map((row) => renderRow(row, request.snapshot.tab)).join("")
           : '<tr><td colspan="6" class="empty">没有匹配记录</td></tr>';
       } catch (error) {
+        if (error.name === "AbortError" || !requestCoordinator.isCurrent(request)) return;
         lastData = null;
         $("#rows").innerHTML = `<tr><td colspan="6" class="empty">加载失败：${esc(error.message)}</td></tr>`;
       }
-      renderPagination();
+      renderPagination(lastData, request.snapshot.tab);
     }
     document.querySelectorAll(".segmented-item").forEach((button) => {
       button.addEventListener("click", () => { location.hash = button.dataset.tab; });
+      button.addEventListener("keydown", (event) => {
+        const index = tabs.indexOf(button.dataset.tab);
+        let nextIndex = null;
+        if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+        if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === "Home") nextIndex = 0;
+        if (event.key === "End") nextIndex = tabs.length - 1;
+        if (nextIndex === null) return;
+        event.preventDefault();
+        const next = document.querySelector(`[data-tab="${tabs[nextIndex]}"]`);
+        next.focus();
+        location.hash = tabs[nextIndex];
+      });
     });
     $("#status-filter").addEventListener("change", () => {
       state[current].status = $("#status-filter").value;
@@ -293,8 +327,16 @@
         load();
       }
     });
-    current = activeFromHash();
-    load();
+    async function initialize() {
+      try {
+        filterOptions = await api("/admin/record-statuses");
+      } catch (_) {
+        // Keep the complete local fallback when status metadata is unavailable.
+      }
+      current = activeFromHash();
+      load();
+    }
+    initialize();
   </script>
 </body>
 </html>
