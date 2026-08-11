@@ -11,10 +11,8 @@ The repository runs without external credentials:
 - `DINGTALK_TRANSPORT=log`
 - `SAFE_MODE=true`
 - `AUTO_SEND_ENABLED=false`
-- SMTP recipients are blocked unless they are on `RECIPIENT_ALLOWLIST`
-- Internal forwards additionally require an exact address in
-  `FORWARD_RECIPIENT_ALLOWLIST`; previously used recipients are autocomplete
-  history only and never grant authorization
+- In `SAFE_MODE`, SMTP recipients (including reviewer-entered internal
+  forwards) are blocked unless they are on `RECIPIENT_ALLOWLIST`
 
 No real secrets are included. Copy `.env.example` to `.env` and fill it **locally** when you are ready. Do not paste keys, mailbox passwords, or webhook URLs into chat.
 
@@ -591,7 +589,7 @@ contact. Other cases are not reassigned. Pending delivery to the failed exact
 address is cancelled, and launched reactivation snapshots must be rescanned
 before the new endpoint can be selected.
 
-An authenticated reviewer can associate the inbound email with an existing case, create and associate a new case for a matching contact, edit and approve a reply, set a manual quotation, forward the source email to an authorized salesperson, pause or resume the case, take over the case, or close the handoff. Approved replies and manual quotations record the handoff ID, reviewer account, approval timestamp, exact MIME message, and append-only audit event. Customer-directed replies and manual quotations still pass recipient matching, do-not-contact and suppression checks, SAFE_MODE allowlisting, address/MX preflight, Gmail spacing, hourly/daily limits, and SMTP cooldowns. Human-approved internal forwards may skip customer-recipient equality and customer do-not-contact because their destination is a salesperson, but still require complete approval metadata, exact membership in `FORWARD_RECIPIENT_ALLOWLIST`, SAFE_MODE allowlisting, suppression checks, address/MX preflight, spacing and rate limits. Explicitly human-approved messages may be delivered while autonomous sending is disabled; `MAIL_TRANSPORT=file` remains the global no-network-send control.
+An authenticated reviewer can associate the inbound email with an existing case, create and associate a new case for a matching contact, edit and approve a reply, set a manual quotation, enter a salesperson address and forward the source email, pause or resume the case, take over the case, or close the handoff. A successfully used salesperson address is saved as autocomplete and recent-use history; it is not a separate authorization source. Approved replies and manual quotations record the handoff ID, reviewer account, approval timestamp, exact MIME message, and append-only audit event. Customer-directed replies and manual quotations still pass recipient matching, do-not-contact and suppression checks, SAFE_MODE allowlisting, address/MX preflight, Gmail spacing, hourly/daily limits, and SMTP cooldowns. Human-approved internal forwards may skip customer-recipient equality and customer do-not-contact because their destination is a salesperson, but still require complete approval metadata, valid normalized email syntax, SAFE_MODE's general `RECIPIENT_ALLOWLIST`, suppression checks, address/MX preflight, spacing and rate limits, and SMTP cooldowns. Production deployments using their existing `SAFE_MODE=false` policy do not need to preconfigure salesperson addresses. Explicitly human-approved messages may be delivered while autonomous sending is disabled; `MAIL_TRANSPORT=file` remains the global no-network-send control.
 
 The human-review page can add up to 10 ordinary attachments to an approved reply. Each file is limited to 10 MB, the combined upload is limited to 15 MB, and the final encoded MIME message must remain below 24 MB. Clear executable/script file types are rejected. Deployments behind Nginx must allow the request body before it reaches FastAPI; set `client_max_body_size 20m;` in the `aiemail` site/server block and reload Nginx.
 

@@ -39,15 +39,6 @@ from app.settings import Settings, get_settings
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture(autouse=True)
-def _authorize_forward_test_recipients(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        get_settings(),
-        "forward_recipient_allowlist",
-        ["sales@lanyachem.com"],
-    )
-
-
 async def _forward_case(db_session: AsyncSession) -> tuple[SalesCase, EmailMessage, Handoff]:
     ids = await seed_demo_data(db_session)
     case = SalesCase(
@@ -93,16 +84,17 @@ async def test_forward_handoff_email_preserves_content_and_takes_over(
     db_session: AsyncSession,
 ) -> None:
     case, _email_row, handoff = await _forward_case(db_session)
+    recipient_email = "first.use@new-sales.example"
 
     outbox = await forward_handoff_email(
         db_session,
         handoff_id=handoff.id,
-        recipient="sales@lanyachem.com",
+        recipient=recipient_email,
         actor="admin",
         note="请跟进",
     )
     assert outbox.message_kind == "FORWARD"
-    assert outbox.recipient == "sales@lanyachem.com"
+    assert outbox.recipient == recipient_email
     assert outbox.approval_handoff_id == handoff.id
     assert outbox.human_approved_by == "admin"
     assert outbox.human_approved_at is not None
@@ -125,7 +117,7 @@ async def test_forward_handoff_email_preserves_content_and_takes_over(
     assert handoff.status == "RESOLVED"
     recipient = await db_session.scalar(
         select(ForwardRecipient).where(
-            ForwardRecipient.email == "sales@lanyachem.com"
+            ForwardRecipient.email == recipient_email
         )
     )
     assert recipient is not None
@@ -198,72 +190,60 @@ async def test_forward_outbox_delivers_under_human_takeover(
 
 async def test_forward_recipients_search_and_save(
     db_session: AsyncSession,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        get_settings(),
-        "forward_recipient_allowlist",
-        ["alice@lanyachem.com", "new@lanyachem.com"],
-    )
     await save_forward_recipient(
         db_session,
         email="alice@lanyachem.com",
         name="Alice Sales",
     )
-    db_session.add(
-        ForwardRecipient(
-            email="bob@other.com",
-            name="Old unauthorized history",
-            last_used_at=datetime.now(UTC),
-        )
+    await save_forward_recipient(
+        db_session,
+        email="bob@other.com",
+        name="Bob Sales",
     )
-    await db_session.commit()
 
-    matches = await list_forward_recipients(
+    email_matches = await list_forward_recipients(
         db_session,
         query="alice",
     )
-    assert [item["email"] for item in matches] == ["alice@lanyachem.com"]
+    assert [item["email"] for item in email_matches] == ["alice@lanyachem.com"]
+    name_matches = await list_forward_recipients(db_session, query="Bob Sales")
+    assert [item["email"] for item in name_matches] == ["bob@other.com"]
     all_rows = await list_forward_recipients(db_session)
     assert len(all_rows) == 2
     assert [item["email"] for item in all_rows] == [
+        "bob@other.com",
         "alice@lanyachem.com",
-        "new@lanyachem.com",
     ]
-    assert all_rows[1]["id"] is None
-    with pytest.raises(ValueError, match="not authorized"):
-        await save_forward_recipient(
-            db_session,
-            email="bob@other.com",
-            name="Bob",
-        )
 
 
-async def test_empty_forward_allowlist_returns_no_history_and_disables_authorization(
+async def test_forward_handoff_email_rejects_invalid_runtime_address(
     db_session: AsyncSession,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(get_settings(), "forward_recipient_allowlist", [])
-    db_session.add(
-        ForwardRecipient(
-            email="historical@lanyachem.com",
-            name="Historical only",
-            last_used_at=datetime.now(UTC),
-        )
-    )
-    await db_session.commit()
+    case, _email_row, handoff = await _forward_case(db_session)
+    case_id = case.id
+    handoff_id = handoff.id
 
-    assert await list_forward_recipients(db_session) == []
-    with pytest.raises(ValueError, match="not authorized"):
-        await save_forward_recipient(
+    with pytest.raises(ValueError, match="valid email address"):
+        await forward_handoff_email(
             db_session,
-            email="historical@lanyachem.com",
+            handoff_id=handoff_id,
+            recipient="not-an-email",
+            actor="admin",
         )
+
+    assert await db_session.scalar(select(func.count()).select_from(Outbox)) == 0
+    assert await db_session.scalar(
+        select(func.count()).select_from(ForwardRecipient)
+    ) == 0
+    stored_case = await db_session.get(SalesCase, case_id)
+    stored_handoff = await db_session.get(Handoff, handoff_id)
+    assert stored_case is not None and stored_case.status == CaseStatus.ACTIVE
+    assert stored_handoff is not None and stored_handoff.status == "OPEN"
 
 
 def _smtp_forward_settings(
     *,
-    forward_allowlist: list[str] | None = None,
     safe_allowlist: list[str] | None = None,
 ) -> Settings:
     return Settings(
@@ -271,7 +251,6 @@ def _smtp_forward_settings(
         safe_mode=True,
         auto_send_enabled=False,
         recipient_allowlist=safe_allowlist or [],
-        forward_recipient_allowlist=forward_allowlist or [],
         commercial_gate_enabled=False,
         email_preflight_enabled=True,
         mx_check_enabled=False,
@@ -286,7 +265,6 @@ def _smtp_forward_settings(
         ("allowed", DeliveryStatus.SENT),
         ("customer_dnc", DeliveryStatus.SENT),
         ("safe_mode", DeliveryStatus.CANCELLED),
-        ("unauthorized", DeliveryStatus.CANCELLED),
         ("suppressed", DeliveryStatus.CANCELLED),
         ("preflight_block", DeliveryStatus.CANCELLED),
         ("preflight_defer", DeliveryStatus.PENDING),
@@ -308,9 +286,6 @@ async def test_forward_delivery_policy_matrix(
     )
 
     settings = _smtp_forward_settings(
-        forward_allowlist=(
-            [] if policy_case == "unauthorized" else ["sales@lanyachem.com"]
-        ),
         safe_allowlist=(
             [] if policy_case == "safe_mode" else ["sales@lanyachem.com"]
         ),
@@ -394,15 +369,61 @@ async def test_forged_forward_kind_without_approval_is_cancelled(
             sent.append(recipient)
 
     monkeypatch.setattr(services, "transport_for", lambda _settings: CapturingTransport())
-    settings = _smtp_forward_settings(
-        forward_allowlist=["sales@lanyachem.com"],
-        safe_allowlist=["sales@lanyachem.com"],
-    )
+    settings = _smtp_forward_settings(safe_allowlist=["sales@lanyachem.com"])
     assert await send_one_outbox(db_session, settings, at=datetime.now(UTC)) is True
     await db_session.refresh(outbox)
     assert outbox.status == DeliveryStatus.CANCELLED
     assert "complete human approval" in (outbox.last_error or "")
     assert sent == []
+
+
+async def test_forward_final_gate_does_not_depend_on_recipient_history(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _case, _email_row, handoff = await _forward_case(db_session)
+    recipient_email = "runtime.sales@partner.example"
+    outbox = await forward_handoff_email(
+        db_session,
+        handoff_id=handoff.id,
+        recipient=recipient_email,
+        actor="admin",
+    )
+    history = await db_session.scalar(
+        select(ForwardRecipient).where(ForwardRecipient.email == recipient_email)
+    )
+    assert history is not None
+    await db_session.delete(history)
+    await db_session.commit()
+
+    sent: list[str] = []
+    normalized: list[str] = []
+    normalize_recipient = services._normalize_forward_recipient
+
+    class CapturingTransport:
+        def send(self, raw_message: str, message_id: str, recipient: str) -> None:
+            sent.append(recipient)
+
+    def capture_normalization(recipient: str) -> str:
+        normalized.append(recipient)
+        return normalize_recipient(recipient)
+
+    monkeypatch.setattr(
+        services,
+        "_normalize_forward_recipient",
+        capture_normalization,
+    )
+    monkeypatch.setattr(services, "transport_for", lambda _settings: CapturingTransport())
+    settings = _smtp_forward_settings(safe_allowlist=[recipient_email])
+
+    assert await send_one_outbox(db_session, settings, at=datetime.now(UTC)) is True
+    await db_session.refresh(outbox)
+    assert outbox.status == DeliveryStatus.SENT
+    assert sent == [recipient_email]
+    assert normalized == [recipient_email, recipient_email]
+    assert await db_session.scalar(
+        select(func.count()).select_from(ForwardRecipient)
+    ) == 0
 
 
 @pytest.mark.parametrize(

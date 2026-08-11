@@ -79,7 +79,6 @@ class Settings(BaseSettings):
     safe_mode: bool = True
     auto_send_enabled: bool = False
     recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
-    forward_recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
     max_sends_per_hour: int = 5
     max_sends_per_day: int = 20
     min_send_interval_seconds: int = 120
@@ -113,14 +112,14 @@ class Settings(BaseSettings):
     def normalize_mode(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
 
-    @field_validator("recipient_allowlist", "forward_recipient_allowlist", mode="before")
+    @field_validator("recipient_allowlist", mode="before")
     @classmethod
     def split_allowlist(cls, value: object) -> object:
         if isinstance(value, str):
             return [part.strip() for part in value.split(",") if part.strip()]
         return value
 
-    @field_validator("recipient_allowlist", "forward_recipient_allowlist")
+    @field_validator("recipient_allowlist")
     @classmethod
     def normalize_allowlist_addresses(cls, value: list[str]) -> list[str]:
         normalized: list[str] = []

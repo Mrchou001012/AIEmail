@@ -863,10 +863,7 @@ async def _final_recipient_delivery_guard(
     if current.message_kind == "FORWARD":
         complete_approval = _human_approval_from_outbox(current) is not None
         try:
-            normalized_forward_recipient = _authorize_forward_recipient(
-                current.recipient,
-                settings,
-            )
+            normalized_forward_recipient = _normalize_forward_recipient(current.recipient)
         except ValueError as exc:
             current.status = DeliveryStatus.CANCELLED
             current.last_error = f"final forward authorization failed: {exc}"[:2000]
@@ -2207,13 +2204,6 @@ def _normalize_forward_recipient(value: str) -> str:
     return result.normalized
 
 
-def _authorize_forward_recipient(value: str, settings: Settings) -> str:
-    normalized = _normalize_forward_recipient(value)
-    if normalized not in settings.forward_recipient_allowlist:
-        raise ValueError("recipient is not authorized for internal forwarding")
-    return normalized
-
-
 async def _touch_forward_recipient(
     session: AsyncSession,
     *,
@@ -2341,49 +2331,40 @@ async def list_forward_recipients(
     query: str = "",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    allowlist = get_settings().forward_recipient_allowlist
-    if not allowlist:
-        return []
-    q = query.strip().casefold()
+    conditions = []
+    q = query.strip()
+    if q:
+        pattern = f"%{q}%"
+        conditions.append(
+            or_(
+                ForwardRecipient.email.ilike(pattern),
+                ForwardRecipient.name.ilike(pattern),
+            )
+        )
     rows = (
         (
             await session.execute(
                 select(ForwardRecipient)
-                .where(ForwardRecipient.email.in_(allowlist))
+                .where(*conditions)
                 .order_by(
                     ForwardRecipient.last_used_at.desc().nullslast(),
                     ForwardRecipient.id.desc(),
                 )
+                .limit(max(1, min(limit, 50)))
             )
         )
         .scalars()
         .all()
     )
-    by_email = {row.email: row for row in rows}
-    configured_rows: list[dict[str, Any]] = []
-    for email in allowlist:
-        row = by_email.get(email)
-        name = row.name if row is not None else None
-        if q and q not in email.casefold() and q not in (name or "").casefold():
-            continue
-        configured_rows.append({
-            "id": row.id if row is not None else None,
-            "email": email,
-            "name": name,
-            "last_used_at": (
-                row.last_used_at.isoformat()
-                if row is not None and row.last_used_at
-                else None
-            ),
-        })
-    configured_rows.sort(
-        key=lambda item: (
-            item["last_used_at"] is not None,
-            item["last_used_at"] or "",
-        ),
-        reverse=True,
-    )
-    return configured_rows[: max(1, min(limit, 50))]
+    return [
+        {
+            "id": row.id,
+            "email": row.email,
+            "name": row.name,
+            "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+        }
+        for row in rows
+    ]
 
 
 async def save_forward_recipient(
@@ -2392,7 +2373,7 @@ async def save_forward_recipient(
     email: str,
     name: str = "",
 ) -> dict[str, Any]:
-    normalized = _authorize_forward_recipient(email, get_settings())
+    normalized = _normalize_forward_recipient(email)
     row = await _touch_forward_recipient(
         session,
         email=normalized,
@@ -2438,7 +2419,7 @@ async def forward_handoff_email(
     if source_email is None:
         raise ValueError("handoff source email no longer exists")
     settings = get_settings()
-    recipient = _authorize_forward_recipient(recipient, settings)
+    recipient = _normalize_forward_recipient(recipient)
     address_status = await session.get(EmailAddressStatus, recipient)
     if address_status is not None and address_status.suppressed:
         raise ValueError("recipient address is permanently suppressed")
@@ -7268,10 +7249,7 @@ async def send_one_outbox(
     authorized_forward = False
     if is_forward:
         try:
-            normalized_forward_recipient = _authorize_forward_recipient(
-                row.recipient,
-                settings,
-            )
+            normalized_forward_recipient = _normalize_forward_recipient(row.recipient)
         except ValueError as exc:
             row.status = DeliveryStatus.CANCELLED
             row.last_error = f"forward authorization failed: {exc}"[:2000]

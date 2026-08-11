@@ -1,5 +1,3 @@
-import pytest
-
 from app.settings import Settings
 
 
@@ -9,29 +7,6 @@ def test_recipient_allowlist_accepts_comma_separated_environment_value(monkeypat
     settings = Settings(_env_file=None)
 
     assert settings.recipient_allowlist == ["first@example.com", "second@example.com"]
-
-
-def test_forward_recipient_allowlist_defaults_closed_and_normalizes_addresses(monkeypatch) -> None:
-    default_settings = Settings()
-    assert default_settings.forward_recipient_allowlist == []
-
-    monkeypatch.setenv(
-        "FORWARD_RECIPIENT_ALLOWLIST",
-        "Sales.One@Example.com, sales.two@example.com, SALES.ONE@example.com",
-    )
-    configured = Settings()
-
-    assert configured.forward_recipient_allowlist == [
-        "sales.one@example.com",
-        "sales.two@example.com",
-    ]
-
-
-def test_forward_recipient_allowlist_rejects_invalid_addresses(monkeypatch) -> None:
-    monkeypatch.setenv("FORWARD_RECIPIENT_ALLOWLIST", "sales@example.com.evil.invalid, not-an-email")
-
-    with pytest.raises(ValueError, match="valid email address"):
-        Settings()
 
 
 def test_imap_batch_size_is_configurable(monkeypatch) -> None:

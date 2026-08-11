@@ -560,16 +560,13 @@
       state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可定价发送。" : "";
       updateManualPriceSendState();
     }
-    let forwardingEnabled = false;
     function renderForward(data) {
-      forwardingEnabled = Boolean(data.forwarding_enabled);
+      const closed = data.status !== "OPEN";
       const state = $("#forward-state");
-      state.textContent = !forwardingEnabled
-        ? "内部转发未配置：请先设置 FORWARD_RECIPIENT_ALLOWLIST。"
-        : (data.status !== "OPEN" ? "处理单已关闭，不可转发。" : "");
-      $("#forward-recipient").disabled = !forwardingEnabled || data.status !== "OPEN";
-      $("#forward-note").disabled = !forwardingEnabled || data.status !== "OPEN";
-      $("#forward-send").disabled = !forwardingEnabled || data.status !== "OPEN";
+      state.textContent = closed ? "处理单已关闭，不可转发。" : "";
+      $("#forward-recipient").disabled = closed;
+      $("#forward-note").disabled = closed;
+      $("#forward-send").disabled = closed;
     }
     let forwardRecipientTimer = null;
     async function loadForwardRecipients() {
@@ -759,7 +756,7 @@
         await load();
       } catch (error) {
         notice(error.message, "error");
-        $("#forward-send").disabled = !forwardingEnabled || state?.status !== "OPEN";
+        $("#forward-send").disabled = state?.status !== "OPEN";
       }
     });
     $("#load-remote-images").addEventListener("click", () => {

@@ -80,15 +80,14 @@ def test_records_page_exposes_accessible_tab_semantics() -> None:
     assert all(tab.get("aria-controls") == "records-panel" for tab in tabs)
 
 
-def test_handoff_page_exposes_explicit_forward_allowlist_disabled_state() -> None:
+def test_handoff_page_accepts_runtime_forward_recipient_and_loads_history() -> None:
     source = HANDOFF_REVIEW_PATH.read_text(encoding="utf-8")
     page = BeautifulSoup(source, "html.parser")
 
     assert page.select_one("#forward-recipient") is not None
     assert page.select_one("#forward-send") is not None
     assert page.select_one("#forward-state") is not None
-    assert "Boolean(data.forwarding_enabled)" in source
-    assert "内部转发未配置" in source
+    assert 'const closed = data.status !== "OPEN"' in source
     assert "await loadForwardRecipients()" in source
 
 

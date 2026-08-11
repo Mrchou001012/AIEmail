@@ -2957,7 +2957,6 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
         "suggested_lines": suggested_lines,
         "price_history_by_product": price_history_by_product,
         "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
-        "forwarding_enabled": bool(get_settings().forward_recipient_allowlist),
         "approved_outbox": (
             {
                 "id": approved_outbox.id,

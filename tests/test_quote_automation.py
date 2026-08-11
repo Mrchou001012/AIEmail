@@ -1035,7 +1035,6 @@ async def test_manual_quote_delivery_policy_matrix(
         recipient_allowlist=(
             [] if policy_case == "safe_mode" else ["internal@example.com"]
         ),
-        forward_recipient_allowlist=[],
         commercial_gate_enabled=False,
         email_preflight_enabled=True,
         mx_check_enabled=False,
