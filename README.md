@@ -579,6 +579,20 @@ Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC thr
 
 A handoff is a durable database record, not merely a DingTalk message. Automatic sending stops for the affected case and the DingTalk notifier links to `/admin/handoffs/{id}/review`. The protected review page shows the source email, extracted facts, related cases, contact/product choices, latest quotation, and a conservative editable reply draft.
 
+Product-category reviews now use the first durable Agent continuation workflow.
+Migration `0020` adds `agent_runs`, `agent_steps`, and `assistance_requests`.
+When an explicit product-list request has no unique category, the review page
+shows a typed category-selection question instead of requiring the reviewer to
+write the customer reply. Submitting the answer atomically records the reviewer,
+increments the run version, and queues one idempotent `resume_agent_run` job.
+The worker then creates or updates the category-level case, re-runs the normal
+send policy, renders the curated catalog, and stages it through the existing
+Outbox. If authorization or another safety condition changed while the task was
+waiting, the run becomes `BLOCKED` and remains in human review; it never bypasses
+the existing sending gates. Existing open `PRODUCT_CATEGORY_REVIEW` handoffs are
+backfilled by the migration. The JSON endpoint used by the review page is
+`POST /admin/assistance-requests/{request_id}/answer`.
+
 Customer email endpoints are maintained at `/admin/contacts`. A permanent
 bounce suppresses only the exact failed address; sibling contacts under the
 same customer remain usable. Operators can add another address without
@@ -656,6 +670,152 @@ Failures print bounded container diagnostics before removing only the isolated r
 ```
 
 A successful static check alone is not proof of a runnable MVP; the script must complete the runtime layer.
+
+## NAS knowledge base
+
+The NAS index is local and deny-by-default. `config/nas_knowledge_policy.yaml`
+classifies files as `customer_ready`, `internal`, `review_required`, or
+`excluded`; product-directory candidates become `customer_ready` only after
+local text extraction succeeds and the sensitive-content guard finds no price,
+customer, order, payment, supplier, or formulation markers. Customer searches
+can only read `customer_ready` chunks. Administrator overrides are persisted in
+`runtime/nas_knowledge/classification_overrides.json` and survive later scans.
+
+Run an initial host-side scan on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\sync_nas_knowledge.py `
+  --root '\\DS1821plus\LANYACHEM' `
+  --output runtime\nas_knowledge
+```
+
+For Docker, mount the share read-only with `NAS_KNOWLEDGE_HOST_DIR` (for
+example `//DS1821plus/LANYACHEM` after Docker Desktop has access), then set
+`NAS_KNOWLEDGE_ENABLED=true`. The worker polls every
+`NAS_KNOWLEDGE_POLL_SECONDS`; unchanged files reuse their existing chunks,
+changed files are re-extracted, and deleted files are removed. A periodic poll
+is used instead of an SMB filesystem watcher because disconnects can lose
+watcher events.
+
+Administrative endpoints:
+
+- `GET /admin/knowledge/nas/status`
+- `POST /admin/knowledge/nas/scan`
+- `GET /admin/knowledge/nas/documents?classification=review_required`
+- `POST /admin/knowledge/nas/classification`
+- `GET /admin/knowledge/nas/search?query=...&audience=customer`
+
+### Standard COA catalog and reviewed email drafts
+
+COA selection is a separate deterministic catalog, not a RAG answer. It scans
+only `\\DS1821plus\LANYACHEM\!PRODUCT DATA\!PRODUCT DOCS`, considers PDF
+filenames containing COA, rejects Chinese paths and date/version/customer or
+special-purpose suffixes, and selects a file only when one suffix-free English
+COA uniquely matches its product directory. Product names, codes, aliases, and
+CAS numbers are enriched only from the approved local product catalog.
+
+Build or refresh the host-side catalog:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\sync_coa_catalog.py `
+  --root '\\DS1821plus\LANYACHEM\!PRODUCT DATA\!PRODUCT DOCS' `
+  --output runtime\coa_catalog\catalog.json
+```
+
+The worker repeats this scan when `COA_CATALOG_ENABLED=true`. Unchanged files
+reuse their extraction record; changed and deleted files update the catalog.
+Before an approved draft is queued, the application reads the NAS file again
+and requires the SHA-256 hash to match the selected catalog entry.
+
+During observation/testing, keep all three workflow switches false:
+
+```dotenv
+COA_AUTO_SEND_ENABLED=false
+PRODUCT_LIST_AUTO_SEND_ENABLED=false
+QUOTE_AUTO_SEND_ENABLED=false
+```
+
+An exact COA request, a known-category product-list request, or a policy-valid
+standard quote then creates an editable review draft. COA and product-list
+attachments are regenerated or re-read at approval. A quote approval rechecks
+the active price-policy source hash, commercial price/inventory cycle, quote
+history, expiry, quantity, standard terms, and calculated price. Ambiguous COA
+matches and missing standard files remain open as `COA_REVIEW` handoffs rather
+than guessing.
+
+Every handoff created from an inbound email also has a durable `AgentRun` and
+step trace. The run remains `WAITING_HUMAN` until the reviewer resolves or
+approves it. Product-category selection and a missing/ambiguous COA have typed
+assistance forms: the answer queues one versioned resume job, re-runs current
+catalog/safety checks, and continues from the original email. Other high-risk
+handoffs remain normal human-controlled tasks; resolving, replying, or taking
+over the case finalizes the related run instead of silently abandoning it.
+
+The review page automatically uses the prepared workflow endpoint when the
+handoff contains a verified draft:
+
+- `POST /admin/handoffs/{id}/approve-coa-draft`
+- `POST /admin/handoffs/{id}/approve-product-list-draft`
+- `POST /admin/handoffs/{id}/approve-quote-draft`
+- `POST /admin/handoffs/{id}/approve-multi-quote-draft`
+- `POST /admin/assistance-requests/{id}/answer`
+
+COA files are deterministic attachments, so they are not embedded or selected
+by RAG. Rebuild the COA catalog after this classification change; regenerate
+general RAG vectors only when the customer-ready text knowledge set itself
+changes.
+
+COA administration endpoints:
+
+- `GET /admin/coa/status`
+- `POST /admin/coa/scan`
+- `GET /admin/coa/find?query=...&cas_number=...`
+- `GET /admin/coa/review`
+
+Private acceptance emails may be placed in the Git-ignored `email-case/`
+directory. The evaluator reads `.eml` files locally and prints only structured
+intent, product, quantity, route, and blocker fields; it does not copy customer
+addresses, signatures, or message bodies into test fixtures:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_email_cases.py `
+  --input email-case `
+  --coa-catalog runtime\coa_catalog\catalog.json
+```
+
+The current 11-email offline acceptance set routes eight cases directly to a
+safe draft/clarification and three to a specific assistance requirement. To
+close those remaining business-data gaps, provide only approved customer-ready
+facts:
+
+1. HMDS packing details (exact English wording and applicable pack sizes).
+2. The official catalog mapping for `LT 560` (canonical product code/aliases,
+   plus an approved active price policy before it can be quoted).
+3. The approved scope for “solvents available for tanker load” (a catalog
+   category or an explicit product-code list). No full catalog is substituted
+   for this scoped request.
+
+The evaluator and sanitized tests never commit the original messages. Keep
+`email-case/` local; `.gitignore` excludes the directory as well as general
+`.eml` customer mail.
+
+### Phased activation
+
+1. Keep `MAIL_TRANSPORT=file`, `SAFE_MODE=true`, `AUTO_SEND_ENABLED=false`, and
+   all three workflow auto-send switches false. Review generated drafts and
+   assistance/resume behavior.
+2. Enable SMTP only with an internal recipient allowlist. Explicitly approved
+   drafts can be delivered while the global autonomous switch remains off.
+3. After acceptance, set `AUTO_SEND_ENABLED=true` and enable only one bounded
+   workflow switch at a time. Start with exact, hash-verified COA matches;
+   continue to keep product-list and quote auto-send false.
+4. Enable category product lists only after catalog ownership and scope are
+   signed off. Enable quotations last, after active price feeds, expiry,
+   commercial-cycle confirmation, and wrong-price regression tests are
+   routinely green.
+5. Kill switches: set the affected workflow switch false to return it to draft
+   review; set `AUTO_SEND_ENABLED=false` to stop all autonomous delivery; set
+   `MAIL_TRANSPORT=file` or stop the worker for a global network-send stop.
 
 ## API summary
 

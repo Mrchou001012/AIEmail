@@ -1,0 +1,157 @@
+version: 1
+
+# Customer-facing access is deny-by-default.  Rules are evaluated from top to
+# bottom; a manual override written by an administrator always wins.
+rules:
+  - pattern: "#recycle/**"
+    classification: excluded
+    reason: NAS recycle bin
+  - pattern: "软件/**"
+    classification: excluded
+    reason: software installers are not knowledge documents
+  - pattern: "EMAIL/**"
+    classification: excluded
+    reason: raw mailbox data belongs in the separately curated email-learning pipeline
+  - pattern: "Google/**"
+    classification: excluded
+    reason: account exports are outside the sales knowledge scope
+  - pattern: "HISTORY/**"
+    classification: excluded
+    reason: historical commercial records are outside the first knowledge scope
+  - pattern: "!SHIPMENTS/**"
+    classification: excluded
+    reason: transactional purchasing, sales and logistics data requires a separate operations tool
+  - pattern: "卷宗归档/**"
+    classification: excluded
+    reason: archive scope is unknown and not required by the sales knowledge base
+
+  # Selected internal technical sources. Their parent containers must remain
+  # traversable while all non-selected siblings are skipped.
+  - pattern: "LANYA-EUROPE"
+    classification: internal
+    reason: container for selectively approved internal sources
+  - pattern: "LANYA-EUROPE/硅烷低聚物/**"
+    classification: internal
+    reason: internal product knowledge; never customer-facing without review
+  - pattern: "LANYA-EUROPE/**"
+    classification: excluded
+    reason: regional pricing, customer and operating records are out of scope
+  - pattern: "LANYA-LAB"
+    classification: internal
+    reason: container for selectively approved internal technical sources
+  - pattern: "LANYA-LAB/问题汇总/**"
+    classification: internal
+    reason: internal product issue knowledge
+  - pattern: "LANYA-LAB/相关参考文献/**"
+    classification: internal
+    reason: internal technical reference literature
+  - pattern: "LANYA-LAB/产品配方及实验记录/**"
+    classification: excluded
+    reason: formulations and experiment records are trade-secret material
+  - pattern: "LANYA-LAB/**"
+    classification: excluded
+    reason: laboratory content is deny-by-default
+  - pattern: "OTHER DOCUMENTS/HR/**"
+    classification: excluded
+    reason: human-resources records are out of scope
+  - pattern: "OTHER DOCUMENTS/COMPANY REGULATIONS/**"
+    classification: excluded
+    reason: internal company regulations are out of scope
+  - pattern: "TRAINING"
+    classification: internal
+    reason: container for selectively approved training sources
+  - pattern: "TRAINING/PRODUCT/**"
+    classification: internal
+    reason: internal product training knowledge
+  - pattern: "TRAINING/**"
+    classification: excluded
+    reason: software and company-regulation training are out of scope
+  - pattern: "LANYA-INDIA/TRAINING DATA/**"
+    classification: internal
+    reason: internal product training knowledge
+  - pattern: "!PRODUCT DATA/RFQ SUMMARY/**"
+    classification: excluded
+    reason: stale quotation summaries must not override live pricing policy
+
+  # These locations normally contain public product collateral.  A document
+  # is promoted to customer_ready only after extraction succeeds and the local
+  # sensitive-content guard finds no commercial/private markers.
+  - pattern: "!PRODUCT DATA/!PRODUCT DOCS/**"
+    classification: customer_candidate
+    reason: product document candidate
+  - pattern: "!PRODUCT DATA/INTRODUCTION/**"
+    classification: customer_candidate
+    reason: company or product introduction candidate
+  - pattern: "!PRODUCT DATA/PRESENTATIONS/**"
+    classification: customer_candidate
+    reason: presentation candidate
+  - pattern: "!PRODUCT DATA/PRODUCT LIST/**"
+    classification: customer_candidate
+    reason: product-list candidate
+  - pattern: "LANYA-INDIA/COA/**"
+    classification: customer_candidate
+    reason: certificate candidate; customer/order-specific content is held for review
+  - pattern: "LANYA-INDIA/RELATIVE LITERATURE/**"
+    classification: customer_candidate
+    reason: technical literature candidate
+
+  - pattern: "OTHER DOCUMENTS/COMPANY LICENSE/**"
+    classification: review_required
+    reason: legal documents may be shared only for a defined purpose
+  - pattern: "OTHER DOCUMENTS/PHOTO/**"
+    classification: review_required
+    reason: image assets need visual review
+  - pattern: "**"
+    classification: review_required
+    reason: no explicit policy rule
+
+excluded_extensions:
+  - .7z
+  - .apk
+  - .bat
+  - .bin
+  - .cab
+  - .cmd
+  - .com
+  - .dll
+  - .dmg
+  - .exe
+  - .gz
+  - .img
+  - .iso
+  - .jar
+  - .lnk
+  - .msi
+  - .ps1
+  - .rar
+  - .scr
+  - .sys
+  - .tar
+  - .tmp
+  - .vbs
+  - .xz
+  - .zip
+
+extractable_extensions:
+  - .csv
+  - .docx
+  - .eml
+  - .htm
+  - .html
+  - .json
+  - .md
+  - .pdf
+  - .pptx
+  - .tsv
+  - .txt
+  - .xlsx
+  - .yaml
+  - .yml
+
+# A hit does not label the file "internal" automatically.  It removes it from
+# autonomous customer retrieval and sends it to review.
+sensitive_markers:
+  - "(?i)\\b(?:fob|cif|cfr|exw|unit price|target price|payment terms|invoice|purchase order|proforma)\\b"
+  - "(?i)\\b(?:customer|client|buyer|consignee|shipper)\\s*(?:name|address|email|contact|code)?\\s*:"
+  - "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b"
+  - "(?:报价|底价|成本|利润|毛利|付款条件|采购订单|销售订单|发票|客户名称|客户地址|收货人|配方|实验记录|供应商)"

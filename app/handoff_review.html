@@ -149,6 +149,27 @@
         </article>
       </section>
       <aside>
+        <article class="card hidden" id="agent-assistance-card">
+          <h2>Agent 继续处理</h2>
+          <div class="sub" id="agent-run-state"></div>
+          <div id="assistance-question"></div>
+          <div id="assistance-category-fields">
+            <label for="assistance-category">产品系列</label>
+            <select id="assistance-category"></select>
+          </div>
+          <div class="hidden" id="assistance-coa-fields">
+            <label for="assistance-coa-query">修正后的产品名或产品代码</label>
+            <input id="assistance-coa-query" maxlength="255" placeholder="例如：LANOPAP-DF 4234">
+            <label for="assistance-coa-cas">CAS（可选）</label>
+            <input id="assistance-coa-cas" maxlength="32" placeholder="例如：919-30-2">
+          </div>
+          <label for="assistance-note">选择依据（可选）</label>
+          <input id="assistance-note" maxlength="2000" placeholder="例如：根据客户主营业务确认发送该系列">
+          <div class="actions">
+            <button class="primary" id="answer-assistance" type="button">提交并让 Agent 继续</button>
+          </div>
+          <div class="file-help" id="assistance-state"></div>
+        </article>
         <article class="card" id="manual-price-card">
           <h2>快速定价并发送报价</h2>
           <div class="sub" id="manual-price-help">产品默认不预选；按需添加产品并填写单价、数量，可一次为多个产品定价，系统生成一封报价邮件发送，价格保存为历史参考；下次同产品询价仍转人工。</div>
@@ -408,6 +429,56 @@
         attachmentBox.classList.remove("hidden");
       }
     }
+    function renderAssistance(data) {
+      const card = $("#agent-assistance-card");
+      const requests = data.assistance_requests || [];
+      const request = requests.find((item) => item.status === "OPEN") || requests[requests.length - 1];
+      card.classList.toggle("hidden", !request);
+      if (!request) return;
+      const run = data.agent_run;
+      $("#agent-run-state").textContent = run
+        ? `任务 #${run.id} · ${run.status} · 版本 ${run.version} · 当前步骤 ${run.current_step || "—"}`
+        : "Agent 任务状态不可用";
+      $("#assistance-question").textContent = request.question || "请补充 Agent 继续执行所需的信息。";
+      const coaLookup = request.request_type === "COA_LOOKUP_CORRECTION";
+      $("#assistance-category-fields").classList.toggle("hidden", coaLookup);
+      $("#assistance-coa-fields").classList.toggle("hidden", !coaLookup);
+      const choices = [...(request.options || [])].sort((left, right) => Number(right.recommended) - Number(left.recommended));
+      $("#assistance-category").innerHTML = choices.length
+        ? '<option value="">请选择产品系列</option>' + choices.map((item) => {
+            const label = `${item.recommended ? "建议 · " : ""}${item.name}${item.name_zh ? ` / ${item.name_zh}` : ""}`;
+            return `<option value="${esc(item.category_id)}">${esc(label)}</option>`;
+          }).join("")
+        : '<option value="">当前没有可用产品系列</option>';
+      if (request.answer?.category_id) {
+        $("#assistance-category").value = String(request.answer.category_id);
+      }
+      if (coaLookup) {
+        if (!$("#assistance-coa-query").value) {
+          $("#assistance-coa-query").value = request.answer?.product_query || data.facts?.coa_query || "";
+        }
+        if (!$("#assistance-coa-cas").value) {
+          $("#assistance-coa-cas").value = request.answer?.cas_number || data.facts?.coa_cas_number || "";
+        }
+      }
+      const retryable = request.status === "ANSWERED" && run?.status === "BLOCKED";
+      const open = (request.status === "OPEN" || retryable) && data.status === "OPEN";
+      $("#assistance-category").disabled = !open || retryable;
+      $("#assistance-coa-query").disabled = !open || retryable;
+      $("#assistance-coa-cas").disabled = !open || retryable;
+      $("#assistance-note").disabled = !open;
+      $("#answer-assistance").disabled = !open || (coaLookup ? !$("#assistance-coa-query").value.trim() : choices.length === 0);
+      $("#answer-assistance").textContent = retryable ? "重新尝试继续处理" : "提交并让 Agent 继续";
+      $("#assistance-state").textContent = request.status === "OPEN"
+        ? "提交后会创建幂等恢复任务；发送前仍会重新检查授权、附件和收件安全。"
+        : request.status === "ANSWERED"
+          ? retryable
+            ? `上次恢复被阻止：${run?.last_error || "请检查当前业务状态后重试。"}`
+            : "答案已保存，Agent 恢复任务正在队列中。"
+          : request.status === "APPLIED"
+            ? "答案已应用，Agent 已完成后续处理。"
+            : `当前状态：${request.status}`;
+    }
     function render(data) {
       state = data;
       $("#handoff-id").textContent = `#${data.id}`;
@@ -417,6 +488,7 @@
       $("#email-body").textContent = mail?.body_text || "暂无原邮件";
       $("#handoff-meta").innerHTML = `<span class="label">原因</span><span class="pill">${esc(data.reason)}</span><span class="label">摘要</span><span>${esc(data.summary)}</span><span class="label">通知</span><span>${esc(data.dingtalk_status)}</span><span class="label">处理备注</span><span>${esc(data.resolution_note || "无")}</span>`;
       $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
+      renderAssistance(data);
       renderCase(data.case);
       options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product || "产品待确认"} · ${row.status}`);
       const matchingContacts = data.matching_contacts || [];
@@ -446,9 +518,22 @@
         $("#contact-search").value = defaultContactSearch(mail.from);
       }
       const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
+      const preparedCoa = data.facts?.prepared_coa;
+      const preparedProductList = data.facts?.prepared_product_list;
+      const preparedQuote = data.facts?.prepared_quote;
+      const preparedMultiQuote = data.facts?.prepared_multi_quote;
       $("#generate-draft").disabled = blocked;
       $("#send").disabled = blocked;
-      $("#reply-attachments").disabled = blocked;
+      $("#send").textContent = preparedCoa
+        ? `确认并附加 ${preparedCoa.filename || "COA.pdf"} 后加入发件队列`
+        : preparedProductList
+          ? `确认产品列表${preparedProductList.attachment_filename ? `及 ${preparedProductList.attachment_filename}` : ""} 后加入发件队列`
+        : preparedQuote
+          ? `确认 ${preparedQuote.currency} ${preparedQuote.unit_price} 报价后加入发件队列`
+        : preparedMultiQuote
+          ? `确认 ${preparedMultiQuote.lines?.length || 0} 项产品报价后加入发件队列`
+        : "确认并加入发件队列";
+      $("#reply-attachments").disabled = blocked || Boolean(preparedCoa) || Boolean(preparedProductList) || Boolean(preparedQuote) || Boolean(preparedMultiQuote);
       const preview = data.facts?.ai_draft_preview;
       $("#draft-state").textContent = preview
         ? `预览生成于 ${new Date(preview.generated_at).toLocaleString()} · ${preview.provider}/${preview.model} · RAG 命中 ${(preview.rag_matches || []).length} 条 · 未创建发件任务`
@@ -789,6 +874,45 @@
       $("#remote-image-help").textContent = `已加载 ${loaded} 张；${linked ? `${linked} 张非 HTTPS 图片仅提供新窗口链接。` : "远程图片不会保存到本服务器。"}`;
     });
     $("#reply-attachments").addEventListener("change", renderAttachments);
+    $("#assistance-coa-query").addEventListener("input", () => {
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN");
+      if (request?.request_type === "COA_LOOKUP_CORRECTION" && state?.status === "OPEN") {
+        $("#answer-assistance").disabled = !$("#assistance-coa-query").value.trim();
+      }
+    });
+    $("#answer-assistance").addEventListener("click", async () => {
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN")
+        || ((state?.agent_run?.status === "BLOCKED")
+          ? (state?.assistance_requests || []).find((item) => item.status === "ANSWERED")
+          : null);
+      const categoryId = Number($("#assistance-category").value);
+      const coaLookup = request?.request_type === "COA_LOOKUP_CORRECTION";
+      const productQuery = $("#assistance-coa-query").value.trim();
+      if (!request || (coaLookup ? !productQuery : !categoryId)) {
+        notice(coaLookup ? "请填写重新检索使用的产品名或代码。" : "请选择需要发送的产品系列。", "error");
+        return;
+      }
+      if (!confirm(coaLookup ? "确认已补充标准英文 COA，并用该产品信息重新检索？" : "确认该产品系列？Agent 将保存答案并从中断位置继续处理邮件。")) return;
+      $("#answer-assistance").disabled = true;
+      try {
+        const result = await api(`/admin/assistance-requests/${request.id}/answer`, {
+          method:"POST",
+          body:JSON.stringify(coaLookup ? {
+            product_query:productQuery,
+            cas_number:$("#assistance-coa-cas").value.trim() || null,
+            note:$("#assistance-note").value.trim(),
+          } : {
+            category_id:categoryId,
+            note:$("#assistance-note").value.trim(),
+          }),
+        });
+        notice(`答案已保存，恢复任务 #${result.resume_job_id || "已存在"} 已排队。`);
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#answer-assistance").disabled = false;
+      }
+    });
     $("#generate-draft").addEventListener("click", async () => {
       const button = $("#generate-draft");
       const previousSubject = $("#reply-subject").value;
@@ -835,7 +959,49 @@
       }
     });
     $("#send").addEventListener("click", async () => {
-      if (!confirm("确认以当前内容回复客户？邮件将进入发件队列并记录你的账号。")) return;
+      const preparedCoa = state?.facts?.prepared_coa;
+      const preparedProductList = state?.facts?.prepared_product_list;
+      const preparedQuote = state?.facts?.prepared_quote;
+      const preparedMultiQuote = state?.facts?.prepared_multi_quote;
+      const attachmentNotice = preparedCoa
+        ? `系统会从 NAS 重新校验并附加 ${preparedCoa.filename}。`
+        : preparedProductList
+          ? "系统会重新校验当前启用的产品目录，并按客户要求生成附件。"
+          : preparedQuote
+            ? "系统会重新校验当前价格政策、商业数据周期和报价历史。"
+            : preparedMultiQuote
+              ? "系统会逐项重新校验产品、价格政策、商业数据周期、报价轮次和 COA。"
+          : "";
+      if (!confirm(`确认以当前内容回复客户？${attachmentNotice}邮件将进入发件队列并记录你的账号。`)) return;
+      if (preparedCoa || preparedProductList || preparedQuote || preparedMultiQuote) {
+        $("#send").disabled = true;
+        try {
+          const preparedEndpoint = preparedCoa
+            ? "approve-coa-draft"
+            : preparedProductList
+              ? "approve-product-list-draft"
+              : preparedQuote
+                ? "approve-quote-draft"
+                : "approve-multi-quote-draft";
+          const response = await fetch(`/admin/handoffs/${id}/${preparedEndpoint}`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({
+              subject:$("#reply-subject").value,
+              body_text:$("#reply-body").value,
+              note:$("#reply-note").value,
+              resume_automation:$("#resume").checked,
+            }),
+          });
+          if (!response.ok) throw new Error(await responseError(response));
+          notice("资料已重新校验，人工确认回复已加入发件队列。");
+          await load();
+        } catch (error) {
+          notice(error.message, "error");
+          $("#send").disabled = false;
+        }
+        return;
+      }
       const form = new FormData();
       form.append("subject", $("#reply-subject").value);
       form.append("body_text", $("#reply-body").value);

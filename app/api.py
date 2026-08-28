@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import json
 import logging
 import re
 import secrets
 import tempfile
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -19,13 +21,23 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agent_runtime import (
+    answer_coa_lookup_assistance,
+    answer_product_category_assistance,
+    assistance_request_payload,
+    finalize_handoff_agent_run,
+)
+from app.coa_catalog import COACatalog, COACatalogScanner
 from app.commercial import (
     commercial_update_link,
     get_or_create_current_cycle,
     lock_commercial_scope,
 )
 from app.db import (
+    AgentRun,
+    AgentStep,
     AIInvocation,
+    AssistanceRequest,
     AuditEvent,
     CaseStatus,
     CommercialDataCycle,
@@ -64,6 +76,15 @@ from app.mail import (
     extract_email_resource,
     parse_mime,
 )
+from app.nas_knowledge import (
+    Classification,
+    LocalKnowledgeBase,
+    NASKnowledgeScanner,
+    ScanPaths,
+    list_documents,
+    read_scan_summary,
+    set_classification_override,
+)
 from app.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
 from app.products import canonical_product_code, product_text_key
 from app.reactivation import (
@@ -89,6 +110,10 @@ from app.services import (
     ingest_raw_email,
     list_forward_recipients,
     queue_human_reply,
+    queue_prepared_coa_reply,
+    queue_prepared_multi_quote_reply,
+    queue_prepared_product_list_reply,
+    queue_prepared_quote_reply,
     quote_with_manual_price,
     replace_handoff_recipient,
     resolve_deliverability_handoff,
@@ -172,11 +197,28 @@ class HandoffCaseProductRequest(BaseModel):
     product_id: int = Field(gt=0)
 
 
+class AssistanceAnswer(BaseModel):
+    category_id: int | None = Field(default=None, gt=0)
+    product_query: str | None = Field(default=None, min_length=1, max_length=255)
+    cas_number: str | None = Field(default=None, max_length=32)
+    note: str = Field(default="", max_length=2_000)
+
+
+class NASClassificationUpdate(BaseModel):
+    path: str = Field(min_length=1, max_length=2_000)
+    classification: Classification
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class HandoffReplyRequest(BaseModel):
     subject: str = Field(min_length=1, max_length=998)
     body_text: str = Field(min_length=1, max_length=50_000)
     note: str = Field(default="", max_length=2_000)
     resume_automation: bool = False
+
+
+class PreparedCOAReplyRequest(HandoffReplyRequest):
+    pass
 
 
 class ManualPriceQuoteLine(BaseModel):
@@ -1343,6 +1385,9 @@ async def admin_status(_: Admin, session: Session, settings: Annotated[Settings,
         "dingtalk_transport": settings.dingtalk_transport,
         "safe_mode": settings.safe_mode,
         "auto_send_enabled": settings.auto_send_enabled,
+        "coa_auto_send_enabled": settings.coa_auto_send_enabled,
+        "product_list_auto_send_enabled": settings.product_list_auto_send_enabled,
+        "quote_auto_send_enabled": settings.quote_auto_send_enabled,
         "imap_sync_enabled": settings.imap_sync_enabled,
         "company_research_enabled": settings.company_research_enabled,
         "company_research_auto_send_enabled": (
@@ -1357,6 +1402,184 @@ async def admin_status(_: Admin, session: Session, settings: Annotated[Settings,
         "outbox": {str(key.value): count for key, count in outbox.all()},
         "open_handoffs": handoffs or 0,
     }
+
+
+def _configured_nas_scanner(settings: Settings) -> NASKnowledgeScanner:
+    return NASKnowledgeScanner(
+        root=settings.nas_knowledge_root,
+        policy_path=settings.nas_knowledge_policy_path,
+        output_dir=settings.nas_knowledge_output_dir,
+        max_extract_bytes=settings.nas_knowledge_max_file_mb * 1024 * 1024,
+        extraction_timeout_seconds=settings.nas_knowledge_file_timeout_seconds,
+    )
+
+
+def _configured_coa_scanner(settings: Settings) -> COACatalogScanner:
+    return COACatalogScanner(
+        root=settings.coa_catalog_root,
+        output_path=settings.coa_catalog_path,
+        product_catalog_path=settings.coa_product_catalog_path,
+        max_file_bytes=settings.coa_catalog_max_file_mb * 1024 * 1024,
+        extraction_timeout_seconds=settings.coa_catalog_file_timeout_seconds,
+    )
+
+
+@router.get("/admin/knowledge/nas/status")
+async def nas_knowledge_status(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    return {
+        "enabled": settings.nas_knowledge_enabled,
+        "poll_seconds": settings.nas_knowledge_poll_seconds,
+        "root": str(settings.nas_knowledge_root),
+        "scan": read_scan_summary(settings.nas_knowledge_output_dir),
+    }
+
+
+@router.post("/admin/knowledge/nas/scan")
+async def scan_nas_knowledge(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_configured_nas_scanner(settings).scan)
+
+
+@router.get("/admin/knowledge/nas/documents")
+async def nas_knowledge_documents(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    classification: Classification | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2_000),
+) -> dict[str, Any]:
+    rows = list_documents(
+        settings.nas_knowledge_output_dir,
+        classification=classification,
+        limit=limit,
+    )
+    return {"count": len(rows), "documents": rows}
+
+
+@router.post("/admin/knowledge/nas/classification")
+async def update_nas_knowledge_classification(
+    request: NASClassificationUpdate,
+    admin: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    manifest = ScanPaths.in_directory(settings.nas_knowledge_output_dir).manifest
+    known_paths = (
+        {
+            str(row.get("path"))
+            for row in json.loads(manifest.read_text(encoding="utf-8")).get("documents", [])
+        }
+        if manifest.exists()
+        else set()
+    )
+    normalized = request.path.replace("\\", "/").lstrip("/")
+    if normalized not in known_paths:
+        raise HTTPException(404, "Document is not present in the latest NAS inventory")
+    override = set_classification_override(
+        output_dir=settings.nas_knowledge_output_dir,
+        relative_path=normalized,
+        classification=request.classification,
+        reason=request.reason,
+        actor=admin,
+    )
+    scan = await asyncio.to_thread(_configured_nas_scanner(settings).scan)
+    return {"path": normalized, "override": override, "scan": scan}
+
+
+@router.get("/admin/knowledge/nas/search")
+async def search_nas_knowledge(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    query: str = Query(min_length=2, max_length=2_000),
+    audience: Literal["customer", "internal"] = Query(default="customer"),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    index_path = ScanPaths.in_directory(settings.nas_knowledge_output_dir).index
+    if not index_path.exists():
+        raise HTTPException(409, "NAS knowledge index has not been built")
+    matches = LocalKnowledgeBase(index_path).search(query, audience=audience, top_k=limit)
+    return {
+        "audience": audience,
+        "matches": [
+            {
+                "path": match.path,
+                "chunk": match.chunk,
+                "score": round(match.score, 4),
+                "classification": match.classification.value,
+                "text": match.text,
+            }
+            for match in matches
+        ],
+    }
+
+
+@router.get("/admin/coa/status")
+async def coa_catalog_status(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    payload = (
+        json.loads(settings.coa_catalog_path.read_text(encoding="utf-8"))
+        if settings.coa_catalog_path.exists()
+        else {}
+    )
+    return {
+        "enabled": settings.coa_catalog_enabled,
+        "auto_send_enabled": settings.coa_auto_send_enabled,
+        "poll_seconds": settings.coa_catalog_poll_seconds,
+        "root": str(settings.coa_catalog_root),
+        "catalog_path": str(settings.coa_catalog_path),
+        "scan": {
+            key: value
+            for key, value in payload.items()
+            if key not in {"entries", "review"}
+        },
+    }
+
+
+@router.post("/admin/coa/scan")
+async def scan_coa_catalog(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    payload = await asyncio.to_thread(_configured_coa_scanner(settings).scan)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"entries", "review"}
+    }
+
+
+@router.get("/admin/coa/find")
+async def find_coa(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    query: str = Query(default="", max_length=500),
+    cas_number: str | None = Query(default=None, max_length=50),
+) -> dict[str, Any]:
+    if not query.strip() and not (cas_number or "").strip():
+        raise HTTPException(422, "Provide a product name/alias or CAS number")
+    if not settings.coa_catalog_path.exists():
+        raise HTTPException(409, "COA catalog has not been built")
+    return COACatalog(settings.coa_catalog_path).find(
+        query,
+        cas_number=cas_number,
+    ).as_dict()
+
+
+@router.get("/admin/coa/review")
+async def coa_catalog_review(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=200, ge=1, le=2_000),
+) -> dict[str, Any]:
+    if not settings.coa_catalog_path.exists():
+        raise HTTPException(409, "COA catalog has not been built")
+    catalog = COACatalog(settings.coa_catalog_path)
+    return {"count": len(catalog.review), "review": list(catalog.review[:limit])}
 
 
 @router.get("/admin/history/status")
@@ -2409,6 +2632,17 @@ def _suggested_handoff_reply(
             "Thank you for your interest in our products. We are reviewing which product range "
             "is most relevant to your business and will share the appropriate list."
         ),
+        "PRODUCT_LIST_REVIEW": (
+            "Thank you for your interest in our products. Please find our relevant product list "
+            "below."
+        ),
+        "QUOTE_REVIEW": (
+            "Thank you for your inquiry. Please find our quotation details below."
+        ),
+        "COA_REVIEW": (
+            "Thank you for your request. We are confirming the correct standard Certificate of "
+            "Analysis before replying."
+        ),
         "PERSONNEL_CHANGE": (
             "Thank you for the update. We are reviewing the contact information before making any "
             "changes to our records."
@@ -2798,6 +3032,34 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
     approved_outbox = await session.scalar(
         select(Outbox).where(Outbox.approval_handoff_id == handoff.id)
     )
+    agent_run = await session.scalar(
+        select(AgentRun).where(AgentRun.handoff_id == handoff.id)
+    )
+    assistance_requests: Sequence[AssistanceRequest] = []
+    agent_steps: Sequence[AgentStep] = []
+    if agent_run is not None:
+        assistance_requests = (
+            (
+                await session.execute(
+                    select(AssistanceRequest)
+                    .where(AssistanceRequest.run_id == agent_run.id)
+                    .order_by(AssistanceRequest.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        agent_steps = (
+            (
+                await session.execute(
+                    select(AgentStep)
+                    .where(AgentStep.run_id == agent_run.id)
+                    .order_by(AgentStep.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
     history_product = None
     if case is not None and case.product_id is not None:
         history_product = await session.get(Product, case.product_id)
@@ -2910,6 +3172,47 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
         "status": handoff.status,
         "dingtalk_status": handoff.dingtalk_status,
         "resolution_note": handoff.resolution_note,
+        "agent_run": (
+            {
+                "id": agent_run.id,
+                "status": agent_run.status.value,
+                "goal": agent_run.goal,
+                "current_step": agent_run.current_step,
+                "version": agent_run.version,
+                "last_error": agent_run.last_error,
+                "completed_at": (
+                    agent_run.completed_at.isoformat()
+                    if agent_run.completed_at
+                    else None
+                ),
+                "steps": [
+                    {
+                        "id": step.id,
+                        "sequence": step.sequence,
+                        "kind": step.kind,
+                        "status": step.status.value,
+                        "input": step.input_json,
+                        "output": step.output_json,
+                        "error": step.error,
+                        "started_at": (
+                            step.started_at.isoformat() if step.started_at else None
+                        ),
+                        "completed_at": (
+                            step.completed_at.isoformat()
+                            if step.completed_at
+                            else None
+                        ),
+                    }
+                    for step in agent_steps
+                ],
+            }
+            if agent_run is not None
+            else None
+        ),
+        "assistance_requests": [
+            assistance_request_payload(request)
+            for request in assistance_requests
+        ],
         "case": case_payload,
         "source_email": (
             {
@@ -2971,6 +3274,46 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
             if approved_outbox
             else None
         ),
+    }
+
+
+@router.post("/admin/assistance-requests/{request_id}/answer", status_code=202)
+async def answer_assistance_request(
+    request_id: int,
+    answer: AssistanceAnswer,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        if answer.category_id is not None:
+            result = await answer_product_category_assistance(
+                session,
+                request_id=request_id,
+                category_id=answer.category_id,
+                actor=admin,
+                note=answer.note,
+            )
+        elif answer.product_query is not None:
+            result = await answer_coa_lookup_assistance(
+                session,
+                request_id=request_id,
+                product_query=answer.product_query,
+                cas_number=answer.cas_number,
+                actor=admin,
+                note=answer.note,
+            )
+        else:
+            raise ValueError("answer requires category_id or product_query")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "assistance_request_id": result.request.id,
+        "assistance_status": result.request.status.value,
+        "agent_run_id": result.run.id,
+        "agent_run_status": result.run.status.value,
+        "run_version": result.run.version,
+        "resume_job_id": result.job.id if result.job is not None else None,
+        "newly_answered": result.newly_answered,
     }
 
 
@@ -3301,6 +3644,110 @@ async def send_handoff_reply_with_attachments(
     }
 
 
+@router.post("/admin/handoffs/{handoff_id}/approve-coa-draft", status_code=202)
+async def approve_prepared_coa_draft(
+    handoff_id: int,
+    request: PreparedCOAReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_coa_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-product-list-draft", status_code=202)
+async def approve_prepared_product_list_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_product_list_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-quote-draft", status_code=202)
+async def approve_prepared_quote_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_quote_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-multi-quote-draft", status_code=202)
+async def approve_prepared_multi_quote_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_multi_quote_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
 @router.post("/admin/handoffs/{handoff_id}")
 async def update_handoff(
     handoff_id: int,
@@ -3369,6 +3816,14 @@ async def update_handoff(
                 for row in pending:
                     row.status = DeliveryStatus.CANCELLED
                     row.last_error = f"cancelled by handoff action: {update.action}"
+    if update.action != "resume":
+        await finalize_handoff_agent_run(
+            session,
+            handoff_id=handoff.id,
+            actor=admin,
+            outcome=f"handoff-{update.action}",
+            cancelled=update.action in {"pause", "takeover", "reject"},
+        )
     session.add(
         AuditEvent(
             case_id=handoff.case_id,

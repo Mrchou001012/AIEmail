@@ -21,6 +21,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agent_runtime import (
+    COA_LOOKUP_REQUEST_TYPE,
+    ensure_handoff_agent_run,
+    finalize_handoff_agent_run,
+)
 from app.ai import (
     AIClient,
     CompanyCategoryDecision,
@@ -28,6 +33,7 @@ from app.ai import (
     InboundAnalysis,
     explicit_product_list_requested,
     extract_quantity_kg,
+    generic_product_list_requested,
     render_draft_preview,
     requested_product_list_file_format,
     stub_analyze,
@@ -40,6 +46,7 @@ from app.bounces import (
     classify_smtp_failure,
     has_permanent_failure_evidence,
 )
+from app.coa_catalog import COACatalog, COAFindStatus
 from app.commercial import (
     QuoteContext,
     QuoteContextStatus,
@@ -52,7 +59,13 @@ from app.commercial import (
     next_business_open,
 )
 from app.db import (
+    AgentRun,
+    AgentRunStatus,
+    AgentStep,
+    AgentStepStatus,
     AIInvocation,
+    AssistanceRequest,
+    AssistanceStatus,
     AuditEvent,
     CaseStage,
     CaseStatus,
@@ -671,6 +684,13 @@ async def resolve_deliverability_handoff(
         case.status = CaseStatus.PAUSED
     handoff.status = "RESOLVED"
     handoff.resolution_note = note.strip() or f"Recipient {recipient} marked permanently undeliverable"
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome="recipient-suppressed",
+        cancelled=True,
+    )
     await audit(
         session,
         "handoff.deliverability_recipient_suppressed",
@@ -1148,6 +1168,13 @@ async def replace_handoff_recipient(
     handoff.resolution_note = note.strip() or (
         f"Replaced undeliverable recipient {old_email} with {new_contact.email}"
     )
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome="recipient-replaced",
+        cancelled=True,
+    )
     await audit(
         session,
         "handoff.deliverability_recipient_replaced",
@@ -1262,6 +1289,7 @@ async def create_handoff(
     summary: str,
     facts: dict[str, Any] | None = None,
     source_email_id: int | None = None,
+    update_existing: bool = False,
 ) -> Handoff:
     created = False
     try:
@@ -1285,6 +1313,18 @@ async def create_handoff(
         expected_case_id = case.id if case else None
         if handoff.case_id != expected_case_id:
             raise RuntimeError(f"email {source_email_id} is already attached to a different case handoff") from exc
+        if update_existing:
+            if handoff.status != "OPEN":
+                raise ValueError("cannot update a resolved handoff") from exc
+            handoff.reason_code = reason.value
+            handoff.summary = summary
+            handoff.extracted_facts = facts or {}
+
+    # Every inbound handoff is a durable paused Agent task.  Only handoff
+    # types with a strict response schema receive typed assistance; all other
+    # high-risk cases remain waiting for normal human resolution.
+    if source_email_id is not None:
+        await ensure_handoff_agent_run(session, handoff=handoff)
 
     if created:
         if case and case.status == CaseStatus.ACTIVE:
@@ -1295,6 +1335,19 @@ async def create_handoff(
             case_id=case.id if case else None,
             actor="system",
             data={"handoff_id": handoff.id, "reason": reason.value, "source_email_id": source_email_id},
+        )
+        await session.commit()
+    elif update_existing:
+        await audit(
+            session,
+            "handoff.updated_for_resume",
+            case_id=case.id if case else None,
+            actor="agent-runtime",
+            data={
+                "handoff_id": handoff.id,
+                "reason": reason.value,
+                "source_email_id": source_email_id,
+            },
         )
         await session.commit()
     await enqueue_job(
@@ -1702,6 +1755,7 @@ async def queue_human_reply(
     note: str = "",
     resume_automation: bool = False,
     attachments: tuple[OutboundAttachment, ...] = (),
+    quote: Quote | None = None,
 ) -> Outbox:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None:
@@ -1750,7 +1804,8 @@ async def queue_human_reply(
         raise ValueError("subject must be a single non-empty line")
     if not clean_body:
         raise ValueError("reply body cannot be empty")
-    bundle = load_content(get_settings().content_dir)
+    settings = get_settings()
+    bundle = load_content(settings.content_dir)
     clean_body = _strip_duplicate_signature_lead(
         clean_body,
         bundle.signature_text,
@@ -1790,6 +1845,7 @@ async def queue_human_reply(
     now = datetime.now(UTC)
     outbox = Outbox(
         case_id=case.id,
+        quote_id=quote.id if quote is not None else None,
         message_kind="HUMAN_REPLY",
         business_key=business_key,
         message_id=message_id,
@@ -1822,6 +1878,12 @@ async def queue_human_reply(
     handoff.status = "RESOLVED"
     handoff.resolution_note = note.strip() or f"Reply approved by {actor}"
     case.status = CaseStatus.ACTIVE if resume_automation else CaseStatus.HUMAN_TAKEOVER
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome="human-reply",
+    )
     await audit(
         session,
         "handoff.reply_approved",
@@ -2160,6 +2222,12 @@ async def quote_with_manual_price(
     if outbox is None:
         raise ValueError("a quotation is already queued for this handoff")
     handoff.status = "RESOLVED"
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome="manual-quotation",
+    )
     priced_summary = "; ".join(
         (
             f"{product_by_id[product_id].code} {quantity} "
@@ -2486,6 +2554,13 @@ async def forward_handoff_email(
     handoff.resolution_note = (
         note.strip()
         or f"Forwarded by {actor} to {recipient} for human takeover"
+    )
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome="forwarded-to-salesperson",
+        cancelled=True,
     )
     if handoff.dingtalk_status != "SENT":
         handoff.dingtalk_status = "CANCELLED"
@@ -4451,6 +4526,13 @@ async def reconcile_permanent_bounce_handoffs(session: AsyncSession) -> int:
         handoff.resolution_note = (
             f"Automatically resolved: {recipient} has a permanent recipient/domain failure"
         )
+        await finalize_handoff_agent_run(
+            session,
+            handoff_id=handoff.id,
+            actor="bounce-reconciler",
+            outcome="permanent-bounce",
+            cancelled=True,
+        )
         if handoff.dingtalk_status != "SENT":
             handoff.dingtalk_status = "CANCELLED"
         notify_job = await session.scalar(
@@ -4845,7 +4927,8 @@ async def _maybe_send_quote_clarification(
         )
         return True
 
-    bundle = load_content(get_settings().content_dir)
+    settings = get_settings()
+    bundle = load_content(settings.content_dir)
     greeting = f"Dear {case.contact.name.strip() or 'Customer'},"
     if needs_multi_quantities:
         opening = "Thank you for your quotation request."
@@ -4941,6 +5024,28 @@ async def _maybe_send_quote_clarification(
             reason=HandoffReason.AI_FAILURE,
             summary=f"Product clarification rendering failed: {type(exc).__name__}",
             facts={**analysis_facts, "product_pending": True},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    if not settings.quote_auto_send_enabled:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.QUOTE_REVIEW,
+            summary="Quotation clarification draft prepared; human approval is required",
+            facts={
+                **analysis_facts,
+                "product_pending": case.product is None,
+                "ai_draft_preview": {
+                    "subject": f"Re: {email_row.subject}",
+                    "body_text": "\n".join(business_lines),
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "provider": "deterministic-quote-clarification",
+                    "model": "current-catalog-moq-v1",
+                    "rag_matches": [],
+                },
+            },
             source_email_id=email_row.id,
         )
         return True
@@ -5197,6 +5302,24 @@ async def _maybe_send_multi_product_quote(
         )
         return True
 
+    prepared_coas: list[dict[str, Any]] = []
+    if analysis.coa_requested:
+        try:
+            prepared_coas = _prepare_coa_attachments(
+                settings=settings,
+                product_codes=codes,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            await create_handoff(
+                session,
+                case=case,
+                reason=HandoffReason.COA_REVIEW,
+                summary=f"Multi-product quote is possible, but requested COAs need review: {exc}",
+                facts={**analysis_facts, "quote_ready": True, "product_codes": codes},
+                source_email_id=email_row.id,
+            )
+            return True
+
     bundle = load_content(settings.content_dir)
     try:
         plan = await AIClient().draft_plan(
@@ -5243,6 +5366,12 @@ async def _maybe_send_multi_product_quote(
         valid_until=valid_until,
         availability_note=availability_note,
     )
+    signature_text = bundle.signature_text.strip()
+    draft_body = (
+        text[: -len(signature_text)].rstrip()
+        if signature_text and text.endswith(signature_text)
+        else text.rstrip()
+    )
     try:
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
@@ -5271,6 +5400,72 @@ async def _maybe_send_multi_product_quote(
         .limit(1)
     )
     round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
+    if not settings.quote_auto_send_enabled:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.QUOTE_REVIEW,
+            summary="Multi-product quotation draft prepared; human approval is required",
+            facts={
+                **analysis_facts,
+                "prepared_multi_quote": {
+                    "product_codes": codes,
+                    "round_number": round_number,
+                    "currency": case.currency,
+                    "lines": [
+                        {
+                            "product_id": product.id,
+                            "product_code": product.code,
+                            "price_policy_id": policy.id,
+                            "price_policy_source_hash": policy.source_hash,
+                            "commercial_cycle_id": (
+                                context.cycle.id if context is not None else None
+                            ),
+                            "unit_price": str(unit_price),
+                            "quantity": quantity,
+                            "valid_until": row_valid_until.isoformat(),
+                        }
+                        for (
+                            product,
+                            policy,
+                            context,
+                            unit_price,
+                            quantity,
+                            row_valid_until,
+                        ) in quote_rows
+                    ],
+                    "prepared_coas": prepared_coas,
+                    "requires_manual_revalidation": True,
+                },
+                "ai_draft_preview": {
+                    "subject": f"Re: {email_row.subject}",
+                    "body_text": draft_body,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "provider": "deterministic-multi-quote",
+                    "model": "current-commercial-policy-v1",
+                    "rag_matches": [],
+                },
+            },
+            source_email_id=email_row.id,
+        )
+        return True
+
+    try:
+        coa_attachments = _read_prepared_coa_attachments(
+            settings=settings,
+            prepared_coas=prepared_coas,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary=f"Prepared multi-product COA changed or is unavailable: {exc}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
     created_quotes: list[Quote] = []
     for product, policy, context, unit_price, quantity, valid_until in quote_rows:
         quote = Quote(
@@ -5311,6 +5506,7 @@ async def _maybe_send_multi_product_quote(
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
         inline_images=source.inline_images,
+        attachments=coa_attachments,
     )
     if outbox is None:
         await session.rollback()
@@ -5675,6 +5871,848 @@ def _product_list_outbound_attachments(
     )
 
 
+def _coa_reply_draft(
+    *,
+    contact_name: str,
+    original_subject: str,
+    product_name: str,
+) -> tuple[str, str]:
+    subject = (
+        f"Re: {original_subject.strip()}"
+        if original_subject.strip() and not original_subject.strip().casefold().startswith("re:")
+        else (original_subject.strip() or f"COA for {product_name}")
+    )
+    greeting_name = contact_name.strip() or "Customer"
+    body = (
+        f"Dear {greeting_name},\n\n"
+        f"Please find attached the Certificate of Analysis (COA) for {product_name}."
+    )
+    return subject[:998], body
+
+
+def _prepare_coa_attachments(
+    *,
+    settings: Settings,
+    product_codes: list[str],
+) -> list[dict[str, Any]]:
+    if not settings.coa_catalog_enabled:
+        raise ValueError("approved COA catalog is disabled")
+    catalog = COACatalog(settings.coa_catalog_path)
+    prepared: list[dict[str, Any]] = []
+    for code in product_codes:
+        result = catalog.find(code)
+        if (
+            result.status is not COAFindStatus.FOUND
+            or len(result.matches) != 1
+            or not result.auto_send_eligible
+        ):
+            raise ValueError(f"no unique approved standard English COA for {code}")
+        entry = dict(result.matches[0])
+        relative_path = str(entry["path"])
+        prepared.append(
+            {
+                "product_code": code,
+                "path": relative_path,
+                "filename": relative_path.replace("\\", "/").rsplit("/", 1)[-1],
+                "sha256": str(entry["sha256"]),
+                "size": int(entry["size"]),
+                "match_basis": result.match_basis,
+            }
+        )
+    return prepared
+
+
+def _read_prepared_coa_attachments(
+    *,
+    settings: Settings,
+    prepared_coas: list[dict[str, Any]],
+) -> tuple[OutboundAttachment, ...]:
+    if not prepared_coas:
+        return ()
+    catalog = COACatalog(settings.coa_catalog_path)
+    attachments: list[OutboundAttachment] = []
+    for prepared in prepared_coas:
+        entry = catalog.entry_for_path(str(prepared.get("path") or ""))
+        if str(entry.get("sha256") or "") != str(prepared.get("sha256") or ""):
+            raise ValueError("prepared COA no longer matches the approved catalog")
+        attachments.append(
+            OutboundAttachment(
+                filename=str(prepared.get("filename") or "COA.pdf"),
+                content_type="application/pdf",
+                payload=catalog.read_verified_attachment(entry),
+            )
+        )
+    return tuple(attachments)
+
+
+async def _maybe_handle_coa_request(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+) -> bool:
+    """Resolve a COA request against the approved catalog or pause for review."""
+
+    if analysis.intent != Intent.COA_REQUEST:
+        return False
+    settings = get_settings()
+    explicit_query = (analysis.requested_product_name or analysis.product_code or "").strip()
+    query = explicit_query
+    if not query and case.product is not None:
+        query = (case.product.code or case.product.name).strip()
+    cas_number = (analysis.requested_cas_number or "").strip() or None
+    lookup_facts: dict[str, Any] = {
+        **analysis_facts,
+        "coa_query": query,
+        "coa_cas_number": cas_number,
+        "coa_catalog_path": str(settings.coa_catalog_path),
+    }
+    if not settings.coa_catalog_enabled:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary="COA request is waiting because the approved COA catalog is disabled",
+            facts=lookup_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    if not query and not cas_number:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary="Customer requested a COA but the product or CAS number is missing",
+            facts={**lookup_facts, "coa_help_needed": "product name, product code, or CAS number"},
+            source_email_id=email_row.id,
+        )
+        return True
+    try:
+        catalog = COACatalog(settings.coa_catalog_path)
+        result = catalog.find(query, cas_number=cas_number)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary="Approved COA catalog is unavailable and must be rebuilt",
+            facts={**lookup_facts, "coa_catalog_error": type(exc).__name__},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    result_facts = {**lookup_facts, "coa_lookup": result.as_dict()}
+    if (
+        result.status is not COAFindStatus.FOUND
+        or len(result.matches) != 1
+        or not result.auto_send_eligible
+    ):
+        reason = (
+            "COA match is ambiguous and requires human selection"
+            if result.status is COAFindStatus.AMBIGUOUS
+            else "No unique approved standard English COA was found"
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary=reason,
+            facts={
+                **result_facts,
+                "coa_help_needed": (
+                    "confirm the correct suffix-free standard English COA"
+                    if result.status is COAFindStatus.AMBIGUOUS
+                    else "provide or identify a suffix-free standard English COA"
+                ),
+            },
+            source_email_id=email_row.id,
+        )
+        return True
+
+    entry = dict(result.matches[0])
+    product_name = str(entry.get("product_code") or entry.get("product_name") or query)
+    subject, draft_body = _coa_reply_draft(
+        contact_name=case.contact.name,
+        original_subject=email_row.subject,
+        product_name=product_name,
+    )
+    relative_path = str(entry["path"])
+    prepared = {
+        "path": relative_path,
+        "filename": relative_path.replace("\\", "/").rsplit("/", 1)[-1],
+        "sha256": str(entry["sha256"]),
+        "size": int(entry["size"]),
+        "product_name": product_name,
+        "match_basis": result.match_basis,
+        "catalog_schema": catalog.schema_version,
+    }
+    draft_preview = {
+        "subject": subject,
+        "body_text": draft_body,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "provider": "deterministic-coa",
+        "model": catalog.schema_version,
+        "rag_matches": [],
+    }
+    prepared_facts = {
+        **result_facts,
+        "prepared_coa": prepared,
+        "ai_draft_preview": draft_preview,
+    }
+
+    if not settings.coa_auto_send_enabled:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary=f"COA draft prepared for {product_name}; human approval is required",
+            facts=prepared_facts,
+            source_email_id=email_row.id,
+            update_existing=True,
+        )
+        return True
+
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            product_confidence=analysis.product_confidence,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            product_known=True,
+        ),
+        intent_threshold=settings.intent_confidence_threshold,
+        product_threshold=settings.product_confidence_threshold,
+        numeric_threshold=settings.numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await create_handoff(
+            session,
+            case=case,
+            reason=send_decision.reason or HandoffReason.COA_REVIEW,
+            summary="COA was found, but current send policy requires human approval",
+            facts=prepared_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    try:
+        payload = catalog.read_verified_attachment(entry)
+    except (OSError, ValueError) as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary="Selected COA changed or became unavailable; rescan and review are required",
+            facts={**prepared_facts, "coa_attachment_error": type(exc).__name__},
+            source_email_id=email_row.id,
+        )
+        return True
+
+    bundle = load_content(settings.content_dir)
+    signed_text = "\n".join([draft_body, "", bundle.signature_text.strip()])
+    signed_html = "".join(
+        f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
+        for line in draft_body.splitlines()
+    ) + bundle.signature_html
+    source = _reply_source(email_row)
+    signed_text, signed_html = append_quoted_reply(
+        signed_text,
+        signed_html,
+        from_address=email_row.from_address,
+        source_body=source.body_text,
+        source_html=source.body_html,
+        occurred_at=email_row.received_at,
+    )
+    outbox = await stage_outbox(
+        session,
+        case=case,
+        message_kind="COA",
+        subject=subject,
+        text_body=signed_text,
+        html_body=signed_html,
+        business_key=f"inbound-coa:{email_row.id}",
+        in_reply_to=email_row.message_id,
+        references=_reply_references(email_row),
+        inline_images=source.inline_images,
+        attachments=(
+            OutboundAttachment(
+                filename=prepared["filename"],
+                content_type="application/pdf",
+                payload=payload,
+            ),
+        ),
+    )
+    if outbox is None:
+        await session.rollback()
+        return True
+    await audit(
+        session,
+        "inbound.coa_queued",
+        case_id=case.id,
+        actor="system",
+        data={
+            "email_id": email_row.id,
+            "outbox_id": outbox.id,
+            "coa_path": relative_path,
+            "coa_sha256": prepared["sha256"],
+            "match_basis": result.match_basis,
+        },
+    )
+    return True
+
+
+async def queue_prepared_coa_reply(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    subject: str,
+    body_text: str,
+    actor: str,
+    note: str = "",
+    resume_automation: bool = False,
+) -> Outbox:
+    """Approve a prepared COA draft while rechecking the exact NAS file hash."""
+
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    prepared = (handoff.extracted_facts or {}).get("prepared_coa")
+    if handoff.reason_code != HandoffReason.COA_REVIEW.value or not isinstance(prepared, dict):
+        raise ValueError("handoff has no prepared COA attachment")
+    settings = get_settings()
+    try:
+        catalog = COACatalog(settings.coa_catalog_path)
+        entry = catalog.entry_for_path(str(prepared.get("path") or ""))
+        if str(entry.get("sha256") or "") != str(prepared.get("sha256") or ""):
+            raise ValueError("prepared COA no longer matches the approved catalog")
+        payload = catalog.read_verified_attachment(entry)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("approved COA catalog or attachment is unavailable") from exc
+    return await queue_human_reply(
+        session,
+        handoff_id=handoff_id,
+        subject=subject,
+        body_text=body_text,
+        actor=actor,
+        note=note,
+        resume_automation=resume_automation,
+        attachments=(
+            OutboundAttachment(
+                filename=str(prepared.get("filename") or "COA.pdf"),
+                content_type="application/pdf",
+                payload=payload,
+            ),
+        ),
+    )
+
+
+async def queue_prepared_product_list_reply(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    subject: str,
+    body_text: str,
+    actor: str,
+    note: str = "",
+    resume_automation: bool = False,
+) -> Outbox:
+    """Approve a catalog draft after confirming its active product snapshot."""
+
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    prepared = (handoff.extracted_facts or {}).get("prepared_product_list")
+    if (
+        handoff.reason_code != HandoffReason.PRODUCT_LIST_REVIEW.value
+        or not isinstance(prepared, dict)
+    ):
+        raise ValueError("handoff has no prepared product-list draft")
+    if prepared.get("scope") == "all":
+        category = _all_products_catalog_category()
+        products = list(
+            (
+                await session.scalars(
+                    select(Product)
+                    .join(ProductCategory, Product.category_id == ProductCategory.id)
+                    .where(Product.active.is_(True), ProductCategory.active.is_(True))
+                    .order_by(ProductCategory.sort_order, Product.sort_order, Product.id)
+                )
+            ).all()
+        )
+    else:
+        category_id = int(prepared.get("category_id") or 0)
+        category = await session.get(ProductCategory, category_id)
+        if category is None or not category.active:
+            raise ValueError("prepared product category is missing or inactive")
+        products = list(
+            (
+                await session.scalars(
+                    select(Product)
+                    .where(
+                        Product.category_id == category.id,
+                        Product.active.is_(True),
+                    )
+                    .order_by(Product.sort_order, Product.id)
+                )
+            ).all()
+        )
+    expected_ids = [int(value) for value in prepared.get("product_ids") or []]
+    expected_codes = [str(value) for value in prepared.get("product_codes") or []]
+    if [product.id for product in products] != expected_ids or [
+        product.code for product in products
+    ] != expected_codes:
+        raise ValueError("active product list changed after draft creation; regenerate the draft")
+    file_format = prepared.get("file_format")
+    attachments: tuple[OutboundAttachment, ...] = ()
+    if file_format is not None:
+        if file_format not in {"xlsx", "csv"}:
+            raise ValueError("prepared product-list attachment format is invalid")
+        catalog_file = build_product_list_attachment(
+            category=category,
+            products=products,
+            file_format=file_format,
+        )
+        attachments = (
+            OutboundAttachment(
+                filename=catalog_file.filename,
+                content_type=catalog_file.content_type,
+                payload=catalog_file.payload,
+            ),
+        )
+    return await queue_human_reply(
+        session,
+        handoff_id=handoff_id,
+        subject=subject,
+        body_text=body_text,
+        actor=actor,
+        note=note,
+        resume_automation=resume_automation,
+        attachments=attachments,
+    )
+
+
+async def queue_prepared_quote_reply(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    subject: str,
+    body_text: str,
+    actor: str,
+    note: str = "",
+    resume_automation: bool = False,
+) -> Outbox:
+    """Approve a quote draft only while its price policy snapshot is current."""
+
+    existing = await session.scalar(
+        select(Outbox).where(Outbox.approval_handoff_id == handoff_id)
+    )
+    if existing is not None:
+        return existing
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise ValueError("handoff not found")
+    prepared = (handoff.extracted_facts or {}).get("prepared_quote")
+    if handoff.reason_code != HandoffReason.QUOTE_REVIEW.value or not isinstance(
+        prepared, dict
+    ):
+        raise ValueError("handoff has no prepared quotation draft")
+    if handoff.case_id is None:
+        raise ValueError("quotation draft is not associated with a case")
+    sales_case = await session.get(SalesCase, handoff.case_id)
+    policy = await session.get(PricePolicy, int(prepared.get("price_policy_id") or 0))
+    product_id = int(prepared.get("product_id") or 0)
+    if sales_case is None or sales_case.product_id != product_id:
+        raise ValueError("case product changed after quotation draft creation")
+    if (
+        policy is None
+        or not policy.active
+        or policy.product_id != product_id
+        or policy.currency != str(prepared.get("currency") or "")
+        or policy.source_hash != str(prepared.get("price_policy_source_hash") or "")
+    ):
+        raise ValueError("approved price policy changed after draft creation; regenerate the quote")
+    current_policy = await active_policy(session, product_id, policy.currency)
+    if current_policy is None or current_policy.id != policy.id:
+        raise ValueError("quotation no longer uses the current active price policy")
+    cycle_id = prepared.get("commercial_cycle_id")
+    if cycle_id is not None:
+        cycle = await session.get(CommercialDataCycle, int(cycle_id))
+        settings = get_settings()
+        if (
+            cycle is None
+            or cycle.price_status != "CONFIRMED"
+            or (not settings.quote_ignore_inventory and cycle.inventory_status != "CONFIRMED")
+            or policy.commercial_cycle_id != cycle.id
+        ):
+            raise ValueError("commercial price or inventory confirmation is no longer current")
+    expected_round = int(prepared.get("round_number") or 0)
+    latest_quote = await session.scalar(
+        select(Quote)
+        .where(Quote.case_id == sales_case.id)
+        .order_by(Quote.round_number.desc(), Quote.id.desc())
+        .limit(1)
+    )
+    actual_round = latest_quote.round_number + 1 if latest_quote is not None else 0
+    if actual_round != expected_round:
+        raise ValueError("quotation history changed after draft creation; regenerate the quote")
+    valid_until = date.fromisoformat(str(prepared.get("valid_until") or ""))
+    if valid_until < datetime.now(UTC).astimezone(
+        ZoneInfo(get_settings().business_timezone)
+    ).date():
+        raise ValueError("quotation draft has expired; regenerate it")
+    quantity = int(prepared.get("quantity") or 0)
+    current_price = initial_quote(_pricing_policy(policy), quantity)
+    if (
+        not current_price.approved
+        or current_price.unit_price is None
+        or current_price.unit_price != Decimal(str(prepared.get("unit_price")))
+        or str(prepared.get("incoterm") or "") != policy.standard_incoterm
+        or str(prepared.get("payment_term") or "") != policy.standard_payment_term
+    ):
+        raise ValueError("prepared quotation no longer matches current pricing rules")
+    prepared_coas = prepared.get("prepared_coas") or []
+    if not isinstance(prepared_coas, list):
+        raise ValueError("prepared quotation COA metadata is invalid")
+    try:
+        coa_attachments = _read_prepared_coa_attachments(
+            settings=get_settings(),
+            prepared_coas=[dict(item) for item in prepared_coas],
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("prepared quotation COA is unavailable") from exc
+    quote = Quote(
+        case_id=sales_case.id,
+        product_id=product_id,
+        price_policy_id=policy.id,
+        commercial_cycle_id=int(cycle_id) if cycle_id is not None else None,
+        round_number=expected_round,
+        unit_price=Decimal(str(prepared.get("unit_price"))),
+        currency=policy.currency,
+        quantity=quantity,
+        incoterm=str(prepared.get("incoterm") or ""),
+        payment_term=str(prepared.get("payment_term") or ""),
+        valid_until=valid_until,
+        pricing_snapshot=dict(prepared.get("pricing_snapshot") or {}),
+    )
+    session.add(quote)
+    await session.flush()
+    sales_case.negotiation_round = expected_round
+    if latest_quote is not None:
+        sales_case.stage = transition(sales_case.stage, CaseStage.NEGOTIATING)
+    return await queue_human_reply(
+        session,
+        handoff_id=handoff_id,
+        subject=subject,
+        body_text=body_text,
+        actor=actor,
+        note=note,
+        resume_automation=resume_automation,
+        attachments=coa_attachments,
+        quote=quote,
+    )
+
+
+async def queue_prepared_multi_quote_reply(
+    session: AsyncSession,
+    *,
+    handoff_id: int,
+    subject: str,
+    body_text: str,
+    actor: str,
+    note: str = "",
+    resume_automation: bool = False,
+) -> Outbox:
+    """Approve all lines of a multi-product quote atomically after revalidation."""
+
+    existing = await session.scalar(
+        select(Outbox).where(Outbox.approval_handoff_id == handoff_id)
+    )
+    if existing is not None:
+        return existing
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None or handoff.case_id is None:
+        raise ValueError("handoff or quotation case not found")
+    prepared = (handoff.extracted_facts or {}).get("prepared_multi_quote")
+    if handoff.reason_code != HandoffReason.QUOTE_REVIEW.value or not isinstance(
+        prepared, dict
+    ):
+        raise ValueError("handoff has no prepared multi-product quotation")
+    sales_case = await session.get(SalesCase, handoff.case_id)
+    if sales_case is None:
+        raise ValueError("quotation case not found")
+    expected_round = int(prepared.get("round_number") or 0)
+    latest_quote = await session.scalar(
+        select(Quote)
+        .where(Quote.case_id == sales_case.id)
+        .order_by(Quote.round_number.desc(), Quote.id.desc())
+        .limit(1)
+    )
+    actual_round = latest_quote.round_number + 1 if latest_quote is not None else 0
+    if actual_round != expected_round:
+        raise ValueError("quotation history changed after draft creation; regenerate the quote")
+    settings = get_settings()
+    prepared_lines = prepared.get("lines")
+    if not isinstance(prepared_lines, list) or len(prepared_lines) < 2:
+        raise ValueError("prepared multi-product quotation lines are invalid")
+    quote_rows: list[Quote] = []
+    seen_products: set[int] = set()
+    for raw_line in prepared_lines:
+        if not isinstance(raw_line, dict):
+            raise ValueError("prepared multi-product quotation line is invalid")
+        product_id = int(raw_line.get("product_id") or 0)
+        if product_id in seen_products:
+            raise ValueError("prepared quotation contains a duplicate product")
+        seen_products.add(product_id)
+        product = await session.get(Product, product_id)
+        policy = await session.get(PricePolicy, int(raw_line.get("price_policy_id") or 0))
+        if (
+            product is None
+            or not product.active
+            or policy is None
+            or not policy.active
+            or policy.product_id != product.id
+            or policy.currency != str(prepared.get("currency") or "")
+            or policy.source_hash != str(raw_line.get("price_policy_source_hash") or "")
+        ):
+            raise ValueError("a product or price policy changed after draft creation")
+        current_policy = await active_policy(session, product.id, policy.currency)
+        if current_policy is None or current_policy.id != policy.id:
+            raise ValueError("a quotation line no longer uses the current price policy")
+        cycle_id = raw_line.get("commercial_cycle_id")
+        if cycle_id is not None:
+            cycle = await session.get(CommercialDataCycle, int(cycle_id))
+            if (
+                cycle is None
+                or cycle.price_status != "CONFIRMED"
+                or (
+                    not settings.quote_ignore_inventory
+                    and cycle.inventory_status != "CONFIRMED"
+                )
+                or policy.commercial_cycle_id != cycle.id
+            ):
+                raise ValueError("commercial confirmation changed for a quotation line")
+        quantity = int(raw_line.get("quantity") or 0)
+        decision = initial_quote(_pricing_policy(policy), quantity)
+        if (
+            not decision.approved
+            or decision.unit_price is None
+            or decision.unit_price != Decimal(str(raw_line.get("unit_price")))
+        ):
+            raise ValueError("a prepared line no longer matches current pricing rules")
+        valid_until = date.fromisoformat(str(raw_line.get("valid_until") or ""))
+        if valid_until < datetime.now(UTC).astimezone(
+            ZoneInfo(settings.business_timezone)
+        ).date():
+            raise ValueError("multi-product quotation draft has expired")
+        quote_rows.append(
+            Quote(
+                case_id=sales_case.id,
+                product_id=product.id,
+                price_policy_id=policy.id,
+                commercial_cycle_id=int(cycle_id) if cycle_id is not None else None,
+                round_number=expected_round,
+                unit_price=decision.unit_price,
+                currency=policy.currency,
+                quantity=quantity,
+                incoterm=policy.standard_incoterm,
+                payment_term=policy.standard_payment_term,
+                valid_until=valid_until,
+                pricing_snapshot={
+                    "hard_minimum": str(decision.hard_minimum),
+                    "pricing_reason": decision.reason,
+                    "applied_markup_pct": str(decision.applied_markup_pct),
+                    "human_approved_multi_quote": True,
+                },
+            )
+        )
+    prepared_coas = prepared.get("prepared_coas") or []
+    if not isinstance(prepared_coas, list):
+        raise ValueError("prepared COA metadata is invalid")
+    coa_attachments = _read_prepared_coa_attachments(
+        settings=settings,
+        prepared_coas=[dict(item) for item in prepared_coas],
+    )
+    session.add_all(quote_rows)
+    await session.flush()
+    sales_case.negotiation_round = expected_round
+    if latest_quote is not None:
+        sales_case.stage = transition(sales_case.stage, CaseStage.NEGOTIATING)
+    return await queue_human_reply(
+        session,
+        handoff_id=handoff_id,
+        subject=subject,
+        body_text=body_text,
+        actor=actor,
+        note=note,
+        resume_automation=resume_automation,
+        attachments=coa_attachments,
+        quote=quote_rows[0],
+    )
+
+
+def _all_products_catalog_category() -> ProductCategory:
+    return ProductCategory(
+        key="all_products",
+        name="All Products",
+        name_zh=None,
+        active=True,
+        sort_order=0,
+    )
+
+
+async def _maybe_send_general_product_list(
+    session: AsyncSession,
+    *,
+    case: SalesCase,
+    email_row: EmailMessage,
+    analysis: InboundAnalysis,
+    analysis_facts: dict[str, Any],
+) -> bool:
+    """Prepare the dynamic company-wide English catalog for a generic request."""
+
+    request_text = f"{email_row.subject}\n{email_row.body_text}"
+    if not generic_product_list_requested(request_text):
+        return False
+    products = list(
+        (
+            await session.scalars(
+                select(Product)
+                .join(ProductCategory, Product.category_id == ProductCategory.id)
+                .where(Product.active.is_(True), ProductCategory.active.is_(True))
+                .order_by(ProductCategory.sort_order, Product.sort_order, Product.id)
+            )
+        ).all()
+    )
+    if not products:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.PRODUCT_LIST_REVIEW,
+            summary="Generic product-list request has no active approved catalog rows",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    settings = get_settings()
+    send_decision = evaluate_send_policy(
+        SendContext(
+            intent=analysis.intent,
+            stage=case.stage,
+            status=case.status,
+            intent_confidence=analysis.intent_confidence,
+            product_confidence=1.0,
+            numeric_confidence=1.0,
+            auto_send_allowed=case.customer.auto_send_allowed,
+            contact_suppressed=case.contact.suppressed,
+            do_not_contact=case.customer.do_not_contact,
+            has_risky_attachment=analysis.risky_attachment,
+            product_known=True,
+        ),
+        intent_threshold=settings.intent_confidence_threshold,
+        product_threshold=settings.product_confidence_threshold,
+        numeric_threshold=settings.numeric_confidence_threshold,
+    )
+    if not send_decision.allow_send:
+        await create_handoff(
+            session,
+            case=case,
+            reason=send_decision.reason or HandoffReason.PRODUCT_LIST_REVIEW,
+            summary="Generic product-list request requires human review",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    category = _all_products_catalog_category()
+    catalog_file = build_product_list_attachment(
+        category=category,
+        products=products,
+        file_format="xlsx",
+    )
+    contact_name = case.contact.name.strip() or "Customer"
+    draft_body = (
+        f"Dear {contact_name},\n\n"
+        "Please find attached our current English product catalogue. It includes the approved "
+        "product codes, product names, CAS numbers, and available content specifications.\n\n"
+        "Please let us know the products and quantities you require so we can confirm current "
+        "availability and pricing."
+    )
+    subject = f"Re: {email_row.subject}" if email_row.subject.strip() else "Lanya Chem product catalogue"
+    prepared = {
+        "scope": "all",
+        "category_id": None,
+        "category_key": "all_products",
+        "category_name": "All Products",
+        "product_ids": [product.id for product in products],
+        "product_codes": [product.code for product in products],
+        "file_format": "xlsx",
+        "attachment_filename": catalog_file.filename,
+    }
+    if not settings.product_list_auto_send_enabled:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.PRODUCT_LIST_REVIEW,
+            summary="Company-wide product catalog draft prepared; human approval is required",
+            facts={
+                **analysis_facts,
+                "prepared_product_list": prepared,
+                "ai_draft_preview": {
+                    "subject": subject,
+                    "body_text": draft_body,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "provider": "deterministic-product-list",
+                    "model": "active-full-product-catalog-v1",
+                    "rag_matches": [],
+                },
+            },
+            source_email_id=email_row.id,
+        )
+        return True
+    bundle = load_content(settings.content_dir)
+    signed_text = "\n".join([draft_body, "", bundle.signature_text.strip()])
+    signed_html = "".join(
+        f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
+        for line in draft_body.splitlines()
+    ) + bundle.signature_html
+    source = _reply_source(email_row)
+    signed_text, signed_html = append_quoted_reply(
+        signed_text,
+        signed_html,
+        from_address=email_row.from_address,
+        source_body=source.body_text,
+        source_html=source.body_html,
+        occurred_at=email_row.received_at,
+    )
+    outbox = await stage_outbox(
+        session,
+        case=case,
+        message_kind="PRODUCT_LIST",
+        subject=subject,
+        text_body=signed_text,
+        html_body=signed_html,
+        business_key=f"inbound-product-list:{email_row.id}:all",
+        in_reply_to=email_row.message_id,
+        references=_reply_references(email_row),
+        inline_images=source.inline_images,
+        attachments=(
+            OutboundAttachment(
+                filename=catalog_file.filename,
+                content_type=catalog_file.content_type,
+                payload=catalog_file.payload,
+            ),
+        ),
+    )
+    return outbox is not None
+
+
 async def _maybe_send_product_list(
     session: AsyncSession,
     *,
@@ -5793,7 +6831,8 @@ async def _maybe_send_product_list(
         )
         return True
 
-    bundle = load_content(get_settings().content_dir)
+    settings = get_settings()
+    bundle = load_content(settings.content_dir)
     try:
         attachments, attachment_filename = _product_list_outbound_attachments(
             category=category,
@@ -5808,6 +6847,12 @@ async def _maybe_send_product_list(
             signature_text=bundle.signature_text,
             signature_html=bundle.signature_html,
             attachment_filename=attachment_filename,
+        )
+        signature_text = bundle.signature_text.strip()
+        draft_body = (
+            text[: -len(signature_text)].rstrip()
+            if signature_text and text.endswith(signature_text)
+            else text.rstrip()
         )
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
@@ -5833,6 +6878,39 @@ async def _maybe_send_product_list(
         if email_row.subject.strip()
         else f"Our {category.name} product list"
     )
+    if not settings.product_list_auto_send_enabled:
+        file_format = requested_product_list_file_format(
+            f"{email_row.subject}\n{email_row.body_text}"
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.PRODUCT_LIST_REVIEW,
+            summary=f"Product-list draft prepared for {category.name}; human approval is required",
+            facts={
+                **analysis_facts,
+                "prepared_product_list": {
+                    "category_id": category.id,
+                    "category_key": category.key,
+                    "category_name": category.name,
+                    "product_ids": [product.id for product in products],
+                    "product_codes": [product.code for product in products],
+                    "file_format": file_format,
+                    "attachment_filename": attachment_filename,
+                },
+                "ai_draft_preview": {
+                    "subject": subject,
+                    "body_text": draft_body,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "provider": "deterministic-product-list",
+                    "model": "active-product-catalog-v1",
+                    "rag_matches": [],
+                },
+            },
+            source_email_id=email_row.id,
+            update_existing=True,
+        )
+        return True
     outbox = await stage_outbox(
         session,
         case=case,
@@ -6453,6 +7531,12 @@ async def backfill_product_list_requests(
             f"Automatically backfilled product list for {category.key}; "
             f"outbox_id={existing_product_list.id}"
         )
+        await finalize_handoff_agent_run(
+            session,
+            handoff_id=handoff.id,
+            actor="product-list-backfill",
+            outcome="product-list-backfilled",
+        )
         if handoff.dingtalk_status != "SENT":
             handoff.dingtalk_status = "CANCELLED"
         await audit(
@@ -6590,6 +7674,14 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
+    if await _maybe_handle_coa_request(
+        session,
+        case=case,
+        email_row=email_row,
+        analysis=analysis,
+        analysis_facts=analysis_facts,
+    ):
+        return
     multi_product_request = (
         len(
             [
@@ -6643,6 +7735,17 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             facts={**analysis_facts, "product_pending": True},
             source_email_id=email_row.id,
         )
+        return
+    if (
+        analysis.intent == Intent.PRODUCT_LIST_REQUEST
+        and await _maybe_send_general_product_list(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=analysis,
+            analysis_facts=analysis_facts,
+        )
+    ):
         return
     if case.product_id is None or case.product is None:
         if (
@@ -6890,6 +7993,23 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
             source_email_id=email_row.id,
         )
         return
+    prepared_coas: list[dict[str, Any]] = []
+    if analysis.coa_requested:
+        try:
+            prepared_coas = _prepare_coa_attachments(
+                settings=settings,
+                product_codes=[case.product.code],
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            await create_handoff(
+                session,
+                case=case,
+                reason=HandoffReason.COA_REVIEW,
+                summary=f"Quotation is possible, but the requested COA needs review: {exc}",
+                facts={**analysis_facts, "quote_ready": True},
+                source_email_id=email_row.id,
+            )
+            return
     valid_until = standard_quote_valid_until(settings)
     bundle = load_content(get_settings().content_dir)
     if not str(bundle.product_snippets.get(case.product.approved_text_key) or "").strip():
@@ -6947,6 +8067,12 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
                 else "Ready stock"
             ),
         )
+        signature_text = bundle.signature_text.strip()
+        draft_body = (
+            text[: -len(signature_text)].rstrip()
+            if signature_text and text.endswith(signature_text)
+            else text.rstrip()
+        )
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
             text,
@@ -6967,6 +8093,69 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         )
         return
     round_number = latest_quote.round_number + 1 if latest_quote is not None else 0
+    if not settings.quote_auto_send_enabled:
+        pricing_snapshot = {
+            "hard_minimum": str(price_decision.hard_minimum),
+            "pricing_reason": price_decision.reason,
+            "applied_markup_pct": str(price_decision.applied_markup_pct),
+            "requested_price": str(analysis.requested_unit_price),
+        }
+        commercial_cycle_id = (
+            commercial_context.cycle.id if commercial_context is not None else None
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.QUOTE_REVIEW,
+            summary=(
+                f"Quotation draft prepared for {case.product.code} at "
+                f"{policy_row.currency} {price_decision.unit_price}; human approval is required"
+            ),
+            facts={
+                **analysis_facts,
+                "prepared_quote": {
+                    "product_id": case.product.id,
+                    "product_code": case.product.code,
+                    "price_policy_id": policy_row.id,
+                    "price_policy_source_hash": policy_row.source_hash,
+                    "commercial_cycle_id": commercial_cycle_id,
+                    "round_number": round_number,
+                    "unit_price": str(price_decision.unit_price),
+                    "currency": policy_row.currency,
+                    "quantity": quantity,
+                    "incoterm": policy_row.standard_incoterm,
+                    "payment_term": policy_row.standard_payment_term,
+                    "valid_until": valid_until.isoformat(),
+                    "pricing_snapshot": pricing_snapshot,
+                    "prepared_coas": prepared_coas,
+                },
+                "ai_draft_preview": {
+                    "subject": f"Re: {email_row.subject}",
+                    "body_text": draft_body,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "provider": metadata["provider"],
+                    "model": metadata["model"],
+                    "rag_matches": historical_style_examples,
+                },
+            },
+            source_email_id=email_row.id,
+        )
+        return
+    try:
+        coa_attachments = _read_prepared_coa_attachments(
+            settings=settings,
+            prepared_coas=prepared_coas,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary=f"Prepared quotation COA changed or is unavailable: {exc}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return
     case.negotiation_round = round_number
     if latest_quote is not None:
         case.stage = transition(case.stage, CaseStage.NEGOTIATING)
@@ -7005,9 +8194,432 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
         inline_images=source.inline_images,
+        attachments=coa_attachments,
     )
     if outbox is None:
         await session.rollback()
+
+
+@_atomic_business_operation
+async def resume_agent_run(
+    session: AsyncSession,
+    *,
+    run_id: int,
+    expected_version: int,
+    assistance_request_id: int,
+) -> None:
+    """Continue a paused product-catalog task after typed human assistance."""
+
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.id == run_id).with_for_update()
+    )
+    if run is None:
+        return
+    if run.status == AgentRunStatus.COMPLETED:
+        return
+    if run.version != expected_version:
+        # A newer human answer/version supersedes this queued continuation.
+        return
+
+    request = await session.scalar(
+        select(AssistanceRequest).where(
+            AssistanceRequest.id == assistance_request_id,
+            AssistanceRequest.run_id == run.id,
+        )
+    )
+    handoff = await session.get(Handoff, run.handoff_id)
+    case = (
+        await session.scalar(
+            select(SalesCase)
+            .options(
+                selectinload(SalesCase.customer),
+                selectinload(SalesCase.contact),
+                selectinload(SalesCase.product),
+            )
+            .where(SalesCase.id == run.case_id)
+        )
+        if run.case_id is not None
+        else None
+    )
+    email_row = await session.get(EmailMessage, run.source_email_id)
+    now = datetime.now(UTC)
+
+    prior_step = await session.scalar(
+        select(AgentStep).where(
+            AgentStep.run_id == run.id,
+            AgentStep.idempotency_key == f"resume:{expected_version}",
+        )
+    )
+    if prior_step is None:
+        sequence = int(
+            await session.scalar(
+                select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run.id)
+            )
+            or 0
+        ) + 1
+        step = AgentStep(
+            run_id=run.id,
+            sequence=sequence,
+            kind="RESUME_EXECUTION",
+            idempotency_key=f"resume:{expected_version}",
+            status=AgentStepStatus.RUNNING,
+            input_json={
+                "assistance_request_id": assistance_request_id,
+                "run_version": expected_version,
+            },
+            started_at=now,
+        )
+        session.add(step)
+        await session.flush()
+    else:
+        step = prior_step
+        step.status = AgentStepStatus.RUNNING
+        step.error = None
+        step.started_at = step.started_at or now
+
+    async def block(reason: str) -> None:
+        run.status = AgentRunStatus.BLOCKED
+        run.current_step = "human_review"
+        run.last_error = reason[:2000]
+        step.status = AgentStepStatus.BLOCKED
+        step.error = reason[:2000]
+        step.completed_at = datetime.now(UTC)
+        if case is not None:
+            case.status = CaseStatus.WAITING_HUMAN
+        if handoff is not None:
+            handoff.status = "OPEN"
+            handoff.summary = reason
+        await audit(
+            session,
+            "agent.run_blocked",
+            case_id=run.case_id,
+            actor="agent-runtime",
+            data={
+                "agent_run_id": run.id,
+                "run_version": run.version,
+                "assistance_request_id": assistance_request_id,
+                "reason": reason,
+            },
+        )
+        await session.commit()
+
+    if (
+        request is None
+        or request.status != AssistanceStatus.ANSWERED
+        or not request.answer_json
+    ):
+        await block("Agent resume is missing an answered assistance request")
+        return
+    if handoff is None or handoff.status != "OPEN":
+        await block("The related human handoff is no longer open")
+        return
+    if email_row is None:
+        await block("The source email is unavailable")
+        return
+
+    if request.request_type == COA_LOOKUP_REQUEST_TYPE:
+        if case is None:
+            await block("The COA request is no longer associated with a customer case")
+            return
+        try:
+            analysis = InboundAnalysis.model_validate(handoff.extracted_facts)
+        except Exception:
+            await block("The stored COA request facts are invalid")
+            return
+        corrected_query = str(request.answer_json.get("product_query") or "").strip()
+        corrected_cas = str(request.answer_json.get("cas_number") or "").strip() or None
+        corrected_analysis = analysis.model_copy(
+            update={
+                "requested_product_name": corrected_query,
+                "requested_cas_number": corrected_cas,
+                "missing_fields": [
+                    field
+                    for field in analysis.missing_fields
+                    if field != "requested_product_name"
+                ],
+            }
+        )
+        run.status = AgentRunStatus.RUNNING
+        run.current_step = "recheck-coa-catalog"
+        run.last_error = None
+        case.status = CaseStatus.ACTIVE
+        resume_facts = {
+            **(handoff.extracted_facts or {}),
+            **corrected_analysis.model_dump(mode="json"),
+            "human_corrected_coa_lookup": {
+                "product_query": corrected_query,
+                "cas_number": corrected_cas,
+                "assistance_request_id": request.id,
+                "answered_by": request.answered_by,
+            },
+        }
+        handoff.extracted_facts = resume_facts
+        await _maybe_handle_coa_request(
+            session,
+            case=case,
+            email_row=email_row,
+            analysis=corrected_analysis,
+            analysis_facts=resume_facts,
+        )
+        prepared = (handoff.extracted_facts or {}).get("prepared_coa")
+        outbox = await session.scalar(
+            select(Outbox).where(
+                Outbox.business_key == f"inbound-coa:{email_row.id}",
+                Outbox.status != DeliveryStatus.CANCELLED,
+            )
+        )
+        completed_at = datetime.now(UTC)
+        if isinstance(prepared, dict):
+            request.status = AssistanceStatus.APPLIED
+            request.applied_at = completed_at
+            run.status = AgentRunStatus.WAITING_HUMAN
+            run.current_step = "approve-coa-draft"
+            run.last_error = None
+            run.context_json = {
+                **(run.context_json or {}),
+                "coa_path": prepared.get("path"),
+                "coa_sha256": prepared.get("sha256"),
+            }
+            step.status = AgentStepStatus.COMPLETED
+            step.output_json = {
+                "prepared_coa": {
+                    "path": prepared.get("path"),
+                    "sha256": prepared.get("sha256"),
+                },
+                "next_step": "human-draft-approval",
+            }
+            step.completed_at = completed_at
+            await audit(
+                session,
+                "agent.coa_draft_prepared_after_assistance",
+                case_id=case.id,
+                actor="agent-runtime",
+                data={
+                    "agent_run_id": run.id,
+                    "run_version": run.version,
+                    "assistance_request_id": request.id,
+                    "coa_path": prepared.get("path"),
+                    "coa_sha256": prepared.get("sha256"),
+                },
+            )
+            await session.commit()
+            return
+        if outbox is not None:
+            request.status = AssistanceStatus.APPLIED
+            request.applied_at = completed_at
+            handoff.status = "RESOLVED"
+            handoff.resolution_note = f"Agent resumed COA lookup; outbox_id={outbox.id}"
+            run.status = AgentRunStatus.COMPLETED
+            run.current_step = "completed"
+            run.completed_at = completed_at
+            step.status = AgentStepStatus.COMPLETED
+            step.output_json = {"outbox_id": outbox.id}
+            step.completed_at = completed_at
+            await session.commit()
+            return
+        await block("The corrected product or CAS still has no unique standard English COA")
+        return
+
+    category_id = int(request.answer_json.get("category_id") or 0)
+    category = await session.get(ProductCategory, category_id)
+    if category is None or not category.active:
+        await block("The selected product category is missing or inactive")
+        return
+
+    if case is None:
+        contact_id = int((handoff.extracted_facts or {}).get("contact_id") or 0)
+        contact = await session.scalar(
+            select(Contact)
+            .options(selectinload(Contact.customer))
+            .where(Contact.id == contact_id)
+        )
+        if (
+            contact is None
+            or email_row.from_address.casefold() != contact.email.casefold()
+        ):
+            await block("The source sender cannot be safely linked to one customer contact")
+            return
+        currency_rows = await session.execute(
+            select(SalesCase.currency).where(
+                SalesCase.customer_id == contact.customer_id,
+                SalesCase.status.not_in(
+                    [CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]
+                ),
+            )
+        )
+        currencies = set(currency_rows.scalars().all())
+        currency = next(iter(currencies)) if len(currencies) == 1 else "USD"
+        case = SalesCase(
+            customer_id=contact.customer_id,
+            contact_id=contact.id,
+            product_id=None,
+            category_id=category.id,
+            currency=currency,
+            stage=CaseStage.QUOTING,
+            status=CaseStatus.ACTIVE,
+            subject_key=normalized_subject(email_row.subject)[:255],
+        )
+        session.add(case)
+        await session.flush()
+        case.customer = contact.customer
+        case.contact = contact
+        case.product = None
+        email_row.case_id = case.id
+        email_row.customer_id = case.customer_id
+        email_row.contact_id = case.contact_id
+        handoff.case_id = case.id
+        run.case_id = case.id
+
+    try:
+        analysis = InboundAnalysis.model_validate(handoff.extracted_facts)
+        analysis_metadata = None
+    except Exception:
+        try:
+            analysis, analysis_metadata = await AIClient().analyze(
+                email_row.subject,
+                email_row.body_text,
+                email_row.attachment_metadata,
+            )
+        except Exception as exc:
+            await block(f"Inbound analysis failed while resuming: {type(exc).__name__}")
+            return
+        session.add(
+            AIInvocation(
+                case_id=case.id,
+                provider=analysis_metadata["provider"],
+                model=analysis_metadata["model"],
+                purpose="agent_resume_inbound_analysis",
+                request_hash=analysis_metadata["request_hash"],
+                parsed_output=analysis.model_dump(mode="json"),
+                success=True,
+                input_tokens=analysis_metadata.get("input_tokens"),
+                output_tokens=analysis_metadata.get("output_tokens"),
+            )
+        )
+    if analysis.intent != Intent.PRODUCT_LIST_REQUEST:
+        await block("The stored inbound intent is no longer a product-list request")
+        return
+
+    run.status = AgentRunStatus.RUNNING
+    run.current_step = "generate-product-list"
+    run.last_error = None
+    case.category_id = category.id
+    case.category = category
+    case.status = CaseStatus.ACTIVE
+    resume_facts = {
+        **(handoff.extracted_facts or {}),
+        **analysis.model_dump(mode="json"),
+        "human_selected_category": {
+            "category_id": category.id,
+            "category_key": category.key,
+            "category_name": category.name,
+            "assistance_request_id": request.id,
+            "answered_by": request.answered_by,
+        },
+    }
+    handoff.extracted_facts = resume_facts
+
+    await _maybe_send_product_list(
+        session,
+        case=case,
+        email_row=email_row,
+        analysis=analysis,
+        analysis_facts=resume_facts,
+    )
+    outbox = await session.scalar(
+        select(Outbox).where(
+            Outbox.business_key == f"inbound-product-list:{email_row.id}",
+            Outbox.status != DeliveryStatus.CANCELLED,
+        )
+    )
+    prepared_product_list = (handoff.extracted_facts or {}).get(
+        "prepared_product_list"
+    )
+    if isinstance(prepared_product_list, dict):
+        completed_at = datetime.now(UTC)
+        request.status = AssistanceStatus.APPLIED
+        request.applied_at = completed_at
+        run.status = AgentRunStatus.WAITING_HUMAN
+        run.current_step = "approve-product-list-draft"
+        run.last_error = None
+        run.context_json = {
+            **(run.context_json or {}),
+            "category_id": category.id,
+            "category_key": category.key,
+            "prepared_product_ids": prepared_product_list.get("product_ids") or [],
+        }
+        step.status = AgentStepStatus.COMPLETED
+        step.output_json = {
+            "category_id": category.id,
+            "category_key": category.key,
+            "next_step": "human-draft-approval",
+        }
+        step.completed_at = completed_at
+        await audit(
+            session,
+            "agent.product_list_draft_prepared_after_assistance",
+            case_id=case.id,
+            actor="agent-runtime",
+            data={
+                "agent_run_id": run.id,
+                "run_version": run.version,
+                "assistance_request_id": request.id,
+                "category_id": category.id,
+                "category_key": category.key,
+                "product_count": len(prepared_product_list.get("product_ids") or []),
+            },
+        )
+        await session.commit()
+        return
+    if outbox is None:
+        await block(
+            "The category was applied, but current safety policy still requires human review"
+        )
+        return
+
+    completed_at = datetime.now(UTC)
+    request.status = AssistanceStatus.APPLIED
+    request.applied_at = completed_at
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = (
+        f"Agent resumed after {request.answered_by or 'human'} selected "
+        f"{category.name}; outbox_id={outbox.id}"
+    )
+    if handoff.dingtalk_status != "SENT":
+        handoff.dingtalk_status = "CANCELLED"
+    run.status = AgentRunStatus.COMPLETED
+    run.current_step = "completed"
+    run.last_error = None
+    run.completed_at = completed_at
+    run.context_json = {
+        **(run.context_json or {}),
+        "category_id": category.id,
+        "category_key": category.key,
+        "outbox_id": outbox.id,
+    }
+    step.status = AgentStepStatus.COMPLETED
+    step.output_json = {
+        "category_id": category.id,
+        "category_key": category.key,
+        "outbox_id": outbox.id,
+        "outbox_status": outbox.status.value,
+    }
+    step.completed_at = completed_at
+    await audit(
+        session,
+        "agent.run_completed",
+        case_id=case.id,
+        actor="agent-runtime",
+        data={
+            "agent_run_id": run.id,
+            "run_version": run.version,
+            "assistance_request_id": request.id,
+            "category_id": category.id,
+            "category_key": category.key,
+            "outbox_id": outbox.id,
+        },
+    )
+    await session.commit()
 
 
 async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
@@ -7598,6 +9210,12 @@ JOB_HANDLERS = {
     "demo_outreach": lambda session, payload: create_demo_outreach(session, payload),
     "case_outreach": lambda session, payload: create_case_outreach(session, payload),
     "process_inbound": lambda session, payload: process_inbound(session, int(payload["email_id"])),
+    "resume_agent_run": lambda session, payload: resume_agent_run(
+        session,
+        run_id=int(payload["run_id"]),
+        expected_version=int(payload["run_version"]),
+        assistance_request_id=int(payload["assistance_request_id"]),
+    ),
     "notify_handoff": lambda session, payload: notify_handoff(session, int(payload["handoff_id"])),
     "notify_commercial_refresh": lambda session, payload: notify_commercial_refresh(
         session, int(payload["cycle_id"])

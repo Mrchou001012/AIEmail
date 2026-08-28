@@ -41,6 +41,7 @@ from app.services import (
     enqueue_job,
     ingest_raw_email,
     process_inbound,
+    queue_prepared_quote_reply,
     quote_with_manual_price,
     seed_demo_data,
     send_one_outbox,
@@ -214,6 +215,87 @@ async def test_quote_missing_quantity_asks_then_quotes(db_session: AsyncSession)
     assert "WIDGET-100" in quote_outbox.raw_message or "Industrial Widget 100" in quote_outbox.raw_message
 
 
+async def test_quote_review_approval_is_revalidated_and_idempotent(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "quote_auto_send_enabled", False)
+    case = await _seed_case(db_session)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        suffix="quote-review-approval",
+    )
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    assert handoff.reason_code == HandoffReason.QUOTE_REVIEW.value
+    preview = handoff.extracted_facts["ai_draft_preview"]
+    outbox = await queue_prepared_quote_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject=preview["subject"],
+        body_text=preview["body_text"],
+        actor="reviewer",
+        note="Current price verified",
+    )
+    repeated = await queue_prepared_quote_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject=preview["subject"],
+        body_text=preview["body_text"],
+        actor="reviewer",
+    )
+    assert repeated.id == outbox.id
+    assert outbox.quote_id is not None
+    assert outbox.approval_handoff_id == handoff.id
+    assert outbox.human_approved_by == "reviewer"
+
+
+async def test_quote_review_rejects_changed_price_source(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "quote_auto_send_enabled", False)
+    case = await _seed_case(db_session)
+    email_row = await _add_inbound(
+        db_session,
+        case,
+        "PRODUCT WIDGET-100 Please quote 100 kg.",
+        suffix="quote-review-stale-source",
+    )
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    prepared = handoff.extracted_facts["prepared_quote"]
+    policy = await db_session.get(PricePolicy, prepared["price_policy_id"])
+    assert policy is not None
+    policy.source_hash = "changed-after-draft"
+    await db_session.commit()
+    preview = handoff.extracted_facts["ai_draft_preview"]
+
+    with pytest.raises(ValueError, match="price policy changed"):
+        await queue_prepared_quote_reply(
+            db_session,
+            handoff_id=handoff.id,
+            subject=preview["subject"],
+            body_text=preview["body_text"],
+            actor="reviewer",
+        )
+    assert await db_session.scalar(
+        select(func.count()).select_from(Outbox).where(
+            Outbox.approval_handoff_id == handoff.id
+        )
+    ) == 0
+
+
 async def test_quote_ignore_inventory_quotes_out_of_stock_product(
     db_session: AsyncSession,
     monkeypatch,
@@ -227,6 +309,7 @@ async def test_quote_ignore_inventory_quotes_out_of_stock_product(
         business_timezone="Asia/Kolkata",
         commercial_open_hour=0,
         quote_ignore_inventory=True,
+        quote_auto_send_enabled=True,
     )
     monkeypatch.setattr("app.services.get_settings", lambda: settings)
     cycle = await get_or_create_current_cycle(db_session, settings)

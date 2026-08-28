@@ -19,6 +19,8 @@ from app.ai import (
     explicit_product_list_requested,
     extract_company_research_evidence,
     extract_quantity_kg,
+    generic_product_list_requested,
+    latest_reply_text,
     render_draft_preview,
     stub_analyze,
     validate_draft_preview,
@@ -29,6 +31,87 @@ from app.imports import load_content
 from app.mail import build_message, parse_mime
 from app.services import _company_research_gate, render_quote
 from app.settings import Settings
+
+
+def test_private_email_case_quote_coa_and_packing_are_all_preserved() -> None:
+    result = stub_analyze(
+        "Re: Checking in",
+        "Please quote for 3 MT of HMDS with current COA and packing details.",
+        [],
+    )
+
+    assert result.intent is Intent.QUOTE_REQUEST
+    assert result.quote_requested is True
+    assert result.coa_requested is True
+    assert result.packaging_requested is True
+    assert result.product_code == "YAC-HMDS"
+    assert result.quantity == 3000
+
+
+def test_private_email_case_multi_quote_keeps_per_product_quantities_and_coa() -> None:
+    result = stub_analyze(
+        "Re: Checking in",
+        "Please offer rates.\nTMCS 2 ton\nHMDS 3 ton\nPlease share your typical COA too.",
+        [],
+    )
+
+    assert result.intent is Intent.QUOTE_REQUEST
+    assert result.coa_requested is True
+    assert [line.model_dump() for line in result.product_requests] == [
+        {"product_code": "YAC-TMCS", "quantity": 2000},
+        {"product_code": "YAC-HMDS", "quantity": 3000},
+    ]
+    assert result.requested_product_name is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Kindly send your product list",
+        "Please share product list?",
+        "Please share your product catalogue.",
+        "Please send your latest catalogue.",
+        "Please share your products with CAS# in an Excel sheet.",
+        "Share the product details which you have with price for 1 MT each.",
+    ],
+)
+def test_private_email_case_general_catalog_requests_are_detected(body: str) -> None:
+    result = stub_analyze("Re: Checking in", body, [])
+
+    assert result.intent is Intent.PRODUCT_LIST_REQUEST
+    assert generic_product_list_requested(body) is True
+    assert result.product_code is None
+
+
+def test_private_email_case_scoped_solvent_list_is_not_replaced_by_full_catalog() -> None:
+    body = "Kindly share list of solvents available for tanker load."
+    result = stub_analyze("Re: Checking in", body, [])
+
+    assert result.intent is Intent.PRODUCT_LIST_REQUEST
+    assert generic_product_list_requested(body) is False
+
+
+def test_private_email_case_unknown_trade_name_routes_to_quote_clarification() -> None:
+    result = stub_analyze("Re: Checking in", "Kindly share the price of LT 560 silane.", [])
+
+    assert result.intent is Intent.QUOTE_REQUEST
+    assert result.product_code is None
+    assert {"product_code", "quantity"}.issubset(result.missing_fields)
+
+
+def test_latest_reply_text_excludes_outlook_quoted_history() -> None:
+    body = (
+        "Please share your product catalogue.\n\n"
+        "From: sales@example.com\n"
+        "Sent: Tuesday, August 4, 2026\n"
+        "Subject: Checking in\n\n"
+        "Please send product and quantity so we can confirm price."
+    )
+
+    assert latest_reply_text(body) == "Please share your product catalogue."
+    result = stub_analyze("Re: Checking in", body, [])
+    assert result.product_list_requested is True
+    assert result.quote_requested is False
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,8 @@ from app.api import dashboard_data
 from app.auto_replies import AutomatedReplyType
 from app.bounces import BounceType
 from app.db import (
+    AgentRun,
+    AgentRunStatus,
     AuditEvent,
     CaseStage,
     CaseStatus,
@@ -402,6 +404,12 @@ async def test_recovered_processing_does_not_duplicate_handoff(db_session: Async
     await process_inbound(db_session, email_row.id)
 
     assert duplicate.id == original.id
+    agent_run = await db_session.scalar(
+        select(AgentRun).where(AgentRun.handoff_id == original.id)
+    )
+    assert agent_run is not None
+    assert agent_run.status == AgentRunStatus.WAITING_HUMAN
+    assert agent_run.current_step == "human_review"
     assert await db_session.scalar(
         select(func.count()).select_from(Handoff).where(Handoff.source_email_id == email_row.id)
     ) == 1

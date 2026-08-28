@@ -11,6 +11,7 @@ MONEY_QUANTUM = Decimal("0.0001")
 class Intent(StrEnum):
     QUOTE_REQUEST = "quote_request"
     PRODUCT_LIST_REQUEST = "product_list_request"
+    COA_REQUEST = "coa_request"
     COUNTEROFFER = "counteroffer"
     SAMPLE_REQUEST = "sample_request"
     ORDER = "order"
@@ -46,6 +47,9 @@ class HandoffReason(StrEnum):
     NEW_INQUIRY_REVIEW = "NEW_INQUIRY_REVIEW"
     INVENTORY_UNAVAILABLE = "INVENTORY_UNAVAILABLE"
     PRODUCT_CATEGORY_REVIEW = "PRODUCT_CATEGORY_REVIEW"
+    PRODUCT_LIST_REVIEW = "PRODUCT_LIST_REVIEW"
+    QUOTE_REVIEW = "QUOTE_REVIEW"
+    COA_REVIEW = "COA_REVIEW"
 
 
 @dataclass(frozen=True)

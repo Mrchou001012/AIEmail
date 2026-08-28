@@ -37,7 +37,14 @@ async def db_session(tmp_path) -> AsyncIterator[AsyncSession]:
         raise RuntimeError("refusing to clean a database whose name does not end with _test")
 
     original_runtime_dir = settings.runtime_dir
+    original_product_list_auto_send = settings.product_list_auto_send_enabled
+    original_quote_auto_send = settings.quote_auto_send_enabled
     settings.runtime_dir = tmp_path / "runtime"
+    # The historical integration suite exercises autonomous business paths.
+    # Production defaults remain review-first; new review-gate tests explicitly
+    # set these switches back to False inside the individual scenario.
+    settings.product_list_auto_send_enabled = True
+    settings.quote_auto_send_enabled = True
     settings.ensure_runtime()
     await _truncate_test_database()
     try:
@@ -47,3 +54,5 @@ async def db_session(tmp_path) -> AsyncIterator[AsyncSession]:
         await _truncate_test_database()
         await engine.dispose()
         settings.runtime_dir = original_runtime_dir
+        settings.product_list_auto_send_enabled = original_product_list_auto_send
+        settings.quote_auto_send_enabled = original_quote_auto_send

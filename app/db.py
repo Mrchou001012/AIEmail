@@ -74,6 +74,32 @@ class JobStatus(str, enum.Enum):
     FAILED = "FAILED"
 
 
+class AgentRunStatus(str, enum.Enum):
+    WAITING_HUMAN = "WAITING_HUMAN"
+    RESUME_QUEUED = "RESUME_QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+
+
+class AgentStepStatus(str, enum.Enum):
+    WAITING = "WAITING"
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AssistanceStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    ANSWERED = "ANSWERED"
+    APPLIED = "APPLIED"
+    CANCELLED = "CANCELLED"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(
@@ -396,6 +422,100 @@ class Handoff(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), default="OPEN")
     dingtalk_status: Mapped[str] = mapped_column(String(32), default="PENDING")
     resolution_note: Mapped[str | None] = mapped_column(Text)
+
+
+class AgentRun(Base, TimestampMixin):
+    """Durable execution state for an inbound task that can pause and resume."""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        UniqueConstraint("source_email_id", name="uq_agent_runs_source_email"),
+        UniqueConstraint("handoff_id", name="uq_agent_runs_handoff"),
+        CheckConstraint("version >= 1", name="ck_agent_runs_version_positive"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    case_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cases.id", ondelete="SET NULL"), index=True
+    )
+    source_email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE")
+    )
+    handoff_id: Mapped[int] = mapped_column(
+        ForeignKey("handoffs.id", ondelete="CASCADE")
+    )
+    run_kind: Mapped[str] = mapped_column(String(64), default="INBOUND_EMAIL")
+    goal: Mapped[str] = mapped_column(Text)
+    status: Mapped[AgentRunStatus] = mapped_column(
+        Enum(AgentRunStatus, native_enum=False, length=32),
+        default=AgentRunStatus.WAITING_HUMAN,
+        index=True,
+    )
+    context_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    current_step: Mapped[str | None] = mapped_column(String(128))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentStep(Base):
+    """Append-only-ish trace of decisions, tool calls, waits, and resumptions."""
+
+    __tablename__ = "agent_steps"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_steps_run_sequence"),
+        UniqueConstraint("run_id", "idempotency_key", name="uq_agent_steps_run_key"),
+        CheckConstraint("sequence >= 1", name="ck_agent_steps_sequence_positive"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255))
+    status: Mapped[AgentStepStatus] = mapped_column(
+        Enum(AgentStepStatus, native_enum=False, length=32),
+        default=AgentStepStatus.WAITING,
+        index=True,
+    )
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class AssistanceRequest(Base, TimestampMixin):
+    """A typed question whose answer is consumed by a later AgentRun version."""
+
+    __tablename__ = "assistance_requests"
+    __table_args__ = (
+        UniqueConstraint("run_id", "request_key", name="uq_assistance_run_key"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True
+    )
+    handoff_id: Mapped[int] = mapped_column(
+        ForeignKey("handoffs.id", ondelete="CASCADE"), index=True
+    )
+    request_key: Mapped[str] = mapped_column(String(128))
+    request_type: Mapped[str] = mapped_column(String(64), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    response_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    options_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    status: Mapped[AssistanceStatus] = mapped_column(
+        Enum(AssistanceStatus, native_enum=False, length=32),
+        default=AssistanceStatus.OPEN,
+        index=True,
+    )
+    answer_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    answered_by: Mapped[str | None] = mapped_column(String(128))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Job(Base):

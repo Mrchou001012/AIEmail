@@ -34,6 +34,7 @@ postgres_data/
 *.sqlite3
 
 # Customer/business data is local by default. Keep only committed demo fixtures.
+email-case/
 *.eml
 !assets/demo_counteroffer.eml
 !assets/demo_sample_request.eml
@@ -45,5 +46,6 @@ postgres_data/
 !assets/import_templates/price_list_template.xlsx
 
 # Other local tooling
+AGENTS.md
 node_modules/
 .DS_Store

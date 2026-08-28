@@ -48,6 +48,19 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-locally}
       RUNTIME_DIR: /app/runtime
       CONTENT_DIR: /app/config/content
+      NAS_KNOWLEDGE_ROOT: /mnt/lanyachem
+      NAS_KNOWLEDGE_POLICY_PATH: /app/config/nas_knowledge_policy.yaml
+      NAS_KNOWLEDGE_OUTPUT_DIR: /app/runtime/nas_knowledge
+      COA_CATALOG_ENABLED: ${COA_CATALOG_ENABLED:-false}
+      COA_CATALOG_ROOT: /mnt/lanyachem/!PRODUCT DATA/!PRODUCT DOCS
+      COA_CATALOG_PATH: /app/runtime/coa_catalog/catalog.json
+      COA_PRODUCT_CATALOG_PATH: /app/config/product_catalog.yaml
+      COA_CATALOG_POLL_SECONDS: ${COA_CATALOG_POLL_SECONDS:-300}
+      COA_CATALOG_MAX_FILE_MB: ${COA_CATALOG_MAX_FILE_MB:-50}
+      COA_CATALOG_FILE_TIMEOUT_SECONDS: ${COA_CATALOG_FILE_TIMEOUT_SECONDS:-15}
+      COA_AUTO_SEND_ENABLED: ${COA_AUTO_SEND_ENABLED:-false}
+      PRODUCT_LIST_AUTO_SEND_ENABLED: ${PRODUCT_LIST_AUTO_SEND_ENABLED:-false}
+      QUOTE_AUTO_SEND_ENABLED: ${QUOTE_AUTO_SEND_ENABLED:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -66,6 +79,10 @@ services:
         source: ${ASSETS_HOST_DIR:-./assets}
         target: /app/assets
       - ./config:/app/config:ro
+      - type: bind
+        source: ${NAS_KNOWLEDGE_HOST_DIR:-./runtime/nas_mount}
+        target: /mnt/lanyachem
+        read_only: true
 
   worker:
     build: .
@@ -89,6 +106,19 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-locally}
       RUNTIME_DIR: /app/runtime
       CONTENT_DIR: /app/config/content
+      NAS_KNOWLEDGE_ROOT: /mnt/lanyachem
+      NAS_KNOWLEDGE_POLICY_PATH: /app/config/nas_knowledge_policy.yaml
+      NAS_KNOWLEDGE_OUTPUT_DIR: /app/runtime/nas_knowledge
+      COA_CATALOG_ENABLED: ${COA_CATALOG_ENABLED:-false}
+      COA_CATALOG_ROOT: /mnt/lanyachem/!PRODUCT DATA/!PRODUCT DOCS
+      COA_CATALOG_PATH: /app/runtime/coa_catalog/catalog.json
+      COA_PRODUCT_CATALOG_PATH: /app/config/product_catalog.yaml
+      COA_CATALOG_POLL_SECONDS: ${COA_CATALOG_POLL_SECONDS:-300}
+      COA_CATALOG_MAX_FILE_MB: ${COA_CATALOG_MAX_FILE_MB:-50}
+      COA_CATALOG_FILE_TIMEOUT_SECONDS: ${COA_CATALOG_FILE_TIMEOUT_SECONDS:-15}
+      COA_AUTO_SEND_ENABLED: ${COA_AUTO_SEND_ENABLED:-false}
+      PRODUCT_LIST_AUTO_SEND_ENABLED: ${PRODUCT_LIST_AUTO_SEND_ENABLED:-false}
+      QUOTE_AUTO_SEND_ENABLED: ${QUOTE_AUTO_SEND_ENABLED:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -99,6 +129,10 @@ services:
         source: ${RUNTIME_HOST_DIR:-./runtime}
         target: /app/runtime
       - ./config:/app/config:ro
+      - type: bind
+        source: ${NAS_KNOWLEDGE_HOST_DIR:-./runtime/nas_mount}
+        target: /mnt/lanyachem
+        read_only: true
 
   imap:
     build: .

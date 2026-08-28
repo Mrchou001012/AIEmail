@@ -24,3 +24,11 @@ def test_company_research_defaults_to_disabled_observation_mode() -> None:
     assert settings.company_research_auto_send_enabled is False
     assert settings.company_research_cache_days == 90
     assert settings.company_research_max_searches == 2
+
+
+def test_customer_reply_workflows_default_to_review_only() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.coa_auto_send_enabled is False
+    assert settings.product_list_auto_send_enabled is False
+    assert settings.quote_auto_send_enabled is False

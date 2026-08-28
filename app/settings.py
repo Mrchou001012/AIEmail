@@ -22,6 +22,32 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
     rag_min_similarity: float = 0.25
 
+    # Local NAS knowledge base. Customer retrieval is deny-by-default and only
+    # sees documents classified as customer_ready by the policy/approval flow.
+    nas_knowledge_enabled: bool = False
+    nas_knowledge_root: Path = Path(r"\\DS1821plus\LANYACHEM")
+    nas_knowledge_policy_path: Path = Path("config/nas_knowledge_policy.yaml")
+    nas_knowledge_output_dir: Path = Path("runtime/nas_knowledge")
+    nas_knowledge_poll_seconds: int = 300
+    nas_knowledge_max_file_mb: int = 50
+    nas_knowledge_file_timeout_seconds: int = 5
+
+    # Deny-by-default catalog of one standard English COA per product. This is
+    # intentionally separate from broad NAS knowledge retrieval because a COA
+    # is an attachment-selection workflow, not a free-form RAG answer.
+    coa_catalog_enabled: bool = False
+    coa_catalog_root: Path = Path(
+        r"\\DS1821plus\LANYACHEM\!PRODUCT DATA\!PRODUCT DOCS"
+    )
+    coa_catalog_path: Path = Path("runtime/coa_catalog/catalog.json")
+    coa_product_catalog_path: Path = Path("config/product_catalog.yaml")
+    coa_catalog_poll_seconds: int = 300
+    coa_catalog_max_file_mb: int = 50
+    coa_catalog_file_timeout_seconds: int = 15
+    coa_auto_send_enabled: bool = False
+    product_list_auto_send_enabled: bool = False
+    quote_auto_send_enabled: bool = False
+
     # Optional, bounded web research used only when a known customer explicitly
     # requests a product list and neither CRM nor imported Excel data identifies
     # one catalog category.  Research and autonomous use are separate switches
@@ -241,6 +267,12 @@ class Settings(BaseSettings):
         "reactivation_default_inactive_days",
         "reactivation_default_second_days",
         "company_research_cache_days",
+        "nas_knowledge_poll_seconds",
+        "nas_knowledge_max_file_mb",
+        "nas_knowledge_file_timeout_seconds",
+        "coa_catalog_poll_seconds",
+        "coa_catalog_max_file_mb",
+        "coa_catalog_file_timeout_seconds",
     )
     @classmethod
     def positive_limit(cls, value: int) -> int:
@@ -259,6 +291,8 @@ class Settings(BaseSettings):
         (self.runtime_dir / "demo_outbox").mkdir(parents=True, exist_ok=True)
         (self.runtime_dir / "inbound_archive").mkdir(parents=True, exist_ok=True)
         (self.runtime_dir / "mail_archive").mkdir(parents=True, exist_ok=True)
+        self.nas_knowledge_output_dir.mkdir(parents=True, exist_ok=True)
+        self.coa_catalog_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache

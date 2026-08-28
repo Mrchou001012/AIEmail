@@ -12,9 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import app.services as services
+from app.agent_runtime import answer_product_category_assistance
 from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
 from app.db import (
+    AgentRun,
+    AgentRunStatus,
+    AgentStep,
     AIInvocation,
+    AssistanceRequest,
+    AssistanceStatus,
     AuditEvent,
     CaseStage,
     CaseStatus,
@@ -39,6 +45,8 @@ from app.services import (
     backfill_product_list_requests,
     ingest_raw_email,
     process_inbound,
+    queue_prepared_product_list_reply,
+    resume_agent_run,
     send_one_outbox,
 )
 from app.settings import get_settings
@@ -350,7 +358,7 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
             f"analysis={invocation.parsed_output if invocation else None}; "
             f"handoffs={[(item.reason_code, item.summary) for item in handoffs]}"
         )
-    assert outbox.business_key == f"inbound-product-list:{email_row.id}"
+    assert outbox.business_key == f"inbound-product-list:{email_row.id}:all"
     mime = BytesParser(policy=policy.default).parsebytes(
         outbox.raw_message.encode("utf-8")
     )
@@ -361,9 +369,7 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
     ]
     assert len(attachments) == 1
     attachment = attachments[0]
-    assert attachment.get_filename() == (
-        "Lanya_Chem_pharmaceutical_product_list.xlsx"
-    )
+    assert attachment.get_filename() == "Lanya_Chem_all_products_product_list.xlsx"
     workbook = load_workbook(
         BytesIO(attachment.get_payload(decode=True)),
         data_only=False,
@@ -383,7 +389,7 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
     )
     assert outbound_email is not None
     assert any(
-        item["filename"] == "Lanya_Chem_pharmaceutical_product_list.xlsx"
+        item["filename"] == "Lanya_Chem_all_products_product_list.xlsx"
         for item in outbound_email.attachment_metadata
     ), outbound_email.attachment_metadata
 
@@ -572,6 +578,134 @@ async def test_unknown_interest_routes_to_semantic_handoff_when_research_disable
     assert await _queued_product_list(db_session) is None
 
 
+async def test_human_category_answer_resumes_agent_to_product_list_draft(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
+    await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Product list inquiry",
+            "Please send the list of solvents available.",
+            message_id="agent-category-resume@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    run = await db_session.scalar(
+        select(AgentRun).where(AgentRun.handoff_id == handoff.id)
+    )
+    assert run is not None
+    assert run.status == AgentRunStatus.WAITING_HUMAN
+    request = await db_session.scalar(
+        select(AssistanceRequest).where(AssistanceRequest.run_id == run.id)
+    )
+    assert request is not None
+    assert request.status == AssistanceStatus.OPEN
+    assert request.request_type == "PRODUCT_CATEGORY_SELECTION"
+    assert {item["key"] for item in request.options_json} == {
+        "industrial_silanes",
+        "pharmaceutical",
+        "rubber_plastics",
+    }
+
+    category = await db_session.scalar(
+        select(ProductCategory).where(
+            ProductCategory.key == "industrial_silanes"
+        )
+    )
+    assert category is not None
+    result = await answer_product_category_assistance(
+        db_session,
+        request_id=request.id,
+        category_id=category.id,
+        actor="reviewer",
+        note="Confirmed from the customer's business profile",
+    )
+    assert result.newly_answered is True
+    assert result.job is not None and result.job.kind == "resume_agent_run"
+    assert result.run.status == AgentRunStatus.RESUME_QUEUED
+
+    repeated = await answer_product_category_assistance(
+        db_session,
+        request_id=request.id,
+        category_id=category.id,
+        actor="reviewer",
+    )
+    assert repeated.newly_answered is False
+    assert repeated.job is not None and repeated.job.id == result.job.id
+
+    await resume_agent_run(
+        db_session,
+        run_id=run.id,
+        expected_version=run.version,
+        assistance_request_id=request.id,
+    )
+
+    assert await _queued_product_list(db_session) is None
+    await db_session.refresh(run)
+    await db_session.refresh(request)
+    await db_session.refresh(handoff)
+    assert run.status == AgentRunStatus.WAITING_HUMAN
+    assert run.current_step == "approve-product-list-draft"
+    assert request.status == AssistanceStatus.APPLIED
+    assert request.applied_at is not None
+    assert handoff.status == "OPEN"
+    assert handoff.reason_code == HandoffReason.PRODUCT_LIST_REVIEW.value
+    assert handoff.extracted_facts["human_selected_category"]["category_key"] == "industrial_silanes"
+    prepared = handoff.extracted_facts["prepared_product_list"]
+    assert prepared["category_key"] == "industrial_silanes"
+    assert prepared["product_ids"]
+    steps = (
+        (
+            await db_session.execute(
+                select(AgentStep)
+                .where(AgentStep.run_id == run.id)
+                .order_by(AgentStep.sequence)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [step.kind for step in steps] == [
+        "HUMAN_HANDOFF",
+        "HUMAN_INPUT",
+        "RESUME_EXECUTION",
+    ]
+    assert steps[-1].output_json["next_step"] == "human-draft-approval"
+
+    preview = handoff.extracted_facts["ai_draft_preview"]
+    outbox = await queue_prepared_product_list_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject=preview["subject"],
+        body_text=preview["body_text"],
+        actor="reviewer",
+        note="Approved scoped catalog",
+    )
+    repeated = await queue_prepared_product_list_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject=preview["subject"],
+        body_text=preview["body_text"],
+        actor="reviewer",
+    )
+    assert repeated.id == outbox.id
+    assert outbox.approval_handoff_id == handoff.id
+    assert outbox.human_approved_by == "reviewer"
+    await db_session.refresh(handoff)
+    await db_session.refresh(run)
+    assert handoff.status == "RESOLVED"
+    assert run.status == AgentRunStatus.COMPLETED
+
+
 async def test_company_research_observation_mode_records_evidence_without_sending(
     db_session: AsyncSession,
     monkeypatch,
@@ -618,7 +752,7 @@ async def test_company_research_observation_mode_records_evidence_without_sendin
         db_session,
         _message(
             "Product list inquiry",
-            "Please send us your product list.",
+            "Please send the list of solvents available.",
             message_id="research-observation@example.com",
         ),
         mailbox="integration-test",
@@ -681,7 +815,7 @@ async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
         db_session,
         _message(
             "First catalog request",
-            "Please send us your product list.",
+            "Please send the list of solvents available.",
             message_id="research-auto-first@example.com",
         ),
         mailbox="integration-test",
@@ -700,7 +834,7 @@ async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
         db_session,
         _message(
             "Second catalog request",
-            "Please send your product catalog.",
+            "Please send the list of solvents available.",
             message_id="research-auto-second@example.com",
         ),
         mailbox="integration-test",
@@ -1338,7 +1472,7 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
             (
                 "Dear Shreya\n\n"
                 "Ms. Pooja no longer works in our company.\n\n"
-                "Please send us your product list.\n\n"
+                "Please send us your product list for industrial silane.\n\n"
                 "Regards, Judy"
             ),
         ),
@@ -1434,7 +1568,7 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
             (
                 "Dear Shreya\n\n"
                 "Ms. Pooja no longer works in our company.\n\n"
-                "Please send us your product list.\n\n"
+                "Please send the list of solvents available.\n\n"
                 "Regards, Judy"
             ),
         ),
