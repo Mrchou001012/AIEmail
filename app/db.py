@@ -168,7 +168,9 @@ class Product(Base, TimestampMixin):
     # audited value below so an internal shorthand is never presented as an
     # official product number.
     catalog_code: Mapped[str | None] = mapped_column(String(128))
-    catalog_visible: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Fail closed: only the curated catalog importer may opt a product into
+    # customer-facing lists.  Legacy or ad-hoc product rows remain internal.
+    catalog_visible: Mapped[bool] = mapped_column(Boolean, default=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
 

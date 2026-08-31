@@ -71,6 +71,11 @@ def test_catalog_yaml_has_audited_categories_and_unique_internal_products() -> N
     assert all(item.get("content") != "-" for item in products)
 
 
+def test_unreviewed_database_products_default_to_catalog_hidden() -> None:
+    default = Product.__table__.c.catalog_visible.default
+    assert default is not None and default.arg is False
+
+
 def test_category_keyword_classification() -> None:
     assert classify_category_interests("工业硅烷") == ["industrial_silanes"]
     assert classify_category_interests("we are interested in industrial silane") == [

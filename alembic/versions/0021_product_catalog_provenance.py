@@ -22,7 +22,9 @@ def upgrade() -> None:
             "catalog_visible",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.true(),
+            # Existing production rows must stay internal until the audited
+            # YAML import explicitly marks them customer-visible.
+            server_default=sa.false(),
         ),
     )
 
