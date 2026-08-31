@@ -177,6 +177,18 @@ def _optional_catalog_value(
     return str(item.get(key) or "").strip() or None
 
 
+def _catalog_code(item: dict[str, Any], internal_code: str) -> str | None:
+    """Return the curated customer-facing code.
+
+    Canonical products default to their audited internal code.  Entries whose
+    commercial name differs from the internal matcher must explicitly provide
+    ``catalog_code`` in the YAML; an explicit null keeps the customer cell blank.
+    """
+    if "catalog_code" not in item:
+        return internal_code
+    return str(item.get("catalog_code") or "").strip() or None
+
+
 def _catalog_categories(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     categories: dict[str, dict[str, Any]] = {}
     for item in payload.get("categories") or []:
@@ -294,6 +306,8 @@ async def import_product_catalog(
                 cas_no=str(item.get("cas_no") or "").strip() or None,
                 content=str(item.get("content") or "").strip() or None,
                 series=str(item.get("series") or "").strip() or None,
+                catalog_code=_catalog_code(item, code),
+                catalog_visible=bool(item.get("catalog_visible", True)),
                 sort_order=sort_order,
             )
             session.add(product)
@@ -306,6 +320,8 @@ async def import_product_catalog(
             product.cas_no = _optional_catalog_value(item, "cas_no", product.cas_no)
             product.content = _optional_catalog_value(item, "content", product.content)
             product.series = _optional_catalog_value(item, "series", product.series)
+            product.catalog_code = _catalog_code(item, code)
+            product.catalog_visible = bool(item.get("catalog_visible", True))
             product.sort_order = sort_order
             product.active = True
             result["products_updated"] += 1
@@ -325,7 +341,7 @@ async def import_product_catalog(
 
 def _product_rows(products: Iterable[Product]) -> list[Product]:
     return sorted(
-        products,
+        (product for product in products if product.catalog_visible is not False),
         key=lambda product: (product.sort_order or 0, product.id or 0),
     )
 
@@ -406,7 +422,7 @@ def build_product_list_attachment(
         (
             index,
             _safe_file_cell(product.series),
-            _safe_file_cell(product.code),
+            _safe_file_cell(product.catalog_code),
             _safe_file_cell(product.name),
             _safe_file_cell(product.cas_no),
             _safe_file_cell(product.content),
@@ -488,7 +504,7 @@ def render_product_list_email(
                 " | ".join(
                     [
                         str(number),
-                        _value(product.code),
+                        _value(product.catalog_code),
                         _value(product.name),
                         _value(product.cas_no),
                         _value(product.content),
@@ -527,7 +543,7 @@ def render_product_list_email(
                     f"<td>{html.escape(value)}</td>"
                     for value in (
                         str(number),
-                        _value(product.code),
+                        _value(product.catalog_code),
                         _value(product.name),
                         _value(product.cas_no),
                         _value(product.content),

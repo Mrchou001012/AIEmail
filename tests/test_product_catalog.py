@@ -21,7 +21,7 @@ from app.products import (
 )
 
 
-def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
+def test_catalog_yaml_has_audited_categories_and_unique_internal_products() -> None:
     payload = load_catalog_yaml()
     categories = payload["categories"]
     products = payload["products"]
@@ -30,6 +30,8 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
         "industrial_silanes",
         "pharmaceutical",
         "rubber_plastics",
+        "acetylacetone_salts",
+        "silicone_oil",
     ]
     keys = {item["key"] for item in categories}
     codes = [item["code"] for item in products]
@@ -38,33 +40,15 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     assert any(item["code"] == "YAC-A110" for item in products)
     assert any(item["code"] == "YAC-HMDS" for item in products)
     acac = next(item for item in products if item["code"] == "ACAC")
-    assert acac["category"] == "pharmaceutical"
+    assert acac["category"] == "acetylacetone_salts"
+    assert acac["catalog_code"] == "AcAc"
+    assert acac["cas_no"] == "123-54-6"
     n113 = next(item for item in products if item["code"] == "YAC-N113")
     assert n113["cas_no"] == "1185-55-3"
     source_blank_cas_codes = {
-        "YAC-BDAC",
-        "YAC-TOS",
-        "YAC-POS",
         "YAC-MTMS",
-        "YAC-TMOS",
-        "YAC-TEOS28",
-        "ACAC",
         "OH-Polymer 80K",
-        "SBM-55",
-        "DBM-83",
-        "CAA",
-        "ZAA",
-        "THEIC",
-        "AAA",
-        "AO-168",
-        "AO-1010",
-        "AO-1076",
-        "UV-770",
-        "UV-944",
         "UV-783",
-        "UV-622",
-        "UV-P",
-        "UV-531",
     }
     actual_blank_cas_codes = {
         item["code"] for item in products if item.get("cas_no") is None
@@ -73,6 +57,18 @@ def test_catalog_yaml_has_three_categories_and_unique_products() -> None:
     assert any(item["code"] == "UV-531" for item in products)
     assert any(item["code"] == "OH-Polymer 80K" for item in products)
     assert any(item["code"] == "YAC-N823(99%)" for item in products)
+    hidden = [item for item in products if item.get("catalog_visible") is False]
+    assert [item["code"] for item in hidden] == ["YAC-N823(99%)"]
+    public_codes = [
+        item.get("catalog_code", item["code"])
+        for item in products
+        if item.get("catalog_visible", True)
+    ]
+    assert len(public_codes) == len(set(public_codes)) == 70
+    assert "YAC-N823" in public_codes
+    assert "LANSTAB-CAA" in public_codes
+    assert "LANSORB UV-770" in public_codes
+    assert all(item.get("content") != "-" for item in products)
 
 
 def test_category_keyword_classification() -> None:
@@ -144,6 +140,7 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
     products = [
         Product(
             code="YAC-A110",
+            catalog_code="YAC-A110",
             name="3-AMINOPROPYLTRIETHOXYSILANE",
             brand="YAC",
             cas_no="919-30-2",
@@ -154,6 +151,7 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
         ),
         Product(
             code="YAC-N113",
+            catalog_code="YAC-N113",
             name="METHYLTRIMETHOXYSILANE",
             brand="YAC",
             cas_no="1185-55-3",
@@ -161,6 +159,16 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
             series="Alkyl Silane Series (N)",
             sort_order=2,
             id=2,
+        ),
+        Product(
+            code="YAC-N823(99%)",
+            catalog_code="YAC-N823",
+            catalog_visible=False,
+            name="N-OCTYLTRIETHOXYSILANE",
+            cas_no="2943-75-1",
+            content="99%",
+            sort_order=3,
+            id=3,
         ),
     ]
 
@@ -181,6 +189,7 @@ def test_product_list_email_rendering_is_deterministic_and_price_free() -> None:
     assert "US$" not in text and "USD" not in text
     assert "<table" in html_body
     assert "YAC-N113" in html_body
+    assert "YAC-N823" not in text and "YAC-N823" not in html_body
     assert text.count("Best regards,") == 1
     assert html_body.count("Best regards,") == 1
 
@@ -197,6 +206,7 @@ def test_product_list_workbook_uses_only_curated_values_and_keeps_missing_cas_bl
     products = [
         Product(
             code="ACAC",
+            catalog_code="AcAc",
             name="ACETYL ACETONE",
             cas_no=None,
             content="99%",
@@ -206,12 +216,23 @@ def test_product_list_workbook_uses_only_curated_values_and_keeps_missing_cas_bl
         ),
         Product(
             code="YAC-N113",
+            catalog_code="YAC-N113",
             name="METHYLTRIMETHOXYSILANE",
             cas_no="1185-55-3",
             content="99%",
             series="Alkyl Silane Series (N)",
             sort_order=2,
             id=2,
+        ),
+        Product(
+            code="YAC-N823(99%)",
+            catalog_code="YAC-N823",
+            catalog_visible=False,
+            name="N-OCTYLTRIETHOXYSILANE",
+            cas_no="2943-75-1",
+            content="99%",
+            sort_order=3,
+            id=3,
         ),
     ]
 
@@ -226,16 +247,19 @@ def test_product_list_workbook_uses_only_curated_values_and_keeps_missing_cas_bl
     assert attachment.filename == "Lanya_Chem_pharmaceutical_product_list.xlsx"
     assert sheet["A1"].value == "No."
     assert sheet["E1"].value == "CAS No."
-    assert sheet["C2"].value == "ACAC"
+    assert sheet["C2"].value == "AcAc"
     assert sheet["E2"].value is None
     assert sheet["C3"].value == "YAC-N113"
     assert sheet["E3"].value == "1185-55-3"
+    assert sheet.max_row == 3
+    assert all(cell.value != "'-" for row in sheet.iter_rows() for cell in row)
 
 
 def test_attached_product_list_email_requires_a_real_attachment_context() -> None:
     category = ProductCategory(key="pharmaceutical", name="Pharmaceuticals")
     product = Product(
         code="ACAC",
+        catalog_code="AcAc",
         name="ACETYL ACETONE",
         cas_no=None,
         content="99%",

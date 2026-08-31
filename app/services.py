@@ -1504,6 +1504,7 @@ async def _prepared_handoff_draft_preview(
                     .join(ProductCategory, Product.category_id == ProductCategory.id)
                     .where(
                         Product.active.is_(True),
+                        Product.catalog_visible.is_(True),
                         ProductCategory.active.is_(True),
                     )
                     .order_by(
@@ -1541,6 +1542,7 @@ async def _prepared_handoff_draft_preview(
                         .join(ProductCategory, Product.category_id == ProductCategory.id)
                         .where(
                             Product.active.is_(True),
+                            Product.catalog_visible.is_(True),
                             ProductCategory.active.is_(True),
                         )
                         .order_by(
@@ -1565,6 +1567,7 @@ async def _prepared_handoff_draft_preview(
                         .where(
                             Product.category_id == category.id,
                             Product.active.is_(True),
+                            Product.catalog_visible.is_(True),
                         )
                         .order_by(Product.sort_order, Product.id)
                     )
@@ -6625,7 +6628,11 @@ async def _validated_prepared_product_list(
                 await session.scalars(
                     select(Product)
                     .join(ProductCategory, Product.category_id == ProductCategory.id)
-                    .where(Product.active.is_(True), ProductCategory.active.is_(True))
+                    .where(
+                        Product.active.is_(True),
+                        Product.catalog_visible.is_(True),
+                        ProductCategory.active.is_(True),
+                    )
                     .order_by(ProductCategory.sort_order, Product.sort_order, Product.id)
                 )
             ).all()
@@ -6643,6 +6650,7 @@ async def _validated_prepared_product_list(
                     .where(
                         Product.category_id == category.id,
                         Product.active.is_(True),
+                        Product.catalog_visible.is_(True),
                     )
                     .order_by(Product.sort_order, Product.id)
                 )
@@ -7073,7 +7081,11 @@ async def _maybe_send_general_product_list(
             await session.scalars(
                 select(Product)
                 .join(ProductCategory, Product.category_id == ProductCategory.id)
-                .where(Product.active.is_(True), ProductCategory.active.is_(True))
+                .where(
+                    Product.active.is_(True),
+                    Product.catalog_visible.is_(True),
+                    ProductCategory.active.is_(True),
+                )
                 .order_by(ProductCategory.sort_order, Product.sort_order, Product.id)
             )
         ).all()
@@ -7316,6 +7328,7 @@ async def _maybe_send_product_list(
                 .where(
                     Product.category_id == category.id,
                     Product.active.is_(True),
+                    Product.catalog_visible.is_(True),
                 )
                 .order_by(Product.sort_order, Product.id)
             )
@@ -7843,6 +7856,7 @@ async def backfill_product_list_requests(
                         .where(
                             Product.category_id == category.id,
                             Product.active.is_(True),
+                            Product.catalog_visible.is_(True),
                         )
                         .order_by(Product.sort_order, Product.id)
                     )

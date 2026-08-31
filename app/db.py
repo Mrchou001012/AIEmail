@@ -163,6 +163,12 @@ class Product(Base, TimestampMixin):
     cas_no: Mapped[str | None] = mapped_column(String(64))
     content: Mapped[str | None] = mapped_column(String(64))
     series: Mapped[str | None] = mapped_column(String(128))
+    # ``code`` remains the stable internal identity used by pricing, aliases,
+    # and historical cases.  Customer-facing catalogs use the independently
+    # audited value below so an internal shorthand is never presented as an
+    # official product number.
+    catalog_code: Mapped[str | None] = mapped_column(String(128))
+    catalog_visible: Mapped[bool] = mapped_column(Boolean, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
 
