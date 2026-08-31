@@ -17,6 +17,7 @@ from app.api import (
     commercial_update_page,
     contacts_page,
     dashboard,
+    download_prepared_product_list,
     favicon,
     health,
     reactivation_page,
@@ -24,6 +25,7 @@ from app.api import (
     stream_handoff_preview,
 )
 from app.db import Handoff
+from app.mail import OutboundAttachment
 from app.services import _strip_duplicate_signature_lead
 
 
@@ -177,6 +179,10 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "payload.detail ?? payload" in html
     assert "当前发件地址尚未登记。请先确认客户归属并新增联系人。" in html
     assert "/draft-preview/stream" in html
+    assert 'id="prepared-product-list-review"' in html
+    assert "/prepared-product-list/download" in html
+    assert "下载 Excel 预览（不会发送）" in html
+    assert "付款条款待业务确认，暂不可发送" in html
     assert "response.body.getReader()" in html
     assert 'new TextDecoder("utf-8")' in html
 
@@ -202,6 +208,28 @@ async def test_handoff_draft_stream_uses_ndjson_and_disables_proxy_buffering(
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-accel-buffering"] == "no"
     assert [event["type"] for event in events] == ["status", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_prepared_product_list_download_is_review_only_and_no_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build = AsyncMock(
+        return_value=OutboundAttachment(
+            filename="Lanya_Chem_all_products_product_list.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            payload=b"xlsx-preview",
+        )
+    )
+    monkeypatch.setattr("app.api.prepared_product_list_attachment", build)
+    session = AsyncMock()
+
+    response = await download_prepared_product_list(2013, "admin", session)
+
+    assert response.body == b"xlsx-preview"
+    assert response.headers["cache-control"] == "no-store"
+    assert "attachment" in response.headers["content-disposition"]
+    build.assert_awaited_once_with(session, handoff_id=2013)
 
 
 def test_handoff_case_request_allows_product_to_remain_pending() -> None:

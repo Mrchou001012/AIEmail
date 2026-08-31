@@ -66,7 +66,7 @@ HANDOFF_REASON_SUMMARIES = {
     "NEW_INQUIRY_REVIEW": "新询盘无法安全自动建立或关联业务案例。",
     "INVENTORY_UNAVAILABLE": "当前库存不足或库存信息尚未确认。",
     "PRODUCT_CATEGORY_REVIEW": "客户索要产品列表，但系统无法安全确定应发送的产品系列，需要人工确认。",
-    "PRODUCT_LIST_REVIEW": "产品系列已确定，系统已生成产品列表回复草稿，等待人工确认发送。",
+    "PRODUCT_LIST_REVIEW": "系统已准备产品列表草稿和附件数据，等待人工核对产品范围与邮件正文后确认发送。",
     "QUOTE_REVIEW": "系统已按当前价格、库存和报价规则生成草稿，等待人工确认发送。",
     "COA_REVIEW": "客户索要 COA；系统已准备标准英文版草稿，或需要人工确认正确附件。",
 }

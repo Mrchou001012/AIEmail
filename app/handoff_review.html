@@ -55,6 +55,11 @@
     .check input { width:auto; }
     .file-help { color:var(--muted); font-size:12px; margin-top:6px; }
     .file-list { margin-top:8px; padding:9px 11px; border-radius:9px; background:#f8fafc; color:var(--muted); overflow-wrap:anywhere; }
+    .prepared-review { margin-top:12px; padding:12px; border:1px solid #b2ccff; border-radius:10px; background:#f5f8ff; }
+    .prepared-review.warning { border-color:#f7d394; background:#fffaeb; }
+    .prepared-review .catalog-title { font-weight:700; color:#1849a9; }
+    .prepared-review .catalog-codes { margin-top:8px; color:var(--muted); overflow-wrap:anywhere; }
+    .button-link { display:inline-flex; border-radius:9px; padding:9px 13px; background:#e9eef6; color:var(--blue); font-weight:650; }
     .suggested-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .suggested-tag { display:inline-flex; align-items:center; gap:5px; background:#eef4ff; color:#1849a9; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:650; }
     .suggested-tag .qty { color:#667085; font-weight:400; }
@@ -203,6 +208,7 @@
           <div class="sub">可先调用当前大模型和历史邮件 RAG 生成预览。生成只保存草稿，不会发邮件或通知钉钉。</div>
           <div class="actions"><button id="generate-draft" type="button">生成 / 重新生成 AI 草稿预览</button></div>
           <div class="sub" id="draft-state"></div>
+          <div class="prepared-review hidden" id="prepared-product-list-review"></div>
           <label for="reply-subject">邮件主题</label>
           <input id="reply-subject" maxlength="998">
           <label for="reply-body">邮件正文</label>
@@ -523,16 +529,48 @@
       const preparedQuote = data.facts?.prepared_quote;
       const preparedMultiQuote = data.facts?.prepared_multi_quote;
       $("#generate-draft").disabled = blocked;
-      $("#send").disabled = blocked;
-      $("#send").textContent = preparedCoa
+      const missingBusinessFacts = preparedProductList?.missing_business_facts || [];
+      const productListBlocked = missingBusinessFacts.length > 0;
+      $("#send").disabled = blocked || productListBlocked;
+      $("#send").textContent = productListBlocked
+        ? "付款条款待业务确认，暂不可发送"
+        : preparedCoa
         ? `确认并附加 ${preparedCoa.filename || "COA.pdf"} 后加入发件队列`
         : preparedProductList
-          ? `确认产品列表${preparedProductList.attachment_filename ? `及 ${preparedProductList.attachment_filename}` : ""} 后加入发件队列`
+          ? `确认当前正文并附加 ${preparedProductList.attachment_filename || "产品列表"} 后加入发件队列`
         : preparedQuote
           ? `确认 ${preparedQuote.currency} ${preparedQuote.unit_price} 报价后加入发件队列`
         : preparedMultiQuote
           ? `确认 ${preparedMultiQuote.lines?.length || 0} 项产品报价后加入发件队列`
         : "确认并加入发件队列";
+      const productListReview = $("#prepared-product-list-review");
+      productListReview.classList.toggle("hidden", !preparedProductList);
+      productListReview.classList.toggle("warning", productListBlocked);
+      if (preparedProductList) {
+        const codes = preparedProductList.product_codes || [];
+        const breakdown = preparedProductList.category_breakdown || [];
+        const scopeLabel = preparedProductList.scope === "all"
+          ? "全部产品"
+          : (preparedProductList.category_name || preparedProductList.category_key || "指定分类");
+        const breakdownText = breakdown.length
+          ? breakdown.map((row) => `${row.category_name}：${row.product_count} 个`).join("；")
+          : "分类明细将在重新生成草稿后显示";
+        const missingText = productListBlocked
+          ? '<div class="danger"><strong>尚不能发送：</strong>客户同时询问付款方式，但系统没有已确认的付款条款。请等待业务确认，系统不会编造或向客户发送占位回复。</div>'
+          : "";
+        const download = preparedProductList.file_format
+          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 Excel 预览（不会发送）</a></div>`
+          : "";
+        productListReview.innerHTML = `
+          <div class="catalog-title">待附加产品清单：${esc(scopeLabel)} · ${esc(preparedProductList.product_count || codes.length)} 个产品</div>
+          <div class="sub">${esc(breakdownText)}</div>
+          <div class="catalog-codes">产品代码：${esc(codes.join(", ") || "暂无")}</div>
+          ${download}
+          ${missingText}
+        `;
+      } else {
+        productListReview.innerHTML = "";
+      }
       $("#reply-attachments").disabled = blocked || Boolean(preparedCoa) || Boolean(preparedProductList) || Boolean(preparedQuote) || Boolean(preparedMultiQuote);
       const preview = data.facts?.ai_draft_preview;
       $("#draft-state").textContent = preview

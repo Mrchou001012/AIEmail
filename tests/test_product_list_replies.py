@@ -43,7 +43,9 @@ from app.domain import HandoffReason
 from app.product_catalog import import_product_catalog
 from app.services import (
     backfill_product_list_requests,
+    generate_handoff_draft_preview,
     ingest_raw_email,
+    prepared_product_list_attachment,
     process_inbound,
     queue_prepared_product_list_reply,
     resume_agent_run,
@@ -704,6 +706,74 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     await db_session.refresh(run)
     assert handoff.status == "RESOLVED"
     assert run.status == AgentRunStatus.COMPLETED
+
+
+async def test_manual_draft_regeneration_preserves_catalog_and_blocks_missing_payment_terms(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
+    await _seed_catalog_and_interest(db_session, interests=[])
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "Checking in from Lanya Chem",
+            "Kindly share your product list and share your payment support.",
+            message_id="catalog-and-payment@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    facts = dict(handoff.extracted_facts or {})
+    assert facts["prepared_product_list"]["scope"] == "all"
+    facts["ai_draft_preview"] = {
+        "subject": "Re: Checking in from Lanya Chem",
+        "body_text": "We are reviewing your request and will get back to you.",
+        "provider": "anthropic",
+        "model": "test-model",
+    }
+    handoff.extracted_facts = facts
+    await db_session.commit()
+
+    preview = await generate_handoff_draft_preview(
+        db_session,
+        handoff_id=handoff.id,
+        actor="reviewer",
+    )
+    await db_session.refresh(handoff)
+
+    assert "Please find attached our current English product catalogue" in preview["body_text"]
+    assert "reviewing your request" not in preview["body_text"]
+    assert preview["provider"] == "deterministic-product-list"
+    assert preview["missing_business_facts"] == ["payment_terms"]
+    prepared = handoff.extracted_facts["prepared_product_list"]
+    assert prepared["product_count"] == 71
+    assert [row["product_count"] for row in prepared["category_breakdown"]] == [45, 10, 16]
+    assert prepared["missing_business_facts"] == ["payment_terms"]
+
+    attachment = await prepared_product_list_attachment(
+        db_session,
+        handoff_id=handoff.id,
+    )
+    assert attachment.filename == "Lanya_Chem_all_products_product_list.xlsx"
+    workbook = load_workbook(BytesIO(attachment.payload), read_only=True)
+    assert workbook.active.max_row == 72
+    assert await _queued_product_list(db_session) is None
+
+    with pytest.raises(ValueError, match="missing approved business facts: payment_terms"):
+        await queue_prepared_product_list_reply(
+            db_session,
+            handoff_id=handoff.id,
+            subject=preview["subject"],
+            body_text=preview["body_text"],
+            actor="reviewer",
+        )
 
 
 async def test_company_research_observation_mode_records_evidence_without_sending(

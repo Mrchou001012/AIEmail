@@ -109,6 +109,8 @@ from app.services import (
     generate_handoff_draft_preview,
     ingest_raw_email,
     list_forward_recipients,
+    prepared_product_list_attachment,
+    product_list_missing_business_facts,
     queue_human_reply,
     queue_prepared_coa_reply,
     queue_prepared_multi_quote_reply,
@@ -2963,6 +2965,17 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
         if handoff.source_email_id is not None
         else None
     )
+    facts_payload = dict(handoff.extracted_facts or {})
+    prepared_product_list = facts_payload.get("prepared_product_list")
+    if isinstance(prepared_product_list, dict):
+        facts_payload["prepared_product_list"] = {
+            **prepared_product_list,
+            "missing_business_facts": await product_list_missing_business_facts(
+                session,
+                handoff=handoff,
+                source_email=source_email,
+            ),
+        }
     case_payload = await _handoff_case_payload(session, handoff.case_id)
     case = None
     if handoff.case_id is not None:
@@ -3168,7 +3181,7 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
         "source_email_id": handoff.source_email_id,
         "reason": handoff.reason_code,
         "summary": handoff.summary,
-        "facts": handoff.extracted_facts,
+        "facts": facts_payload,
         "status": handoff.status,
         "dingtalk_status": handoff.dingtalk_status,
         "resolution_note": handoff.resolution_note,
@@ -3694,6 +3707,33 @@ async def approve_prepared_product_list_draft(
         "outbox_id": outbox.id,
         "status": outbox.status.value,
     }
+
+
+@router.get("/admin/handoffs/{handoff_id}/prepared-product-list/download")
+async def download_prepared_product_list(
+    handoff_id: int,
+    _: Admin,
+    session: Session,
+) -> Response:
+    """Download the validated catalog preview without creating an Outbox row."""
+
+    try:
+        attachment = await prepared_product_list_attachment(
+            session,
+            handoff_id=handoff_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    encoded_filename = quote(attachment.filename, safe="")
+    return Response(
+        content=attachment.payload,
+        media_type=attachment.content_type,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.post("/admin/handoffs/{handoff_id}/approve-quote-draft", status_code=202)
