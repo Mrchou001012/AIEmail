@@ -58,7 +58,11 @@
     .prepared-review { margin-top:12px; padding:12px; border:1px solid #b2ccff; border-radius:10px; background:#f5f8ff; }
     .prepared-review.warning { border-color:#f7d394; background:#fffaeb; }
     .prepared-review .catalog-title { font-weight:700; color:#1849a9; }
-    .prepared-review .catalog-codes { margin-top:8px; color:var(--muted); overflow-wrap:anywhere; }
+    .catalog-breakdown { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+    .catalog-breakdown span { display:inline-flex; border-radius:999px; padding:3px 9px; background:#e7efff; color:#344054; font-size:12px; }
+    .catalog-code-details { margin-top:9px; color:var(--muted); }
+    .catalog-code-details summary { cursor:pointer; color:var(--blue); font-weight:650; }
+    .prepared-review .catalog-codes { margin-top:7px; padding:8px 10px; max-height:120px; overflow:auto; border-radius:8px; background:#fff; color:var(--muted); overflow-wrap:anywhere; }
     .button-link { display:inline-flex; border-radius:9px; padding:9px 13px; background:#e9eef6; color:var(--blue); font-weight:650; }
     .suggested-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
     .suggested-tag { display:inline-flex; align-items:center; gap:5px; background:#eef4ff; color:#1849a9; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:650; }
@@ -220,6 +224,7 @@
           <label for="reply-note">处理备注</label>
           <input id="reply-note" maxlength="2000" placeholder="例如：已核对价格并人工回复">
           <label class="check"><input id="resume" type="checkbox">发送后恢复该案例的 AI 自动处理</label>
+          <div class="file-help hidden" id="send-attachment-summary"></div>
           <div class="actions"><button class="primary" id="send" type="button">确认并加入发件队列</button></div>
           <div class="sub" id="send-state"></div>
         </article>
@@ -535,36 +540,44 @@
       $("#send").textContent = productListBlocked
         ? "付款条件待重新生成，暂不可发送"
         : preparedCoa
-        ? `确认并附加 ${preparedCoa.filename || "COA.pdf"} 后加入发件队列`
+        ? "确认并加入发件队列"
         : preparedProductList
-          ? `确认当前正文并附加 ${preparedProductList.attachment_filename || "产品列表"} 后加入发件队列`
+          ? "确认并加入发件队列"
         : preparedQuote
-          ? `确认 ${preparedQuote.currency} ${preparedQuote.unit_price} 报价后加入发件队列`
+          ? "确认报价并加入发件队列"
         : preparedMultiQuote
-          ? `确认 ${preparedMultiQuote.lines?.length || 0} 项产品报价后加入发件队列`
+          ? "确认多产品报价并加入发件队列"
         : "确认并加入发件队列";
+      const automaticAttachment = preparedCoa?.filename || preparedProductList?.attachment_filename || "";
+      $("#send-attachment-summary").textContent = automaticAttachment
+        ? `发送时将自动附加：${automaticAttachment}`
+        : "";
+      $("#send-attachment-summary").classList.toggle("hidden", !automaticAttachment);
       const productListReview = $("#prepared-product-list-review");
       productListReview.classList.toggle("hidden", !preparedProductList);
       productListReview.classList.toggle("warning", productListBlocked);
       if (preparedProductList) {
-        const codes = preparedProductList.product_codes || [];
+        const codes = preparedProductList.catalog_codes || [];
         const breakdown = preparedProductList.category_breakdown || [];
         const scopeLabel = preparedProductList.scope === "all"
           ? "全部产品"
           : (preparedProductList.category_name || preparedProductList.category_key || "指定分类");
-        const breakdownText = breakdown.length
-          ? breakdown.map((row) => `${row.category_name}：${row.product_count} 个`).join("；")
-          : "分类明细将在重新生成草稿后显示";
+        const breakdownHtml = breakdown.length
+          ? `<div class="catalog-breakdown">${breakdown.map((row) => `<span>${esc(row.category_name)} · ${esc(row.product_count)} 个</span>`).join("")}</div>`
+          : '<div class="file-help">分类明细将在重新生成草稿后显示</div>';
+        const codeDetails = codes.length
+          ? `<details class="catalog-code-details"><summary>查看 ${esc(codes.length)} 个对外产品代码</summary><div class="catalog-codes">${esc(codes.join(", "))}</div></details>`
+          : '<div class="file-help">完整对外产品字段请下载 Excel 预览。</div>';
         const missingText = productListBlocked
           ? '<div class="danger"><strong>尚不能发送：</strong>当前草稿还没有按付款规则生成。系统将沿用客户最近一次已发送报价中的付款条件；没有这类历史时默认首单预付款。请点击上方“重新生成”后再核对。</div>'
           : "";
         const download = preparedProductList.file_format
-          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 Excel 预览（不会发送）</a></div>`
+          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 Excel 预览</a></div>`
           : "";
         productListReview.innerHTML = `
-          <div class="catalog-title">待附加产品清单：${esc(scopeLabel)} · ${esc(preparedProductList.product_count || codes.length)} 个产品</div>
-          <div class="sub">${esc(breakdownText)}</div>
-          <div class="catalog-codes">产品代码：${esc(codes.join(", ") || "暂无")}</div>
+          <div class="catalog-title">产品目录附件：${esc(scopeLabel)} · ${esc(preparedProductList.product_count || codes.length)} 个产品</div>
+          ${breakdownHtml}
+          ${codeDetails}
           ${download}
           ${missingText}
         `;

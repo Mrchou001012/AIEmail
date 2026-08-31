@@ -147,6 +147,55 @@ PAYMENT_DETAILS_REQUEST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+CONTACT_NAME_PLACEHOLDER_PATTERN = re.compile(
+    r"^(?:customer(?:\s+name)?|buyer|contact|unknown|n/?a|sir\s*/?\s*madam)$",
+    re.IGNORECASE,
+)
+SIGNATURE_SIGNOFF_PATTERN = re.compile(
+    r"^(?:thanks?(?:\s+and)?\s+regards|best\s+regards|kind\s+regards|regards|"
+    r"sincerely|yours\s+sincerely|yours\s+faithfully|thank\s+you)[,!.]*$",
+    re.IGNORECASE,
+)
+SIGNATURE_NON_NAME_PATTERN = re.compile(
+    r"\b(?:sales|marketing|manager|director|officer|executive|engineer|department|"
+    r"team|company|chemical|chemicals|biotech|limited|ltd|inc|corp|llc|pvt|export|"
+    r"import)\b",
+    re.IGNORECASE,
+)
+SIGNATURE_NAME_PATTERN = re.compile(
+    r"[^\W\d_]+(?:['’.-][^\W\d_]+)*(?:\s+[^\W\d_]+(?:['’.-][^\W\d_]+)*){0,3}",
+    re.UNICODE,
+)
+
+
+def _reply_contact_name(stored_name: str | None, message_body: str) -> str:
+    """Resolve a conservative greeting name from a verified contact or signature."""
+
+    clean_stored_name = str(stored_name or "").strip()
+    if clean_stored_name and not CONTACT_NAME_PLACEHOLDER_PATTERN.fullmatch(
+        clean_stored_name
+    ):
+        return clean_stored_name
+
+    lines = [
+        html.unescape(line).replace("\xa0", " ").strip()
+        for line in str(message_body or "").replace("\r\n", "\n").split("\n")
+    ]
+    for index, line in enumerate(lines):
+        if not SIGNATURE_SIGNOFF_PATTERN.fullmatch(line):
+            continue
+        candidate = next((value for value in lines[index + 1 :] if value), "")
+        candidate = candidate.strip(" \t*_~#|:;")
+        if (
+            not candidate
+            or len(candidate) > 80
+            or SIGNATURE_NON_NAME_PATTERN.search(candidate)
+            or not SIGNATURE_NAME_PATTERN.fullmatch(candidate)
+        ):
+            return "Customer"
+        return candidate
+    return "Customer"
+
 
 def _retrieve_historical_style_examples(
     settings: Settings,
@@ -1586,7 +1635,10 @@ async def _prepared_handoff_draft_preview(
                 file_format=str(file_format),
             )
             attachment_filename = catalog_file.filename
-        contact_name = sales_case.contact.name.strip() or "Customer"
+        contact_name = _reply_contact_name(
+            sales_case.contact.name,
+            source_email.body_text,
+        )
         subject = (
             source_email.subject
             if source_email.subject.casefold().startswith("re:")
@@ -1833,7 +1885,10 @@ async def stream_handoff_draft_preview(
     async for event in ai.draft_preview_stream(
         {
             "subject": source_email.subject,
-            "contact_name": sales_case.contact.name,
+            "contact_name": _reply_contact_name(
+                sales_case.contact.name,
+                source_email.body_text,
+            ),
             "customer_message": source_email.body_text[:12_000],
             "intent": analysis.intent.value,
             "product_code": sales_case.product.code if sales_case.product is not None else None,
@@ -2519,7 +2574,10 @@ async def quote_with_manual_price(
         plan = await AIClient().draft_plan(
             {
                 "subject": "Quotation",
-                "contact_name": case.contact.name,
+                "contact_name": _reply_contact_name(
+                    case.contact.name,
+                    source_email.body_text,
+                ),
                 "approved_product_key": first_product.approved_text_key,
             }
         )
@@ -5322,7 +5380,7 @@ async def _maybe_send_quote_clarification(
 
     settings = get_settings()
     bundle = load_content(settings.content_dir)
-    greeting = f"Dear {case.contact.name.strip() or 'Customer'},"
+    greeting = f"Dear {_reply_contact_name(case.contact.name, email_row.body_text)},"
     if needs_multi_quantities:
         opening = "Thank you for your quotation request."
         names = ", ".join(missing_product_codes)
@@ -5718,7 +5776,10 @@ async def _maybe_send_multi_product_quote(
         plan = await AIClient().draft_plan(
             {
                 "subject": email_row.subject,
-                "contact_name": case.contact.name,
+                "contact_name": _reply_contact_name(
+                    case.contact.name,
+                    email_row.body_text,
+                ),
                 "approved_product_key": quote_rows[0][0].approved_text_key,
             }
         )
@@ -6427,7 +6488,10 @@ async def _maybe_handle_coa_request(
     entry = dict(result.matches[0])
     product_name = str(entry.get("product_code") or entry.get("product_name") or query)
     subject, draft_body = _coa_reply_draft(
-        contact_name=case.contact.name,
+        contact_name=_reply_contact_name(
+            case.contact.name,
+            getattr(email_row, "body_text", ""),
+        ),
         original_subject=email_row.subject,
         product_name=product_name,
     )
@@ -7135,7 +7199,7 @@ async def _maybe_send_general_product_list(
         products=products,
         file_format="xlsx",
     )
-    contact_name = case.contact.name.strip() or "Customer"
+    contact_name = _reply_contact_name(case.contact.name, email_row.body_text)
     draft_body = (
         f"Dear {contact_name},\n\n"
         "Please find attached our current English product catalogue. It includes the approved "
@@ -7356,7 +7420,7 @@ async def _maybe_send_product_list(
             request_text=f"{email_row.subject}\n{email_row.body_text}",
         )
         text, html_body = render_product_list_email(
-            contact_name=case.contact.name,
+            contact_name=_reply_contact_name(case.contact.name, email_row.body_text),
             category=category,
             products=products,
             subject=email_row.subject,
@@ -7875,7 +7939,7 @@ async def backfill_product_list_requests(
                     )
                 )
                 text_body, html_body = render_product_list_email(
-                    contact_name=contact.name,
+                    contact_name=_reply_contact_name(contact.name, source.body_text),
                     category=category,
                     products=products,
                     subject=source.subject,
@@ -8578,7 +8642,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         plan = await ai.draft_plan(
             {
                 "subject": email_row.subject,
-                "contact_name": case.contact.name,
+                "contact_name": _reply_contact_name(
+                    case.contact.name,
+                    email_row.body_text,
+                ),
                 "approved_product_key": case.product.approved_text_key,
                 "historical_style_examples": historical_style_examples,
             }

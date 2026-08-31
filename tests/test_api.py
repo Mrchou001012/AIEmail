@@ -26,7 +26,7 @@ from app.api import (
 )
 from app.db import Handoff
 from app.mail import OutboundAttachment
-from app.services import _strip_duplicate_signature_lead
+from app.services import _reply_contact_name, _strip_duplicate_signature_lead
 
 
 @pytest.mark.asyncio
@@ -102,6 +102,32 @@ def test_handoff_suggestion_does_not_duplicate_the_automatic_signature() -> None
 
     assert suggestion["body_text"].startswith("Dear Customer,")
     assert "Best regards" not in suggestion["body_text"]
+
+
+def test_reply_contact_name_uses_high_confidence_signature_name_for_placeholder() -> None:
+    body = """Dear Mam,
+
+Thanks for your email.
+
+Thanks and Regards,
+
+Nikita Karande
+Marketing & Sales
+SEEMA BIOTECH
+"""
+
+    assert _reply_contact_name("Customer", body) == "Nikita Karande"
+
+
+def test_reply_contact_name_preserves_verified_contact_name() -> None:
+    body = "Best regards,\nSomeone Else\nSales Manager"
+
+    assert _reply_contact_name("Alice Buyer", body) == "Alice Buyer"
+
+
+def test_reply_contact_name_rejects_job_title_or_company_as_name() -> None:
+    assert _reply_contact_name("Customer", "Best regards,\nMarketing & Sales\nSEEMA BIOTECH") == "Customer"
+    assert _reply_contact_name("Customer", "Best regards,\nSEEMA BIOTECH\nMumbai") == "Customer"
 
 
 def test_handoff_suggestion_prefers_saved_ai_preview() -> None:
@@ -181,7 +207,12 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/draft-preview/stream" in html
     assert 'id="prepared-product-list-review"' in html
     assert "/prepared-product-list/download" in html
-    assert "下载 Excel 预览（不会发送）" in html
+    assert "下载 Excel 预览" in html
+    assert "查看 ${esc(codes.length)} 个对外产品代码" in html
+    assert "preparedProductList.catalog_codes" in html
+    assert 'id="send-attachment-summary"' in html
+    assert "发送时将自动附加" in html
+    assert "确认当前正文并附加" not in html
     assert "付款条件待重新生成，暂不可发送" in html
     assert "response.body.getReader()" in html
     assert 'new TextDecoder("utf-8")' in html

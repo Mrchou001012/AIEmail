@@ -2968,8 +2968,38 @@ async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[st
     facts_payload = dict(handoff.extracted_facts or {})
     prepared_product_list = facts_payload.get("prepared_product_list")
     if isinstance(prepared_product_list, dict):
+        prepared_product_ids = [
+            int(value)
+            for value in prepared_product_list.get("product_ids") or []
+            if str(value).isdigit()
+        ]
+        catalog_codes_by_id: dict[int, str] = {}
+        if prepared_product_ids:
+            catalog_code_rows = (
+                await session.execute(
+                    select(Product.id, Product.catalog_code).where(
+                        Product.id.in_(prepared_product_ids),
+                        Product.active.is_(True),
+                        Product.catalog_visible.is_(True),
+                        Product.catalog_code.is_not(None),
+                    )
+                )
+            ).all()
+            catalog_codes_by_id = {
+                int(product_id): str(catalog_code).strip()
+                for product_id, catalog_code in catalog_code_rows
+                if str(catalog_code or "").strip()
+            }
         facts_payload["prepared_product_list"] = {
             **prepared_product_list,
+            # Internal product codes remain in the persisted snapshot for
+            # approval-time validation. Only audited customer-facing codes are
+            # exposed separately to the review UI.
+            "catalog_codes": [
+                catalog_codes_by_id[product_id]
+                for product_id in prepared_product_ids
+                if product_id in catalog_codes_by_id
+            ],
             "missing_business_facts": await product_list_missing_business_facts(
                 session,
                 handoff=handoff,

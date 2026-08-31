@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 import app.services as services
 from app.agent_runtime import answer_product_category_assistance
 from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
+from app.api import handoff_detail
 from app.db import (
     AgentRun,
     AgentRunStatus,
@@ -714,12 +715,17 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
-    await _seed_catalog_and_interest(db_session, interests=[])
+    _, contact_id = await _seed_catalog_and_interest(db_session, interests=[])
+    contact = await db_session.get(Contact, contact_id)
+    assert contact is not None
+    contact.name = "Customer"
+    await db_session.commit()
     email_row = await ingest_raw_email(
         db_session,
         _message(
             "Checking in from Lanya Chem",
-            "Kindly share your product list and share your payment support.",
+            "Kindly share your product list and share your payment support.\n\n"
+            "Thanks and Regards,\n\nNikita Karande\nMarketing & Sales\nSEEMA BIOTECH",
             message_id="catalog-and-payment@example.com",
         ),
         mailbox="integration-test",
@@ -750,6 +756,7 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     await db_session.refresh(handoff)
 
     assert "Please find attached our current English product catalogue" in preview["body_text"]
+    assert preview["body_text"].startswith("Dear Nikita Karande,")
     assert "reviewing your request" not in preview["body_text"]
     assert "For a first order, our standard payment term is prepayment." in preview["body_text"]
     assert preview["provider"] == "deterministic-product-list"
@@ -761,6 +768,12 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     assert prepared["payment_term_source"] == "new_customer_default"
     assert prepared["payment_term_quote_id"] is None
     assert prepared["missing_business_facts"] == []
+
+    detail = await handoff_detail(handoff.id, "reviewer", db_session)
+    review_codes = detail["facts"]["prepared_product_list"]["catalog_codes"]
+    assert review_codes
+    assert all(review_codes)
+    assert "YAC-N823(98%)" not in review_codes
 
     attachment = await prepared_product_list_attachment(
         db_session,
