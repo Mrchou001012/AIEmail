@@ -182,7 +182,7 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert 'id="prepared-product-list-review"' in html
     assert "/prepared-product-list/download" in html
     assert "下载 Excel 预览（不会发送）" in html
-    assert "付款条款待业务确认，暂不可发送" in html
+    assert "付款条件待重新生成，暂不可发送" in html
     assert "response.body.getReader()" in html
     assert 'new TextDecoder("utf-8")' in html
 

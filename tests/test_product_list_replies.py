@@ -32,6 +32,7 @@ from app.db import (
     PricePolicy,
     Product,
     ProductCategory,
+    Quote,
     ReactivationCampaign,
     ReactivationRecipient,
     SalesCase,
@@ -708,7 +709,7 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     assert run.status == AgentRunStatus.COMPLETED
 
 
-async def test_manual_draft_regeneration_preserves_catalog_and_blocks_missing_payment_terms(
+async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_customer_to_prepayment(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -750,12 +751,16 @@ async def test_manual_draft_regeneration_preserves_catalog_and_blocks_missing_pa
 
     assert "Please find attached our current English product catalogue" in preview["body_text"]
     assert "reviewing your request" not in preview["body_text"]
+    assert "For a first order, our standard payment term is prepayment." in preview["body_text"]
     assert preview["provider"] == "deterministic-product-list"
-    assert preview["missing_business_facts"] == ["payment_terms"]
+    assert preview["missing_business_facts"] == []
     prepared = handoff.extracted_facts["prepared_product_list"]
     assert prepared["product_count"] == 71
     assert [row["product_count"] for row in prepared["category_breakdown"]] == [45, 10, 16]
-    assert prepared["missing_business_facts"] == ["payment_terms"]
+    assert prepared["payment_term"] == "Prepayment"
+    assert prepared["payment_term_source"] == "new_customer_default"
+    assert prepared["payment_term_quote_id"] is None
+    assert prepared["missing_business_facts"] == []
 
     attachment = await prepared_product_list_attachment(
         db_session,
@@ -766,14 +771,111 @@ async def test_manual_draft_regeneration_preserves_catalog_and_blocks_missing_pa
     assert workbook.active.max_row == 72
     assert await _queued_product_list(db_session) is None
 
-    with pytest.raises(ValueError, match="missing approved business facts: payment_terms"):
-        await queue_prepared_product_list_reply(
-            db_session,
-            handoff_id=handoff.id,
-            subject=preview["subject"],
-            body_text=preview["body_text"],
-            actor="reviewer",
+    outbox = await queue_prepared_product_list_reply(
+        db_session,
+        handoff_id=handoff.id,
+        subject=preview["subject"],
+        body_text=preview["body_text"],
+        actor="reviewer",
+    )
+    assert outbox.message_kind == "HUMAN_REPLY"
+    assert "Lanya_Chem_all_products_product_list.xlsx" in outbox.raw_message
+
+
+async def test_product_list_payment_term_uses_latest_sent_customer_quote(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
+    customer_id, contact_id = await _seed_catalog_and_interest(
+        db_session,
+        interests=[],
+    )
+    product = await db_session.scalar(
+        select(Product).where(Product.code == "YAC-A110")
+    )
+    assert product is not None
+    policy = PricePolicy(
+        product_id=product.id,
+        currency="USD",
+        standard_price=Decimal("10"),
+        absolute_floor=Decimal("10"),
+        max_discount_pct=Decimal("0"),
+        standard_incoterm="EXW",
+        allowed_incoterms=["EXW"],
+        standard_payment_term="30% deposit / 70% before shipment",
+        allowed_payment_terms=["30% deposit / 70% before shipment"],
+        valid_from=date.today() - timedelta(days=30),
+        valid_to=date.today() - timedelta(days=1),
+        source_hash="historical-payment-test",
+        active=False,
+    )
+    db_session.add(policy)
+    await db_session.flush()
+    historical_case = SalesCase(
+        customer_id=customer_id,
+        contact_id=contact_id,
+        product_id=product.id,
+        currency="USD",
+        stage=CaseStage.DEAL_ORDER_DECISION,
+        status=CaseStatus.CLOSED_WON,
+        subject_key="historical completed order",
+    )
+    db_session.add(historical_case)
+    await db_session.flush()
+    historical_quote = Quote(
+        case_id=historical_case.id,
+        product_id=product.id,
+        price_policy_id=policy.id,
+        round_number=0,
+        unit_price=Decimal("10"),
+        currency="USD",
+        quantity=100,
+        incoterm="EXW",
+        payment_term="30% deposit / 70% before shipment",
+        valid_until=date.today() - timedelta(days=1),
+        pricing_snapshot={},
+    )
+    db_session.add(historical_quote)
+    await db_session.flush()
+    db_session.add(
+        Outbox(
+            case_id=historical_case.id,
+            quote_id=historical_quote.id,
+            message_kind="AUTO_QUOTE",
+            business_key="historical-payment-quote",
+            message_id="<historical-payment-quote@example.com>",
+            recipient="api@ethachem.example",
+            raw_message="From: sales-agent@example.com\nTo: api@ethachem.example\n\nQuote",
+            status=DeliveryStatus.SENT,
+            sent_at=datetime.now(UTC) - timedelta(days=20),
+            sent_via="smtp",
         )
+    )
+    await db_session.commit()
+
+    email_row = await ingest_raw_email(
+        db_session,
+        _message(
+            "New catalogue request",
+            "Please send your product list and payment terms.",
+            message_id="historical-payment-catalog@example.com",
+        ),
+        mailbox="integration-test",
+    )
+    assert email_row is not None
+    await process_inbound(db_session, email_row.id)
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == email_row.id)
+    )
+    assert handoff is not None
+    prepared = handoff.extracted_facts["prepared_product_list"]
+    preview = handoff.extracted_facts["ai_draft_preview"]
+
+    assert prepared["payment_term"] == "30% deposit / 70% before shipment"
+    assert prepared["payment_term_source"] == "latest_sent_quote"
+    assert prepared["payment_term_quote_id"] == historical_quote.id
+    assert "used previously: 30% deposit / 70% before shipment" in preview["body_text"]
 
 
 async def test_company_research_observation_mode_records_evidence_without_sending(

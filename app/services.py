@@ -169,38 +169,55 @@ def _payment_details_requested(text: str) -> bool:
     return PAYMENT_DETAILS_REQUEST_PATTERN.search(text) is not None
 
 
-async def _current_unique_standard_payment_term(
+@dataclass(frozen=True)
+class CustomerPaymentTerm:
+    term: str
+    source: str
+    quote_id: int | None = None
+
+
+async def _customer_payment_term(
     session: AsyncSession,
     *,
-    settings: Settings,
-) -> str | None:
-    """Return a payment term only when all current policies agree on it."""
+    customer_id: int,
+) -> CustomerPaymentTerm:
+    """Use the latest actually-sent structured quote, otherwise prepayment.
 
-    today = datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date()
-    values = list(
-        (
-            await session.scalars(
-                select(PricePolicy.standard_payment_term)
-                .where(
-                    PricePolicy.active.is_(True),
-                    PricePolicy.valid_from <= today,
-                    (
-                        PricePolicy.valid_to.is_(None)
-                        | (PricePolicy.valid_to >= today)
-                    ),
-                )
-                .distinct()
+    Historical email prose and RAG examples are intentionally excluded: they
+    are useful for writing style, but are not an approved commercial ledger.
+    """
+
+    historical = (
+        await session.execute(
+            select(Quote.id, Quote.payment_term)
+            .join(SalesCase, Quote.case_id == SalesCase.id)
+            .join(Outbox, Outbox.quote_id == Quote.id)
+            .where(
+                SalesCase.customer_id == customer_id,
+                Outbox.status == DeliveryStatus.SENT,
+                Outbox.sent_at.is_not(None),
             )
-        ).all()
+            .order_by(Outbox.sent_at.desc(), Quote.created_at.desc(), Quote.id.desc())
+            .limit(1)
+        )
     )
-    terms: dict[str, str] = {}
-    for value in values:
+    row = historical.first()
+    if row is not None:
+        quote_id, value = row
         clean = str(value or "").strip()
         if clean:
-            terms.setdefault(clean.casefold(), clean)
-    if len(terms) != 1:
-        return None
-    return next(iter(terms.values()))
+            return CustomerPaymentTerm(
+                term=clean,
+                source="latest_sent_quote",
+                quote_id=int(quote_id),
+            )
+    return CustomerPaymentTerm(term="Prepayment", source="new_customer_default")
+
+
+def _payment_term_sentence(payment: CustomerPaymentTerm) -> str:
+    if payment.source == "new_customer_default":
+        return "For a first order, our standard payment term is prepayment."
+    return f"We can continue with the payment term used previously: {payment.term}."
 
 
 async def _catalog_category_breakdown(
@@ -1603,18 +1620,17 @@ async def _prepared_handoff_draft_preview(
 
         payment_requested = _payment_details_requested(request_text)
         payment_term: str | None = None
+        payment_term_source: str | None = None
+        payment_term_quote_id: int | None = None
         if payment_requested:
-            payment_term = await _current_unique_standard_payment_term(
+            payment = await _customer_payment_term(
                 session,
-                settings=settings,
+                customer_id=sales_case.customer_id,
             )
-            if payment_term is None:
-                missing_business_facts.append("payment_terms")
-            elif payment_term.casefold() not in body_text.casefold():
-                body_text = (
-                    f"{body_text.rstrip()}\n\n"
-                    f"Our standard payment term is {payment_term}."
-                )
+            payment_term = payment.term
+            payment_term_source = payment.source
+            payment_term_quote_id = payment.quote_id
+            body_text = f"{body_text.rstrip()}\n\n{_payment_term_sentence(payment)}"
 
         prepared_product_list = {
             **prepared_product_list,
@@ -1626,6 +1642,8 @@ async def _prepared_handoff_draft_preview(
             "attachment_filename": attachment_filename,
             "payment_requested": payment_requested,
             "payment_term": payment_term,
+            "payment_term_source": payment_term_source,
+            "payment_term_quote_id": payment_term_quote_id,
             "missing_business_facts": missing_business_facts,
         }
         stored_facts["prepared_product_list"] = prepared_product_list
@@ -1745,7 +1763,7 @@ async def stream_handoff_draft_preview(
             yield {
                 "type": "status",
                 "stage": "blocked",
-                "message": "产品列表已准备，但付款条款仍待业务确认；当前草稿禁止发送。",
+                "message": "产品列表已准备，但仍有商业条件未写入当前草稿；暂时禁止发送。",
             }
         session.add(
             AIInvocation(
@@ -6644,7 +6662,6 @@ async def product_list_missing_business_facts(
     *,
     handoff: Handoff,
     source_email: EmailMessage | None,
-    settings: Settings | None = None,
 ) -> list[str]:
     prepared = (handoff.extracted_facts or {}).get("prepared_product_list")
     if not isinstance(prepared, dict):
@@ -6657,17 +6674,29 @@ async def product_list_missing_business_facts(
     if source_email is not None and _payment_details_requested(
         f"{source_email.subject}\n{source_email.body_text}"
     ):
-        settings = settings or get_settings()
-        current_payment_term = await _current_unique_standard_payment_term(
-            session,
-            settings=settings,
+        sales_case = (
+            await session.get(SalesCase, handoff.case_id)
+            if handoff.case_id is not None
+            else None
         )
-        if (
-            current_payment_term is None
-            or str(prepared.get("payment_term") or "").strip().casefold()
-            != current_payment_term.casefold()
-        ):
+        if sales_case is None:
             missing.add("payment_terms")
+        else:
+            current = await _customer_payment_term(
+                session,
+                customer_id=sales_case.customer_id,
+            )
+            prepared_quote_id = prepared.get("payment_term_quote_id")
+            if (
+                str(prepared.get("payment_term") or "").strip().casefold()
+                != current.term.casefold()
+                or str(prepared.get("payment_term_source") or "") != current.source
+                or (
+                    int(prepared_quote_id) if prepared_quote_id is not None else None
+                )
+                != current.quote_id
+            ):
+                missing.add("payment_terms")
     return sorted(missing)
 
 
@@ -7103,18 +7132,14 @@ async def _maybe_send_general_product_list(
         "availability and pricing."
     )
     payment_requested = _payment_details_requested(request_text)
-    payment_term = (
-        await _current_unique_standard_payment_term(session, settings=settings)
+    payment = (
+        await _customer_payment_term(session, customer_id=case.customer_id)
         if payment_requested
         else None
     )
-    missing_business_facts = (
-        ["payment_terms"] if payment_requested and payment_term is None else []
-    )
-    if payment_term is not None:
-        draft_body = (
-            f"{draft_body}\n\nOur standard payment term is {payment_term}."
-        )
+    payment_term = payment.term if payment is not None else None
+    if payment is not None:
+        draft_body = f"{draft_body}\n\n{_payment_term_sentence(payment)}"
     subject = f"Re: {email_row.subject}" if email_row.subject.strip() else "Lanya Chem product catalogue"
     prepared = {
         "scope": "all",
@@ -7129,18 +7154,16 @@ async def _maybe_send_general_product_list(
         "attachment_filename": catalog_file.filename,
         "payment_requested": payment_requested,
         "payment_term": payment_term,
-        "missing_business_facts": missing_business_facts,
+        "payment_term_source": payment.source if payment is not None else None,
+        "payment_term_quote_id": payment.quote_id if payment is not None else None,
+        "missing_business_facts": [],
     }
-    if not settings.product_list_auto_send_enabled or missing_business_facts:
+    if not settings.product_list_auto_send_enabled:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.PRODUCT_LIST_REVIEW,
-            summary=(
-                "Company-wide product catalog prepared; payment terms require business confirmation"
-                if missing_business_facts
-                else "Company-wide product catalog draft prepared; human approval is required"
-            ),
+            summary="Company-wide product catalog draft prepared; human approval is required",
             facts={
                 **analysis_facts,
                 "prepared_product_list": prepared,
@@ -7360,19 +7383,15 @@ async def _maybe_send_product_list(
     )
     product_list_request_text = f"{email_row.subject}\n{email_row.body_text}"
     payment_requested = _payment_details_requested(product_list_request_text)
-    payment_term = (
-        await _current_unique_standard_payment_term(session, settings=settings)
+    payment = (
+        await _customer_payment_term(session, customer_id=case.customer_id)
         if payment_requested
         else None
     )
-    missing_business_facts = (
-        ["payment_terms"] if payment_requested and payment_term is None else []
-    )
-    if payment_term is not None:
-        draft_body = (
-            f"{draft_body}\n\nOur standard payment term is {payment_term}."
-        )
-    if not settings.product_list_auto_send_enabled or missing_business_facts:
+    payment_term = payment.term if payment is not None else None
+    if payment is not None:
+        draft_body = f"{draft_body}\n\n{_payment_term_sentence(payment)}"
+    if not settings.product_list_auto_send_enabled:
         file_format = requested_product_list_file_format(
             f"{email_row.subject}\n{email_row.body_text}"
         )
@@ -7380,11 +7399,7 @@ async def _maybe_send_product_list(
             session,
             case=case,
             reason=HandoffReason.PRODUCT_LIST_REVIEW,
-            summary=(
-                f"Product list for {category.name} prepared; payment terms require business confirmation"
-                if missing_business_facts
-                else f"Product-list draft prepared for {category.name}; human approval is required"
-            ),
+            summary=f"Product-list draft prepared for {category.name}; human approval is required",
             facts={
                 **analysis_facts,
                 "prepared_product_list": {
@@ -7401,7 +7416,9 @@ async def _maybe_send_product_list(
                     "attachment_filename": attachment_filename,
                     "payment_requested": payment_requested,
                     "payment_term": payment_term,
-                    "missing_business_facts": missing_business_facts,
+                    "payment_term_source": payment.source if payment is not None else None,
+                    "payment_term_quote_id": payment.quote_id if payment is not None else None,
+                    "missing_business_facts": [],
                 },
                 "ai_draft_preview": {
                     "subject": subject,

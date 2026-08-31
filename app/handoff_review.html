@@ -533,7 +533,7 @@
       const productListBlocked = missingBusinessFacts.length > 0;
       $("#send").disabled = blocked || productListBlocked;
       $("#send").textContent = productListBlocked
-        ? "付款条款待业务确认，暂不可发送"
+        ? "付款条件待重新生成，暂不可发送"
         : preparedCoa
         ? `确认并附加 ${preparedCoa.filename || "COA.pdf"} 后加入发件队列`
         : preparedProductList
@@ -556,7 +556,7 @@
           ? breakdown.map((row) => `${row.category_name}：${row.product_count} 个`).join("；")
           : "分类明细将在重新生成草稿后显示";
         const missingText = productListBlocked
-          ? '<div class="danger"><strong>尚不能发送：</strong>客户同时询问付款方式，但系统没有已确认的付款条款。请等待业务确认，系统不会编造或向客户发送占位回复。</div>'
+          ? '<div class="danger"><strong>尚不能发送：</strong>当前草稿还没有按付款规则生成。系统将沿用客户最近一次已发送报价中的付款条件；没有这类历史时默认首单预付款。请点击上方“重新生成”后再核对。</div>'
           : "";
         const download = preparedProductList.file_format
           ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 Excel 预览（不会发送）</a></div>`
