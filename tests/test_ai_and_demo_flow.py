@@ -413,6 +413,17 @@ def test_extract_quantity_kg_from_trusted_thread_context(
         ("We are interested in industrial silanes.", False),
         ("Please quote YAC-A110 and include the CAS number.", False),
         ("Please quote 100 kg.", False),
+        (
+            "We will review our requirements and get in touch with you if we have "
+            "any inquiries regarding your current product list with us.",
+            False,
+        ),
+        (
+            "Thank you. We will contact you if needed.\n\n"
+            "On Mon, 31 Aug 2026, sales@lanyachem.com wrote:\n"
+            "Please share your product list.",
+            False,
+        ),
     ],
 )
 def test_explicit_product_list_request_markers(text: str, expected: bool) -> None:

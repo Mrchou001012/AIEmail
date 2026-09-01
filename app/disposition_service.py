@@ -1,0 +1,1606 @@
+import hashlib
+import html
+import json
+import re
+from collections import Counter
+from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
+from email.utils import parseaddr, parsedate_to_datetime
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent_runtime import finalize_handoff_agent_run
+from app.db import (
+    AgentRun,
+    AgentRunStatus,
+    AgentStep,
+    AgentStepStatus,
+    AssistanceRequest,
+    AssistanceStatus,
+    AuditEvent,
+    Contact,
+    ContactReferral,
+    Customer,
+    DeliveryStatus,
+    EmailMessage,
+    Handoff,
+    InboundDispositionAction,
+    Job,
+    JobStatus,
+    Outbox,
+    SalesCase,
+)
+from app.deliverability import validate_address_format
+from app.imports import load_content
+from app.inbound_disposition import (
+    InboundDisposition,
+    InboundDispositionType,
+    classify_inbound_disposition,
+)
+from app.mail import build_message, parse_mime
+from app.settings import Settings, get_settings
+
+FREE_MAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "yahoo.com",
+        "yahoo.co.in",
+        "qq.com",
+        "163.com",
+        "126.com",
+    }
+)
+
+MONTH_FORMATS = (
+    "%B %d %Y",
+    "%b %d %Y",
+    "%d %B %Y",
+    "%d %b %Y",
+    "%B %d",
+    "%b %d",
+    "%d %B",
+    "%d %b",
+)
+DISPOSITION_PROVENANCE_KEYS = frozenset(
+    {
+        "verified_reactivation_parent",
+        "original_contact_id",
+        "reply_contact_id",
+        "sender_changed",
+        "personnel_observation_recorded",
+    }
+)
+
+
+def _headers(row: EmailMessage) -> dict[str, str]:
+    raw = (row.automated_reply_metadata or {}).get("headers") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def classify_email_disposition(row: EmailMessage) -> InboundDisposition:
+    return classify_inbound_disposition(
+        subject=row.subject,
+        body=row.body_text,
+        headers=_headers(row),
+        sender=row.from_address,
+    )
+
+
+def _domain(address: str | None) -> str | None:
+    value = (address or "").strip().casefold()
+    if "@" not in value:
+        return None
+    domain = value.rsplit("@", 1)[1].strip(". ")
+    return domain or None
+
+
+def _same_company_domain(first: str | None, second: str | None) -> bool:
+    first_domain = _domain(first)
+    second_domain = _domain(second)
+    return bool(
+        first_domain
+        and first_domain == second_domain
+        and first_domain not in FREE_MAIL_DOMAINS
+    )
+
+
+def _parse_return_until(
+    return_hint: str | None,
+    *,
+    received_at: datetime,
+) -> datetime | None:
+    if not return_hint:
+        return None
+    cleaned = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", return_hint, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    parsed: datetime | None = None
+    try:
+        parsed = parsedate_to_datetime(cleaned)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    if parsed is None:
+        for format_string in MONTH_FORMATS:
+            try:
+                if "%Y" in format_string:
+                    parsed = datetime.strptime(cleaned, format_string)
+                else:
+                    parsed = datetime.strptime(
+                        f"{cleaned} {received_at.year}",
+                        f"{format_string} %Y",
+                    )
+            except ValueError:
+                continue
+            if "%Y" not in format_string:
+                if parsed.date() < received_at.date() - timedelta(days=7):
+                    parsed = parsed.replace(year=received_at.year + 1)
+            break
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=received_at.tzinfo or UTC)
+    # Resume after the stated return/closure day, never during it.
+    return datetime.combine(parsed.date() + timedelta(days=1), time.min, parsed.tzinfo).astimezone(UTC)
+
+
+async def _unique_sender_contact(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> Contact | None:
+    if row.contact_id is not None:
+        return await session.get(Contact, row.contact_id)
+    sender = row.from_address.strip().casefold()
+    contacts = (
+        (
+            await session.execute(
+                select(Contact).where(func.lower(Contact.email) == sender).limit(2)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return contacts[0] if len(contacts) == 1 else None
+
+
+async def _disposition_contact(
+    session: AsyncSession,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    sender_contact: Contact | None,
+) -> Contact | None:
+    """Resolve the endpoint affected by a verified personnel message."""
+
+    metadata = row.disposition_metadata or {}
+    if (
+        disposition.disposition_type is not InboundDispositionType.DEPARTED
+        or not metadata.get("verified_reactivation_parent")
+        or not metadata.get("sender_changed")
+    ):
+        return sender_contact
+    raw_original_contact_id = metadata.get("original_contact_id")
+    if not isinstance(raw_original_contact_id, (int, str)) or isinstance(
+        raw_original_contact_id, bool
+    ):
+        return sender_contact
+    try:
+        original_contact_id = int(raw_original_contact_id)
+    except (TypeError, ValueError):
+        return sender_contact
+    original = await session.get(Contact, original_contact_id)
+    expected_customer_id = row.customer_id or (
+        sender_contact.customer_id if sender_contact is not None else None
+    )
+    if (
+        original is None
+        or expected_customer_id is None
+        or original.customer_id != expected_customer_id
+    ):
+        return sender_contact
+    return original
+
+
+async def _resolved_customer(
+    session: AsyncSession,
+    row: EmailMessage,
+    contact: Contact | None,
+) -> Customer | None:
+    customer_id = row.customer_id or (contact.customer_id if contact else None)
+    return await session.get(Customer, customer_id) if customer_id else None
+
+
+async def build_disposition_plan(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> dict[str, Any]:
+    disposition = classify_email_disposition(row)
+    sender_contact = await _unique_sender_contact(session, row)
+    contact = await _disposition_contact(session, row, disposition, sender_contact)
+    customer = await _resolved_customer(session, row, contact)
+    return_until = _parse_return_until(
+        disposition.return_hint,
+        received_at=row.received_at,
+    )
+    proposed_actions: list[str] = []
+    blockers: list[str] = []
+
+    if disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
+        proposed_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
+        if contact is None:
+            blockers.append("SENDER_CONTACT_NOT_UNIQUE")
+        if return_until is None:
+            blockers.append("RETURN_DATE_NOT_RELIABLE")
+    elif disposition.disposition_type is InboundDispositionType.DEPARTED:
+        proposed_actions.extend(["SUPPRESS_DEPARTED_CONTACT", "SAVE_REFERRALS"])
+        verified_original_contact = bool(
+            contact is not None
+            and (
+                disposition.automated_transport_signal
+                or (
+                    sender_contact is not None
+                    and contact.id != sender_contact.id
+                    and (row.disposition_metadata or {}).get(
+                        "verified_reactivation_parent"
+                    )
+                )
+            )
+        )
+        if not verified_original_contact:
+            blockers.append("ORIGINAL_CONTACT_NOT_VERIFIED")
+        verified_reply_contact = bool(
+            verified_original_contact
+            and sender_contact is not None
+            and contact is not None
+            and sender_contact.id != contact.id
+        )
+        if verified_reply_contact:
+            proposed_actions.append("KEEP_VERIFIED_REPLY_CONTACT")
+        if not disposition.replacement_emails and not verified_reply_contact:
+            blockers.append("NO_REPLACEMENT_CONTACT")
+    elif disposition.disposition_type in {
+        InboundDispositionType.CONTACT_REFERRAL,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+    }:
+        proposed_actions.append("SAVE_REFERRALS")
+        if disposition.forwarded_to_replacement:
+            proposed_actions.append("WAIT_FOR_FORWARDED_REPLY")
+        else:
+            proposed_actions.append("REVIEW_NEW_CONTACT_OUTREACH")
+        if customer is None:
+            blockers.append("CUSTOMER_NOT_RESOLVED")
+        if not disposition.replacement_emails:
+            blockers.append("NO_REPLACEMENT_CONTACT")
+    elif disposition.disposition_type is InboundDispositionType.NON_TARGET:
+        proposed_actions.extend(["MARK_CUSTOMER_NON_TARGET", "STOP_REACTIVATION"])
+        if customer is None:
+            blockers.append("CUSTOMER_NOT_RESOLVED")
+    elif disposition.disposition_type in {
+        InboundDispositionType.AUTOMATED_ACKNOWLEDGEMENT,
+        InboundDispositionType.SYSTEM_NOTIFICATION,
+    }:
+        proposed_actions.append("IGNORE_AUTOREPLY")
+    else:
+        proposed_actions.append("CONTINUE_BUSINESS_PIPELINE")
+
+    referral_candidates = []
+    for address in disposition.replacement_emails:
+        same_domain = _same_company_domain(
+            contact.email if contact else row.from_address,
+            address,
+        )
+        referral_candidates.append(
+            {
+                "email": address,
+                "same_company_domain": same_domain,
+                "auto_contact_eligible": bool(
+                    same_domain
+                    and len(disposition.replacement_emails) == 1
+                    and not disposition.forwarded_to_replacement
+                ),
+            }
+        )
+    if disposition.replacement_emails and not any(
+        candidate["same_company_domain"] for candidate in referral_candidates
+    ):
+        blockers.append("NO_SAME_DOMAIN_REFERRAL")
+    if len(disposition.replacement_emails) > 1:
+        blockers.append("MULTIPLE_REFERRALS_REQUIRE_REVIEW")
+
+    latest_action = await session.scalar(
+        select(InboundDispositionAction)
+        .where(InboundDispositionAction.source_email_id == row.id)
+        .order_by(InboundDispositionAction.id.desc())
+        .limit(1)
+    )
+    action_summary = (
+        {
+            "id": latest_action.id,
+            "status": latest_action.status,
+            "disposition_type": latest_action.disposition_type,
+            "applied_by": latest_action.applied_by,
+            "applied_at": _iso(latest_action.applied_at),
+            "rolled_back_by": latest_action.rolled_back_by,
+            "rolled_back_at": _iso(latest_action.rolled_back_at),
+            "rollback_reason": latest_action.rollback_reason,
+            "applied_actions": (
+                (
+                    (latest_action.after_json.get("email") or {}).get(
+                        "disposition_metadata"
+                    )
+                    or {}
+                ).get("applied_actions", [])
+            ),
+            "outboxes": latest_action.after_json.get("outboxes", []),
+        }
+        if latest_action is not None
+        else None
+    )
+
+    plan = {
+        "email_id": row.id,
+        "received_at": row.received_at.isoformat(),
+        "from_address": row.from_address,
+        "subject": row.subject,
+        "case_id": row.case_id,
+        "customer_id": customer.id if customer else None,
+        "customer_qualification_status": (
+            customer.qualification_status if customer else None
+        ),
+        "contact_id": contact.id if contact else None,
+        "contact_email": contact.email if contact else None,
+        "contact_lifecycle_status": contact.lifecycle_status if contact else None,
+        "contact_suppressed": contact.suppressed if contact else None,
+        "sender_contact_id": sender_contact.id if sender_contact else None,
+        "sender_contact_email": sender_contact.email if sender_contact else None,
+        "sender_contact_lifecycle_status": (
+            sender_contact.lifecycle_status if sender_contact else None
+        ),
+        "sender_contact_suppressed": (
+            sender_contact.suppressed if sender_contact else None
+        ),
+        "disposition_handled_at": _iso(row.disposition_handled_at),
+        "disposition_type": disposition.disposition_type.value,
+        "confidence": disposition.confidence,
+        "reason": disposition.reason,
+        "return_hint": disposition.return_hint,
+        "unavailable_until": return_until.isoformat() if return_until else None,
+        "replacement_emails": list(disposition.replacement_emails),
+        "referral_candidates": referral_candidates,
+        "forwarded_to_replacement": disposition.forwarded_to_replacement,
+        "non_target_reason": disposition.non_target_reason,
+        "product_list_requested": disposition.product_list_requested,
+        "continue_business_processing": disposition.continue_business_processing,
+        "proposed_actions": proposed_actions,
+        "blockers": list(dict.fromkeys(blockers)),
+        "body_preview": re.sub(r"\s+", " ", disposition.authored_text)[:500],
+        "latest_action": action_summary,
+    }
+    fingerprint_payload = {
+        key: value for key, value in plan.items() if key != "latest_action"
+    }
+    plan["plan_token"] = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return plan
+
+
+async def _save_referrals(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    contact: Contact | None,
+    customer: Customer | None,
+) -> list[ContactReferral]:
+    saved: list[ContactReferral] = []
+    for address in disposition.replacement_emails:
+        existing = await session.scalar(
+            select(ContactReferral).where(
+                ContactReferral.source_email_id == row.id,
+                func.lower(ContactReferral.referred_email) == address.casefold(),
+            )
+        )
+        if existing is not None:
+            saved.append(existing)
+            continue
+        referral = ContactReferral(
+                source_email_id=row.id,
+                customer_id=customer.id if customer else None,
+                original_contact_id=contact.id if contact else None,
+                referred_email=address,
+                relationship_type=(
+                    "TEMPORARY_BACKUP"
+                    if disposition.disposition_type
+                    is InboundDispositionType.TEMPORARY_ABSENCE
+                    else "REPLACEMENT"
+                ),
+                status=(
+                    "WAITING_FOR_FORWARDED_REPLY"
+                    if disposition.forwarded_to_replacement
+                    else "CANDIDATE"
+                ),
+                forwarded_already=disposition.forwarded_to_replacement,
+                confidence=Decimal(str(disposition.confidence)),
+                metadata_json={
+                    "same_company_domain": _same_company_domain(
+                        contact.email if contact else row.from_address,
+                        address,
+                    ),
+                    "source_disposition": disposition.disposition_type.value,
+                },
+            )
+        session.add(referral)
+        saved.append(referral)
+    await session.flush()
+    return saved
+
+
+async def _save_verified_reply_contact_referral(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    original_contact: Contact,
+    reply_contact: Contact,
+    customer: Customer,
+) -> ContactReferral:
+    existing = await session.scalar(
+        select(ContactReferral).where(
+            ContactReferral.source_email_id == row.id,
+            func.lower(ContactReferral.referred_email)
+            == reply_contact.email.strip().casefold(),
+        )
+    )
+    if existing is not None:
+        existing.customer_id = customer.id
+        existing.original_contact_id = original_contact.id
+        existing.new_contact_id = reply_contact.id
+        existing.referred_name = reply_contact.name
+        existing.status = "ACTIVE_CONTACT"
+        existing.metadata_json = {
+            **(existing.metadata_json or {}),
+            "verified_reactivation_parent": True,
+            "reply_contact_already_engaged": True,
+        }
+        return existing
+    referral = ContactReferral(
+        source_email_id=row.id,
+        customer_id=customer.id,
+        original_contact_id=original_contact.id,
+        new_contact_id=reply_contact.id,
+        referred_email=reply_contact.email.strip().casefold(),
+        referred_name=reply_contact.name,
+        relationship_type="REPLACEMENT",
+        status="ACTIVE_CONTACT",
+        forwarded_already=False,
+        confidence=Decimal(str(disposition.confidence)),
+        metadata_json={
+            "same_company_domain": _same_company_domain(
+                original_contact.email,
+                reply_contact.email,
+            ),
+            "source_disposition": disposition.disposition_type.value,
+            "verified_reactivation_parent": True,
+            "reply_contact_already_engaged": True,
+        },
+    )
+    session.add(referral)
+    await session.flush()
+    return referral
+
+
+async def _stage_referral_outreach(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    source_contact: Contact,
+    customer: Customer,
+    referrals: list[ContactReferral],
+    settings: Settings,
+) -> Outbox | None:
+    """Queue one bounded referral introduction behind three independent gates."""
+
+    if (
+        not settings.referral_auto_contact_enabled
+        or disposition.forwarded_to_replacement
+        or len(referrals) != 1
+        or customer.do_not_contact
+        or customer.qualification_status == "NON_TARGET"
+        or not customer.auto_send_allowed
+    ):
+        return None
+    referral = referrals[0]
+    target_email = referral.referred_email.strip().casefold()
+    if (
+        not _same_company_domain(source_contact.email, target_email)
+        or not validate_address_format(target_email).valid
+    ):
+        return None
+    contacts = (
+        (
+            await session.execute(
+                select(Contact).where(func.lower(Contact.email) == target_email).limit(2)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(item.customer_id != customer.id for item in contacts):
+        return None
+    target = contacts[0] if contacts else None
+    if target is None:
+        target = Contact(
+            customer_id=customer.id,
+            name="Customer",
+            email=target_email,
+            language=source_contact.language,
+            metadata_json={
+                "source": "inbound_contact_referral",
+                "source_email_id": row.id,
+                "original_contact_id": source_contact.id,
+            },
+        )
+        session.add(target)
+        await session.flush()
+    if target.suppressed or target.lifecycle_status == "DEPARTED":
+        return None
+
+    business_key = f"referral-outreach:{row.id}:{target_email}"
+    existing = await session.scalar(
+        select(Outbox).where(Outbox.business_key == business_key)
+    )
+    if existing is not None:
+        referral.new_contact_id = target.id
+        referral.status = "OUTREACH_QUEUED"
+        return existing
+
+    bundle = load_content(settings.content_dir)
+    subject = "Lanya Chem product contact"
+    business_text = (
+        "Dear Sir/Madam,\n\n"
+        "The previous contact at your company directed future correspondence to "
+        "this address. This is Shreya from Lanya Chem.\n\n"
+        "Could you please confirm whether you are the appropriate contact for "
+        "product sourcing? If so, we can share our current product list and follow "
+        "up on any products you require."
+    )
+    text_body = "\n".join([business_text, "", bundle.signature_text.strip()])
+    html_body = (
+        "<p>"
+        + "</p><p>".join(
+            html.escape(line) if line else "&nbsp;"
+            for line in business_text.splitlines()
+        )
+        + "</p>"
+        + bundle.signature_html
+    )
+    message_id, raw = build_message(
+        from_address=settings.mail_from,
+        recipient=target_email,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        stable_key=business_key,
+    )
+    parsed = parse_mime(raw.encode("utf-8"))
+    now = datetime.now(UTC)
+    outbox = Outbox(
+        case_id=None,
+        quote_id=None,
+        message_kind="REFERRAL_OUTREACH",
+        business_key=business_key,
+        message_id=message_id,
+        recipient=target_email,
+        raw_message=raw,
+        status=DeliveryStatus.PENDING,
+        available_at=now,
+    )
+    session.add(outbox)
+    session.add(
+        EmailMessage(
+            case_id=None,
+            customer_id=customer.id,
+            contact_id=target.id,
+            direction="OUTBOUND",
+            message_id=message_id,
+            from_address=parseaddr(settings.mail_from)[1],
+            to_addresses=[target_email],
+            subject=subject,
+            body_text=text_body,
+            body_html=html_body,
+            attachment_metadata=[],
+            raw_sha256=parsed.raw_sha256,
+            is_history=False,
+            received_at=now,
+        )
+    )
+    referral.new_contact_id = target.id
+    referral.status = "OUTREACH_QUEUED"
+    await session.flush()
+    return outbox
+
+
+async def _resolve_terminal_handoff(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    actor: str,
+) -> None:
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id).with_for_update()
+    )
+    if handoff is None or handoff.status != "OPEN":
+        return
+    handoff.status = "RESOLVED"
+    handoff.resolution_note = (
+        f"Automatically resolved by inbound disposition: "
+        f"{disposition.disposition_type.value}"
+    )
+    if handoff.dingtalk_status != "SENT":
+        handoff.dingtalk_status = "CANCELLED"
+    await finalize_handoff_agent_run(
+        session,
+        handoff_id=handoff.id,
+        actor=actor,
+        outcome=f"disposition-{disposition.disposition_type.value.casefold()}",
+    )
+    notify_job = await session.scalar(
+        select(Job).where(Job.idempotency_key == f"handoff-notify:{handoff.id}")
+    )
+    if notify_job is not None and notify_job.status in {
+        JobStatus.PENDING,
+        JobStatus.FAILED,
+    }:
+        notify_job.status = JobStatus.DONE
+        notify_job.last_error = "Cancelled: inbound disposition resolved the handoff"
+        notify_job.locked_at = None
+        notify_job.locked_by = None
+
+
+async def _sync_open_handoff_facts(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+) -> None:
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id).with_for_update()
+    )
+    if handoff is None or handoff.status != "OPEN":
+        return
+    handoff.extracted_facts = {
+        **(handoff.extracted_facts or {}),
+        "inbound_disposition": {
+            "type": disposition.disposition_type.value,
+            "confidence": disposition.confidence,
+            **disposition.metadata(),
+        },
+    }
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return normalized.isoformat()
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    return format(value.normalize(), "f") if value is not None else None
+
+
+async def _lock_disposition_related_resources(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> None:
+    await session.execute(
+        select(ContactReferral)
+        .where(ContactReferral.source_email_id == row.id)
+        .with_for_update()
+    )
+    await session.execute(
+        select(Outbox)
+        .where(Outbox.business_key.like(f"referral-outreach:{row.id}:%"))
+        .with_for_update()
+    )
+    handoff = await session.scalar(
+        select(Handoff)
+        .where(Handoff.source_email_id == row.id)
+        .with_for_update()
+    )
+    if handoff is None:
+        return
+    run = await session.scalar(
+        select(AgentRun).where(AgentRun.handoff_id == handoff.id).with_for_update()
+    )
+    await session.execute(
+        select(Job)
+        .where(Job.idempotency_key == f"handoff-notify:{handoff.id}")
+        .with_for_update()
+    )
+    if run is None:
+        return
+    await session.execute(
+        select(AssistanceRequest)
+        .where(AssistanceRequest.run_id == run.id)
+        .with_for_update()
+    )
+    await session.execute(
+        select(AgentStep).where(AgentStep.run_id == run.id).with_for_update()
+    )
+
+
+async def _disposition_state_snapshot(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> dict[str, Any]:
+    disposition = classify_email_disposition(row)
+    sender_contact = await _unique_sender_contact(session, row)
+    contact = await _disposition_contact(session, row, disposition, sender_contact)
+    customer = await _resolved_customer(session, row, contact)
+    referrals = (
+        (
+            await session.execute(
+                select(ContactReferral)
+                .where(ContactReferral.source_email_id == row.id)
+                .order_by(ContactReferral.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    outboxes = (
+        (
+            await session.execute(
+                select(Outbox)
+                .where(Outbox.business_key.like(f"referral-outreach:{row.id}:%"))
+                .order_by(Outbox.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id)
+    )
+    run = (
+        await session.scalar(select(AgentRun).where(AgentRun.handoff_id == handoff.id))
+        if handoff is not None
+        else None
+    )
+    notify_job = (
+        await session.scalar(
+            select(Job).where(Job.idempotency_key == f"handoff-notify:{handoff.id}")
+        )
+        if handoff is not None
+        else None
+    )
+    assistance_requests = (
+        (
+            (
+                await session.execute(
+                    select(AssistanceRequest)
+                    .where(AssistanceRequest.run_id == run.id)
+                    .order_by(AssistanceRequest.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if run is not None
+        else []
+    )
+    agent_steps = (
+        (
+            (
+                await session.execute(
+                    select(AgentStep)
+                    .where(AgentStep.run_id == run.id)
+                    .order_by(AgentStep.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if run is not None
+        else []
+    )
+    target_contact_ids = sorted(
+        {
+            referral.new_contact_id
+            for referral in referrals
+            if referral.new_contact_id is not None
+        }
+    )
+    target_contacts = []
+    for contact_id in target_contact_ids:
+        target = await session.get(Contact, contact_id)
+        if target is not None:
+            target_contacts.append(
+                {
+                    "id": target.id,
+                    "customer_id": target.customer_id,
+                    "name": target.name,
+                    "email": target.email,
+                    "suppressed": target.suppressed,
+                    "lifecycle_status": target.lifecycle_status,
+                    "unavailable_until": _iso(target.unavailable_until),
+                    "metadata_json": target.metadata_json or {},
+                }
+            )
+    return {
+        "email": {
+            "id": row.id,
+            "disposition_type": row.disposition_type,
+            "disposition_confidence": (
+                _decimal_text(row.disposition_confidence)
+            ),
+            "disposition_metadata": row.disposition_metadata or {},
+            "disposition_handled_at": _iso(row.disposition_handled_at),
+            "automated_reply_handled_at": _iso(row.automated_reply_handled_at),
+        },
+        "contact": (
+            {
+                "id": contact.id,
+                "suppressed": contact.suppressed,
+                "lifecycle_status": contact.lifecycle_status,
+                "unavailable_until": _iso(contact.unavailable_until),
+            }
+            if contact is not None
+            else None
+        ),
+        "customer": (
+            {
+                "id": customer.id,
+                "qualification_status": customer.qualification_status,
+                "qualification_reason": customer.qualification_reason,
+                "qualified_at": _iso(customer.qualified_at),
+            }
+            if customer is not None
+            else None
+        ),
+        "referrals": [
+            {
+                "id": referral.id,
+                "customer_id": referral.customer_id,
+                "original_contact_id": referral.original_contact_id,
+                "new_contact_id": referral.new_contact_id,
+                "referred_email": referral.referred_email,
+                "referred_name": referral.referred_name,
+                "relationship_type": referral.relationship_type,
+                "status": referral.status,
+                "forwarded_already": referral.forwarded_already,
+                "confidence": _decimal_text(referral.confidence),
+                "metadata_json": referral.metadata_json or {},
+            }
+            for referral in referrals
+        ],
+        "target_contacts": target_contacts,
+        "outboxes": [
+            {
+                "id": outbox.id,
+                "status": outbox.status.value,
+                "recipient": outbox.recipient,
+                "message_kind": outbox.message_kind,
+                "message_id": outbox.message_id,
+                "last_error": outbox.last_error,
+                "sent_at": _iso(outbox.sent_at),
+            }
+            for outbox in outboxes
+        ],
+        "handoff": (
+            {
+                "id": handoff.id,
+                "status": handoff.status,
+                "dingtalk_status": handoff.dingtalk_status,
+                "resolution_note": handoff.resolution_note,
+                "extracted_facts": handoff.extracted_facts or {},
+            }
+            if handoff is not None
+            else None
+        ),
+        "agent_run": (
+            {
+                "id": run.id,
+                "status": run.status.value,
+                "current_step": run.current_step,
+                "last_error": run.last_error,
+                "completed_at": _iso(run.completed_at),
+            }
+            if run is not None
+            else None
+        ),
+        "assistance_requests": [
+            {
+                "id": request.id,
+                "status": request.status.value,
+            }
+            for request in assistance_requests
+        ],
+        "agent_steps": [
+            {
+                "id": step.id,
+                "status": step.status.value,
+                "completed_at": _iso(step.completed_at),
+            }
+            for step in agent_steps
+        ],
+        "notify_job": (
+            {
+                "id": notify_job.id,
+                "status": notify_job.status.value,
+                "last_error": notify_job.last_error,
+                "locked_at": _iso(notify_job.locked_at),
+                "locked_by": notify_job.locked_by,
+            }
+            if notify_job is not None
+            else None
+        ),
+    }
+
+
+async def apply_email_disposition(
+    session: AsyncSession,
+    row: EmailMessage,
+    *,
+    settings: Settings | None = None,
+    allow_referral_outreach: bool = True,
+    actor: str = "inbound_disposition",
+    force_manual: bool = False,
+) -> bool:
+    """Record/apply one disposition; return True when no business work remains."""
+
+    settings = settings or get_settings()
+    if not settings.inbound_disposition_enabled or row.is_bounce:
+        return False
+    disposition = classify_email_disposition(row)
+    previous_metadata = dict(row.disposition_metadata or {})
+    classification_metadata = {
+        **disposition.metadata(),
+        **{
+            key: value
+            for key, value in previous_metadata.items()
+            if key.startswith("applied_") or key in DISPOSITION_PROVENANCE_KEYS
+        },
+    }
+    if not settings.inbound_disposition_apply_enabled and not force_manual:
+        row.disposition_type = disposition.disposition_type.value
+        row.disposition_confidence = Decimal(str(disposition.confidence))
+        row.disposition_metadata = classification_metadata
+        return False
+    locked_row = await session.scalar(
+        select(EmailMessage).where(EmailMessage.id == row.id).with_for_update()
+    )
+    if locked_row is None:
+        return False
+    row = locked_row
+    disposition = classify_email_disposition(row)
+    previous_metadata = dict(row.disposition_metadata or {})
+    classification_metadata = {
+        **disposition.metadata(),
+        **{
+            key: value
+            for key, value in previous_metadata.items()
+            if key.startswith("applied_") or key in DISPOSITION_PROVENANCE_KEYS
+        },
+    }
+    if row.disposition_handled_at is not None:
+        return bool(previous_metadata.get("applied_terminal"))
+    active_action = await session.scalar(
+        select(InboundDispositionAction).where(
+            InboundDispositionAction.source_email_id == row.id,
+            InboundDispositionAction.status == "APPLIED",
+        ).with_for_update()
+    )
+    if active_action is not None:
+        action_email = active_action.after_json.get("email") or {}
+        action_metadata = action_email.get("disposition_metadata") or {}
+        return bool(action_metadata.get("applied_terminal"))
+    sender_contact = await _unique_sender_contact(session, row)
+    contact = await _disposition_contact(session, row, disposition, sender_contact)
+    customer = await _resolved_customer(session, row, contact)
+    if customer is not None:
+        await session.scalar(
+            select(Customer).where(Customer.id == customer.id).with_for_update()
+        )
+    contact_ids = sorted(
+        {
+            item.id
+            for item in (contact, sender_contact)
+            if item is not None
+        }
+    )
+    if contact_ids:
+        await session.execute(
+            select(Contact).where(Contact.id.in_(contact_ids)).with_for_update()
+        )
+    sender_contact = await _unique_sender_contact(session, row)
+    contact = await _disposition_contact(session, row, disposition, sender_contact)
+    customer = await _resolved_customer(session, row, contact)
+    if not force_manual:
+        automatic_plan = await build_disposition_plan(session, row)
+        if automatic_plan["blockers"]:
+            row.disposition_type = disposition.disposition_type.value
+            row.disposition_confidence = Decimal(str(disposition.confidence))
+            row.disposition_metadata = classification_metadata
+            return False
+    await _lock_disposition_related_resources(session, row)
+    before_snapshot = await _disposition_state_snapshot(session, row)
+    row.disposition_type = disposition.disposition_type.value
+    row.disposition_confidence = Decimal(str(disposition.confidence))
+    row.disposition_metadata = classification_metadata
+
+    terminal = False
+    applied_actions: list[str] = []
+
+    if disposition.disposition_type in {
+        InboundDispositionType.AUTOMATED_ACKNOWLEDGEMENT,
+        InboundDispositionType.SYSTEM_NOTIFICATION,
+    }:
+        terminal = True
+        applied_actions.append("IGNORE_AUTOREPLY")
+    elif disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
+        if contact is None:
+            return False
+        contact.lifecycle_status = "TEMPORARILY_UNAVAILABLE"
+        contact.unavailable_until = _parse_return_until(
+            disposition.return_hint,
+            received_at=row.received_at,
+        )
+        await _save_referrals(
+            session,
+            row=row,
+            disposition=disposition,
+            contact=contact,
+            customer=customer,
+        )
+        terminal = True
+        applied_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
+    elif disposition.disposition_type is InboundDispositionType.DEPARTED:
+        # A human reply may mention somebody else leaving.  Suppress the sender
+        # only when the transport itself proves this is that endpoint's auto-reply.
+        verified_original_contact = bool(
+            contact is not None
+            and (
+                disposition.automated_transport_signal
+                or (
+                    sender_contact is not None
+                    and contact.id != sender_contact.id
+                    and (row.disposition_metadata or {}).get(
+                        "verified_reactivation_parent"
+                    )
+                )
+            )
+        )
+        if not verified_original_contact:
+            return False
+        assert contact is not None
+        contact.lifecycle_status = "DEPARTED"
+        contact.suppressed = True
+        contact.unavailable_until = None
+        referrals = await _save_referrals(
+            session,
+            row=row,
+            disposition=disposition,
+            contact=contact,
+            customer=customer,
+        )
+        verified_reply_contact = bool(
+            customer is not None
+            and sender_contact is not None
+            and contact.id != sender_contact.id
+        )
+        if verified_reply_contact:
+            assert customer is not None
+            assert sender_contact is not None
+            verified_referral = await _save_verified_reply_contact_referral(
+                session,
+                row=row,
+                disposition=disposition,
+                original_contact=contact,
+                reply_contact=sender_contact,
+                customer=customer,
+            )
+            referrals.append(verified_referral)
+            applied_actions.append("KEEP_VERIFIED_REPLY_CONTACT")
+        outreach = None
+        if (
+            customer is not None
+            and allow_referral_outreach
+            and not verified_reply_contact
+        ):
+            outreach = await _stage_referral_outreach(
+                session,
+                row=row,
+                disposition=disposition,
+                source_contact=contact,
+                customer=customer,
+                referrals=referrals,
+                settings=settings,
+            )
+            if outreach is not None:
+                applied_actions.append("QUEUE_REFERRAL_OUTREACH")
+        terminal = bool(
+            not disposition.continue_business_processing
+            and (
+                disposition.forwarded_to_replacement
+                or outreach is not None
+                or verified_reply_contact
+            )
+        )
+        applied_actions.extend(["SUPPRESS_DEPARTED_CONTACT", "SAVE_REFERRALS"])
+    elif disposition.disposition_type is InboundDispositionType.NON_TARGET:
+        if customer is None:
+            return False
+        customer.qualification_status = "NON_TARGET"
+        customer.qualification_reason = disposition.non_target_reason
+        customer.qualified_at = datetime.now(UTC)
+        terminal = True
+        applied_actions.extend(["MARK_CUSTOMER_NON_TARGET", "STOP_REACTIVATION"])
+    elif disposition.disposition_type in {
+        InboundDispositionType.CONTACT_REFERRAL,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+    }:
+        if customer is None or not disposition.replacement_emails:
+            return False
+        referrals = await _save_referrals(
+            session,
+            row=row,
+            disposition=disposition,
+            contact=contact,
+            customer=customer,
+        )
+        outreach = None
+        if contact is not None and allow_referral_outreach:
+            outreach = await _stage_referral_outreach(
+                session,
+                row=row,
+                disposition=disposition,
+                source_contact=contact,
+                customer=customer,
+                referrals=referrals,
+                settings=settings,
+            )
+            if outreach is not None:
+                applied_actions.append("QUEUE_REFERRAL_OUTREACH")
+        terminal = disposition.forwarded_to_replacement or outreach is not None
+        applied_actions.append("SAVE_REFERRALS")
+
+    if not applied_actions:
+        return False
+    row.disposition_handled_at = datetime.now(UTC)
+    row.disposition_metadata = {
+        **row.disposition_metadata,
+        "applied_actions": applied_actions,
+        "applied_terminal": terminal,
+    }
+    await _sync_open_handoff_facts(
+        session,
+        row=row,
+        disposition=disposition,
+    )
+    if terminal and row.is_automated_reply:
+        row.automated_reply_handled_at = row.disposition_handled_at
+    if terminal:
+        await _resolve_terminal_handoff(
+            session,
+            row=row,
+            disposition=disposition,
+            actor=actor,
+        )
+    session.add(
+        AuditEvent(
+            case_id=row.case_id,
+            actor=actor[:128],
+            event_type="inbound.disposition_applied",
+            data={
+                "email_id": row.id,
+                "disposition_type": disposition.disposition_type.value,
+                "actions": applied_actions,
+                **disposition.metadata(),
+            },
+        )
+    )
+    await session.flush()
+    after_snapshot = await _disposition_state_snapshot(session, row)
+    session.add(
+        InboundDispositionAction(
+            source_email_id=row.id,
+            disposition_type=disposition.disposition_type.value,
+            status="APPLIED",
+            applied_by=actor[:128],
+            before_json=before_snapshot,
+            after_json=after_snapshot,
+        )
+    )
+    return terminal
+
+
+def _parse_snapshot_datetime(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+async def rollback_email_disposition(
+    session: AsyncSession,
+    *,
+    action_id: int,
+    actor: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Restore one disposition action if no irreversible/later change exists."""
+
+    action = await session.scalar(
+        select(InboundDispositionAction)
+        .where(InboundDispositionAction.id == action_id)
+        .with_for_update()
+    )
+    if action is None:
+        raise ValueError("disposition action was not found")
+    if action.status != "APPLIED":
+        raise ValueError("only an applied disposition action can be rolled back")
+    row = await session.scalar(
+        select(EmailMessage)
+        .where(EmailMessage.id == action.source_email_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise ValueError("source email no longer exists")
+
+    before = action.before_json or {}
+    after = action.after_json or {}
+
+    def snapshot_ids(key: str) -> set[int]:
+        ids: set[int] = set()
+        for snapshot in (before.get(key), after.get(key)):
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("id"), int):
+                ids.add(snapshot["id"])
+        return ids
+
+    def snapshot_list_ids(key: str) -> set[int]:
+        return {
+            item["id"]
+            for snapshot in (before.get(key) or [], after.get(key) or [])
+            for item in [snapshot]
+            if isinstance(item, dict) and isinstance(item.get("id"), int)
+        }
+
+    customer_ids = snapshot_ids("customer")
+    contact_ids = snapshot_ids("contact") | snapshot_list_ids("target_contacts")
+    referral_ids = snapshot_list_ids("referrals")
+    outbox_ids = snapshot_list_ids("outboxes")
+    handoff_ids = snapshot_ids("handoff")
+    run_ids = snapshot_ids("agent_run")
+    assistance_ids = snapshot_list_ids("assistance_requests")
+    step_ids = snapshot_list_ids("agent_steps")
+    job_ids = snapshot_ids("notify_job")
+    for model, ids in (
+        (Customer, customer_ids),
+        (Contact, contact_ids),
+        (ContactReferral, referral_ids),
+        (Outbox, outbox_ids),
+        (Handoff, handoff_ids),
+        (AgentRun, run_ids),
+        (AssistanceRequest, assistance_ids),
+        (AgentStep, step_ids),
+        (Job, job_ids),
+    ):
+        if ids:
+            await session.execute(
+                select(model).where(model.id.in_(sorted(ids))).with_for_update()
+            )
+    current = await _disposition_state_snapshot(session, row)
+    conflicts: list[str] = []
+
+    for key in (
+        "email",
+        "contact",
+        "customer",
+        "referrals",
+        "target_contacts",
+        "assistance_requests",
+        "agent_steps",
+    ):
+        if before.get(key) != after.get(key) and current.get(key) != after.get(key):
+            conflicts.append(f"{key.upper()}_CHANGED_AFTER_APPLY")
+    for key in ("handoff", "agent_run", "notify_job"):
+        # A new handoff may legitimately be created after a non-terminal apply;
+        # restore only resources that this action itself changed.
+        if before.get(key) != after.get(key) and current.get(key) != after.get(key):
+            conflicts.append(f"{key.upper()}_CHANGED_AFTER_APPLY")
+
+    before_outbox_ids = {item["id"] for item in before.get("outboxes") or []}
+    after_outboxes = {
+        item["id"]: item for item in after.get("outboxes") or []
+    }
+    created_outbox_ids = sorted(set(after_outboxes) - before_outbox_ids)
+    created_outbox_message_ids = {
+        after_outboxes[outbox_id]["message_id"]
+        for outbox_id in created_outbox_ids
+        if after_outboxes[outbox_id].get("message_id")
+    }
+    for outbox_id in created_outbox_ids:
+        outbox = await session.get(Outbox, outbox_id)
+        if outbox is None:
+            conflicts.append(f"OUTBOX_{outbox_id}_MISSING_AFTER_APPLY")
+        elif outbox.status in {
+            DeliveryStatus.CLAIMED,
+            DeliveryStatus.SENT,
+            DeliveryStatus.UNKNOWN,
+        }:
+            conflicts.append(f"OUTBOX_{outbox_id}_{outbox.status.value}_IRREVERSIBLE")
+
+    before_targets = {item["id"]: item for item in before.get("target_contacts") or []}
+    after_targets = {item["id"]: item for item in after.get("target_contacts") or []}
+    created_target_ids = sorted(set(after_targets) - set(before_targets))
+    removed_contact_ids: list[int] = []
+    for contact_id in created_target_ids:
+        target = await session.get(Contact, contact_id)
+        if target is None:
+            continue
+        metadata = target.metadata_json or {}
+        created_by_action = bool(
+            metadata.get("source") == "inbound_contact_referral"
+            and metadata.get("source_email_id") == row.id
+        )
+        if not created_by_action:
+            continue
+        later_email_filters = [EmailMessage.contact_id == contact_id]
+        if created_outbox_message_ids:
+            later_email_filters.append(
+                ~(
+                    (EmailMessage.direction == "OUTBOUND")
+                    & EmailMessage.message_id.in_(created_outbox_message_ids)
+                )
+            )
+        later_email_count = await session.scalar(
+            select(func.count())
+            .select_from(EmailMessage)
+            .where(*later_email_filters)
+        )
+        case_count = await session.scalar(
+            select(func.count())
+            .select_from(SalesCase)
+            .where(SalesCase.contact_id == contact_id)
+        )
+        if (later_email_count or 0) > 0 or (case_count or 0) > 0:
+            conflicts.append(f"NEW_CONTACT_{contact_id}_HAS_LATER_ACTIVITY")
+
+    if conflicts:
+        raise ValueError("rollback blocked: " + ", ".join(conflicts))
+
+    removed_outbound_email_ids: list[int] = []
+    for outbox_id in created_outbox_ids:
+        outbox = await session.get(Outbox, outbox_id)
+        if outbox is not None:
+            outbox.status = DeliveryStatus.CANCELLED
+            outbox.last_error = f"Rolled back by {actor[:128]}: {reason}"[:2000]
+    for message_id in sorted(created_outbox_message_ids):
+        staged_email = await session.scalar(
+            select(EmailMessage).where(
+                EmailMessage.direction == "OUTBOUND",
+                EmailMessage.message_id == message_id,
+            )
+        )
+        if staged_email is not None:
+            removed_outbound_email_ids.append(staged_email.id)
+            await session.delete(staged_email)
+
+    current_referrals = {
+        referral.id: referral
+        for referral in (
+            (
+                await session.execute(
+                    select(ContactReferral).where(
+                        ContactReferral.source_email_id == row.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    before_referrals = {item["id"]: item for item in before.get("referrals") or []}
+    for referral_id, referral in list(current_referrals.items()):
+        snapshot = before_referrals.get(referral_id)
+        if snapshot is None:
+            await session.delete(referral)
+            continue
+        referral.customer_id = snapshot["customer_id"]
+        referral.original_contact_id = snapshot["original_contact_id"]
+        referral.new_contact_id = snapshot["new_contact_id"]
+        referral.referred_email = snapshot["referred_email"]
+        referral.referred_name = snapshot["referred_name"]
+        referral.relationship_type = snapshot["relationship_type"]
+        referral.status = snapshot["status"]
+        referral.forwarded_already = snapshot["forwarded_already"]
+        referral.confidence = Decimal(snapshot["confidence"])
+        referral.metadata_json = snapshot["metadata_json"]
+    await session.flush()
+
+    for contact_id in created_target_ids:
+        target = await session.get(Contact, contact_id)
+        if target is None:
+            continue
+        metadata = target.metadata_json or {}
+        if (
+            metadata.get("source") == "inbound_contact_referral"
+            and metadata.get("source_email_id") == row.id
+        ):
+            await session.delete(target)
+            removed_contact_ids.append(contact_id)
+
+    contact_snapshot = before.get("contact")
+    if contact_snapshot is not None and before.get("contact") != after.get("contact"):
+        contact = await session.get(Contact, contact_snapshot["id"])
+        if contact is not None:
+            contact.suppressed = contact_snapshot["suppressed"]
+            contact.lifecycle_status = contact_snapshot["lifecycle_status"]
+            contact.unavailable_until = _parse_snapshot_datetime(
+                contact_snapshot["unavailable_until"]
+            )
+    customer_snapshot = before.get("customer")
+    if customer_snapshot is not None and before.get("customer") != after.get("customer"):
+        customer = await session.get(Customer, customer_snapshot["id"])
+        if customer is not None:
+            customer.qualification_status = customer_snapshot["qualification_status"]
+            customer.qualification_reason = customer_snapshot["qualification_reason"]
+            customer.qualified_at = _parse_snapshot_datetime(
+                customer_snapshot["qualified_at"]
+            )
+
+    handoff_snapshot = before.get("handoff")
+    if handoff_snapshot is not None and before.get("handoff") != after.get("handoff"):
+        handoff = await session.get(Handoff, handoff_snapshot["id"])
+        if handoff is not None:
+            handoff.status = handoff_snapshot["status"]
+            handoff.dingtalk_status = handoff_snapshot["dingtalk_status"]
+            handoff.resolution_note = handoff_snapshot["resolution_note"]
+            handoff.extracted_facts = handoff_snapshot["extracted_facts"]
+    run_snapshot = before.get("agent_run")
+    if run_snapshot is not None and before.get("agent_run") != after.get("agent_run"):
+        run = await session.get(AgentRun, run_snapshot["id"])
+        if run is not None:
+            run.status = AgentRunStatus(run_snapshot["status"])
+            run.current_step = run_snapshot["current_step"]
+            run.last_error = run_snapshot["last_error"]
+            run.completed_at = _parse_snapshot_datetime(run_snapshot["completed_at"])
+    if before.get("assistance_requests") != after.get("assistance_requests"):
+        for snapshot in before.get("assistance_requests") or []:
+            request = await session.get(AssistanceRequest, snapshot["id"])
+            if request is not None:
+                request.status = AssistanceStatus(snapshot["status"])
+    if before.get("agent_steps") != after.get("agent_steps"):
+        for snapshot in before.get("agent_steps") or []:
+            step = await session.get(AgentStep, snapshot["id"])
+            if step is not None:
+                step.status = AgentStepStatus(snapshot["status"])
+                step.completed_at = _parse_snapshot_datetime(snapshot["completed_at"])
+    job_snapshot = before.get("notify_job")
+    if job_snapshot is not None and before.get("notify_job") != after.get("notify_job"):
+        job = await session.get(Job, job_snapshot["id"])
+        if job is not None:
+            job.status = JobStatus(job_snapshot["status"])
+            job.last_error = job_snapshot["last_error"]
+            job.locked_at = _parse_snapshot_datetime(job_snapshot["locked_at"])
+            job.locked_by = job_snapshot["locked_by"]
+
+    email_snapshot = before["email"]
+    row.disposition_type = email_snapshot["disposition_type"]
+    row.disposition_confidence = (
+        Decimal(email_snapshot["disposition_confidence"])
+        if email_snapshot["disposition_confidence"] is not None
+        else None
+    )
+    row.disposition_metadata = email_snapshot["disposition_metadata"]
+    row.disposition_handled_at = _parse_snapshot_datetime(
+        email_snapshot["disposition_handled_at"]
+    )
+    row.automated_reply_handled_at = _parse_snapshot_datetime(
+        email_snapshot["automated_reply_handled_at"]
+    )
+    action.status = "ROLLED_BACK"
+    action.rolled_back_by = actor[:128]
+    action.rolled_back_at = datetime.now(UTC)
+    action.rollback_reason = reason[:2000]
+    session.add(
+        AuditEvent(
+            case_id=row.case_id,
+            actor=actor[:128],
+            event_type="inbound.disposition_rolled_back",
+            data={
+                "email_id": row.id,
+                "action_id": action.id,
+                "disposition_type": action.disposition_type,
+                "reason": reason[:2000],
+                "cancelled_outbox_ids": created_outbox_ids,
+                "removed_outbound_email_ids": removed_outbound_email_ids,
+                "removed_contact_ids": removed_contact_ids,
+            },
+        )
+    )
+    await session.commit()
+    return {
+        "action_id": action.id,
+        "email_id": row.id,
+        "status": action.status,
+        "cancelled_outbox_ids": created_outbox_ids,
+        "removed_outbound_email_ids": removed_outbound_email_ids,
+        "removed_contact_ids": removed_contact_ids,
+    }
+
+
+async def backfill_inbound_dispositions(
+    session: AsyncSession,
+    *,
+    apply: bool = False,
+    limit: int = 1000,
+    include_business: bool = False,
+    include_synced_history: bool = False,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    if apply and not settings.inbound_disposition_apply_enabled:
+        raise ValueError(
+            "INBOUND_DISPOSITION_APPLY_ENABLED must be true before applying a backfill"
+        )
+    filters = [
+        EmailMessage.direction == "INBOUND",
+        EmailMessage.is_bounce.is_(False),
+    ]
+    if not include_synced_history:
+        filters.append(EmailMessage.is_history.is_(False))
+    rows = (
+        (
+            await session.execute(
+                select(EmailMessage)
+                .where(*filters)
+                .order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    plans: list[dict[str, Any]] = []
+    applied_count = 0
+    for row in rows:
+        plan = await build_disposition_plan(session, row)
+        if (
+            include_business
+            or plan["disposition_type"] != InboundDispositionType.BUSINESS.value
+        ):
+            plans.append(plan)
+        if apply:
+            was_unhandled = row.disposition_handled_at is None
+            await apply_email_disposition(
+                session,
+                row,
+                settings=settings,
+                allow_referral_outreach=False,
+            )
+            if was_unhandled and row.disposition_handled_at is not None:
+                applied_count += 1
+    if apply:
+        await session.commit()
+    counts = Counter(plan["disposition_type"] for plan in plans)
+    return {
+        "mode": "apply" if apply else "dry-run",
+        "scanned_count": len(rows),
+        "candidate_count": len(plans),
+        "applied_count": applied_count,
+        "counts": dict(sorted(counts.items())),
+        "plans": plans,
+    }

@@ -477,11 +477,27 @@ async def scan_campaign_candidates(
         prior_sent_at = max((row.sent_at for row in prior if row.sent_at), default=None)
         address_status = address_by_email.get(contact.email.strip().casefold())
         formatted = validate_address_format(contact.email)
+        if (
+            contact.lifecycle_status == "TEMPORARILY_UNAVAILABLE"
+            and contact.unavailable_until is not None
+            and contact.unavailable_until <= observed_at
+        ):
+            contact.lifecycle_status = "ACTIVE"
+            contact.unavailable_until = None
         reason: str | None = None
         if customer.do_not_contact:
             reason = "DO_NOT_CONTACT"
+        elif customer.qualification_status == "NON_TARGET":
+            reason = "NON_TARGET_CUSTOMER"
         elif contact.suppressed:
             reason = "CONTACT_SUPPRESSED"
+        elif contact.lifecycle_status == "DEPARTED":
+            reason = "CONTACT_DEPARTED"
+        elif contact.lifecycle_status == "TEMPORARILY_UNAVAILABLE" and (
+            contact.unavailable_until is None
+            or contact.unavailable_until > observed_at
+        ):
+            reason = "CONTACT_TEMPORARILY_UNAVAILABLE"
         elif not formatted.valid:
             reason = "INVALID_EMAIL_FORMAT"
         elif contact.email.strip().casefold() in duplicate_contact_emails:
@@ -1088,10 +1104,23 @@ async def reactivation_send_guard(
     if recipient.status != "QUEUED" or not recipient.selected:
         return SendGuard("BLOCK", "reactivation recipient is no longer selected")
     address_status = await session.get(EmailAddressStatus, contact.email.strip().casefold())
-    if customer.do_not_contact or contact.suppressed or (address_status and address_status.suppressed):
+    if (
+        customer.do_not_contact
+        or customer.qualification_status == "NON_TARGET"
+        or contact.suppressed
+        or contact.lifecycle_status == "DEPARTED"
+        or (address_status and address_status.suppressed)
+    ):
         recipient.status = "SKIPPED"
         recipient.exclusion_reason = "CONTACT_SUPPRESSED"
         return SendGuard("BLOCK", "reactivation contact is suppressed")
+    if contact.lifecycle_status == "TEMPORARILY_UNAVAILABLE" and (
+        contact.unavailable_until is None
+        or contact.unavailable_until > observed_at
+    ):
+        recipient.status = "SKIPPED"
+        recipient.exclusion_reason = "CONTACT_TEMPORARILY_UNAVAILABLE"
+        return SendGuard("BLOCK", "reactivation contact is temporarily unavailable")
     if contact.last_contact_at is not None and (
         recipient.last_contact_at is None or contact.last_contact_at > recipient.last_contact_at
     ):

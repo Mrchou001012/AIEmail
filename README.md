@@ -571,6 +571,61 @@ addresses, and non-unique matches still require human review.
 
 An inbound message without thread headers that does not satisfy the narrow reply fallback is treated as a new inquiry. A fresh case is created only when the sender maps to one customer contact, exactly one active catalog product is identified, and the market currency is unambiguous. The fresh case starts at quotation round zero and does not inherit earlier prices or negotiation state. Possible same-contact/product cases are recorded in the audit event for visibility, but are not linked automatically.
 
+### Inbound disposition and CRM cleanup
+
+Migration `0022` adds an audited disposition layer before normal case processing.
+It classifies only the newly authored portion of a message and keeps temporary
+absence, permanent departure, explicit referral/forwarding, and an explicit
+non-target logistics role separate. Replacement addresses are extracted only
+from contact directives, not from signatures or quoted history.
+
+The direct-systemd production checklist is in
+[`docs/inbound-disposition-rollout.md`](docs/inbound-disposition-rollout.md).
+
+Start production in observation mode:
+
+```dotenv
+INBOUND_DISPOSITION_ENABLED=true
+INBOUND_DISPOSITION_APPLY_ENABLED=false
+REFERRAL_AUTO_CONTACT_ENABLED=false
+```
+
+The protected page `/admin/inbound-dispositions` runs a historical dry-run and
+shows proposed actions, resolved customer/contact IDs, referral candidates, and
+every blocker. Bulk scanning never applies changes. A reviewer may then confirm
+one email at a time; blockers must be acknowledged against the current plan, so
+a stale browser result cannot silently apply a changed classification. The apply
+request also carries the SHA-256 token of the reviewed plan and is rejected when
+customer/contact state changed before confirmation. Equivalent endpoints are:
+
+- `GET /admin/inbound-dispositions/emails/{email_id}/plan`
+- `POST /admin/inbound-dispositions/backfill?limit=1000&include_synced_history=false`
+- `POST /admin/inbound-dispositions/emails/{email_id}/apply`
+- `POST /admin/inbound-dispositions/actions/{action_id}/rollback`
+
+Each applied action stores its before/after state and reviewer identity. Rollback
+is refused if a changed CRM record would be overwritten or referral mail has
+already entered an irreversible delivery state; a safe rollback cancels staged
+mail, removes action-created referral contacts, and restores the previous state.
+
+After review, the apply switch permits automatic lifecycle and qualification updates;
+explicit one-email reviewer confirmation remains available while that switch is off:
+out-of-office contacts are paused, confirmed departed endpoints are suppressed,
+same-company referrals are saved separately, and explicit logistics providers
+are marked `NON_TARGET` without misusing the legal `do_not_contact` flag. A
+historical backfill never queues referral outreach. New referral outreach also
+requires `REFERRAL_AUTO_CONTACT_ENABLED=true`, exactly one same non-free company
+domain address, an eligible customer, the global send controls, and final
+recipient preflight. Messages that say they were already forwarded are stored
+in a waiting state and are not contacted again.
+
+When a reply to an exact case-less reactivation Message-ID comes from one new
+same-company address, the new sender and historical recipient remain distinct.
+If that verified reply reports the old recipient's departure, the disposition
+retires only the old endpoint, keeps the new sender active, and still continues
+an explicit product-list request. A human sentence about some other employee
+leaving never suppresses the sender.
+
 The message is handed to a human without sending when it refers to prior commercial context (for example, a previous quotation or an earlier discussion), contains unmatched thread headers, maps the sender to multiple customer records, names zero or multiple products, or has ambiguous currency/catalog data. Standard policy checks still route counteroffers, samples, orders, packaging, shipping commitments, risky attachments, and low-confidence extraction to the existing handoff and DingTalk workflow.
 
 Outbound replies use `In-Reply-To` and an ordered `References` chain for RFC threading. Their visible quoted section is built from the complete direct-parent MIME body in the immutable mail archive, so any conversation already quoted by the sender remains visible. AI analysis continues to use only the cleaned new-message text. Quoted HTML is allowlist-sanitized and active content or remote tracking is not fetched; safe `cid:` inline images from the quoted message are copied into the reply MIME so signatures and inline mail content remain intact. Ordinary file attachments are not reattached.

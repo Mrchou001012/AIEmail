@@ -148,14 +148,21 @@
       $("#result-summary").textContent = `显示 ${rows.length} 条，单次最多 200 条`;
       $("#rows").innerHTML = rows.length ? rows.map((row) => {
         const suppressed = Boolean(row.suppressed);
+        const nonTarget = row.qualification_status === "NON_TARGET";
+        const departed = row.lifecycle_status === "DEPARTED";
+        const away = row.lifecycle_status === "TEMPORARILY_UNAVAILABLE";
+        const stateLabel = nonTarget ? "非目标客户" : departed ? "已离职" : away ? "暂时休假" : suppressed ? "已停用" : "可用";
+        const stateClass = nonTarget || departed || suppressed ? "bad" : away ? "warn" : "";
         const bounce = row.last_bounce_type ? ` · 最近退信 ${esc(row.last_bounce_type)}` : "";
         const reason = row.suppression_reason ? ` · ${esc(row.suppression_reason)}` : "";
+        const qualification = row.qualification_reason ? ` · ${esc(row.qualification_reason)}` : "";
+        const unavailable = row.unavailable_until ? ` · 至 ${esc(row.unavailable_until.slice(0, 10))}` : "";
         return `
           <tr data-contact="${row.id}" data-customer="${row.customer_id}">
-            <td><div class="company">${esc(row.company_name)}</div><div class="sub">客户 #${row.customer_id}</div></td>
+            <td><div class="company">${esc(row.company_name)}</div><div class="sub">客户 #${row.customer_id}${qualification}</div></td>
             <td>${esc(row.name)}</td>
             <td class="email">${esc(row.email)}</td>
-            <td><span class="pill ${suppressed ? "bad" : ""}">${suppressed ? "已停用" : "可用"}</span><div class="sub">${bounce}${reason}</div></td>
+            <td><span class="pill ${stateClass}">${stateLabel}</span><div class="sub">${bounce}${reason}${unavailable}</div></td>
             <td><span class="pill warn">${esc(row.source_associations || 0)} 条来源</span></td>
             <td><div class="actions">
               <button type="button" data-add="${row.customer_id}" data-company="${esc(row.company_name)}">在此公司新增</button>

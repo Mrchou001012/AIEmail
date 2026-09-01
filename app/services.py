@@ -90,6 +90,7 @@ from app.db import (
     SalesCase,
 )
 from app.deliverability import MXResult, MXStatus, lookup_mx, validate_address_format
+from app.disposition_service import apply_email_disposition
 from app.domain import (
     HandoffReason,
     Intent,
@@ -102,6 +103,7 @@ from app.domain import (
 )
 from app.history import resolve_unique_contact
 from app.imports import ContentBundle, load_content
+from app.inbound_disposition import classify_inbound_disposition
 from app.integrations import DingTalkNotifier
 from app.mail import (
     FullReplySource,
@@ -1003,6 +1005,58 @@ async def _cancel_pending_recipient_delivery(
     return outbox_ids
 
 
+async def _case_outbound_gate(
+    session: AsyncSession,
+    row: Outbox,
+    *,
+    at: datetime,
+    human_approved: bool,
+) -> tuple[SalesCase | None, str, str | None, datetime | None]:
+    if row.message_kind == "FORWARD":
+        return None, "PASS", None, None
+    if row.case_id is None:
+        return None, "PASS", None, None
+    case = await session.scalar(
+        select(SalesCase)
+        .options(
+            selectinload(SalesCase.customer),
+            selectinload(SalesCase.contact),
+        )
+        .where(SalesCase.id == row.case_id)
+    )
+    if case is None:
+        return None, "BLOCK", "case no longer exists", None
+    if (
+        case.contact.suppressed
+        or case.customer.do_not_contact
+        or case.contact.email.strip().casefold() != row.recipient.strip().casefold()
+    ):
+        return case, "BLOCK", "case/contact eligibility changed", None
+    if human_approved:
+        if case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}:
+            return case, "BLOCK", "case is closed", None
+        return case, "PASS", None, None
+    if (
+        case.customer.qualification_status == "NON_TARGET"
+        or case.contact.lifecycle_status == "DEPARTED"
+    ):
+        return case, "BLOCK", "customer or contact is no longer a sales target", None
+    if case.contact.lifecycle_status == "TEMPORARILY_UNAVAILABLE":
+        unavailable_until = case.contact.unavailable_until
+        if unavailable_until is None or unavailable_until > at:
+            return (
+                case,
+                "DEFER",
+                "contact is temporarily unavailable",
+                unavailable_until or (at + timedelta(days=7)),
+            )
+        case.contact.lifecycle_status = "ACTIVE"
+        case.contact.unavailable_until = None
+    if case.status != CaseStatus.ACTIVE or not case.customer.auto_send_allowed:
+        return case, "BLOCK", "case/customer is not eligible for autonomous mail", None
+    return case, "PASS", None, None
+
+
 async def _final_recipient_delivery_guard(
     session: AsyncSession,
     row: Outbox,
@@ -1040,6 +1094,38 @@ async def _final_recipient_delivery_guard(
             current.last_error = "final forward gate requires complete human approval metadata"
             await session.commit()
             return False
+
+    if current.message_kind == "REFERRAL_OUTREACH":
+        referral_error = await _referral_outreach_eligibility_error(
+            session,
+            current,
+            settings=settings,
+        )
+        if referral_error:
+            current.status = DeliveryStatus.CANCELLED
+            current.last_error = f"final referral gate blocked: {referral_error}"[:2000]
+            await session.commit()
+            return False
+
+    current_human_approved = _human_approval_from_outbox(current) is not None
+    _, case_action, case_reason, case_available_at = await _case_outbound_gate(
+        session,
+        current,
+        at=at,
+        human_approved=current_human_approved,
+    )
+    if case_action == "DEFER":
+        current.status = DeliveryStatus.PENDING
+        current.attempts = max(0, current.attempts - 1)
+        current.available_at = case_available_at or (at + timedelta(days=7))
+        current.last_error = f"final case gate deferred: {case_reason}"[:2000]
+        await session.commit()
+        return False
+    if case_action == "BLOCK":
+        current.status = DeliveryStatus.CANCELLED
+        current.last_error = f"final case gate blocked: {case_reason}"[:2000]
+        await session.commit()
+        return False
 
     address_status = await _email_address_status(session, current.recipient)
     if address_status.suppressed:
@@ -3717,6 +3803,9 @@ async def _ensure_inbound_follow_up(
             f"process-inbound:{row.id}",
         )
         return
+    if await apply_email_disposition(session, row):
+        await session.commit()
+        return
     if row.automated_reply_type == AutomatedReplyType.SYSTEM_NOTIFICATION.value:
         if row.automated_reply_handled_at is None:
             row.automated_reply_handled_at = datetime.now(UTC)
@@ -3743,12 +3832,27 @@ async def _ensure_inbound_follow_up(
         )
         return
     summary_prefix = "Ambiguous thread" if ambiguous else "No case matched inbound email"
+    disposition_facts = (
+        {
+            "inbound_disposition": {
+                "type": row.disposition_type,
+                "confidence": (
+                    str(row.disposition_confidence)
+                    if row.disposition_confidence is not None
+                    else None
+                ),
+                **(row.disposition_metadata or {}),
+            }
+        }
+        if row.disposition_type and row.disposition_type != "BUSINESS"
+        else {}
+    )
     await create_handoff(
         session,
         case=None,
         reason=review_reason or HandoffReason.THREAD_AMBIGUOUS,
         summary=review_summary or f"{summary_prefix} from {row.from_address}: {row.subject}",
-        facts=review_facts,
+        facts={**(review_facts or {}), **disposition_facts},
         source_email_id=row.id,
     )
 
@@ -4415,6 +4519,16 @@ async def ingest_raw_email(
         if direction == "INBOUND" and not (bounce and bounce.is_bounce)
         else None
     )
+    disposition = (
+        classify_inbound_disposition(
+            subject=parsed.subject,
+            body=parsed.body_text,
+            headers=parsed.header_metadata,
+            sender=parsed.from_address,
+        )
+        if direction == "INBOUND" and not (bounce and bounce.is_bounce)
+        else None
+    )
     duplicate_query = select(EmailMessage).where(
         (EmailMessage.raw_sha256 == parsed.raw_sha256)
         | ((EmailMessage.message_id == parsed.message_id) & EmailMessage.message_id.is_not(None))
@@ -4561,6 +4675,12 @@ async def ingest_raw_email(
                 AutomatedReplyType.DEPARTED,
                 AutomatedReplyType.CONTACT_CHANGE,
             }
+            and disposition is not None
+            and (
+                reactivation_parent.sender_changed
+                or disposition.automated_transport_signal
+            )
+            and not get_settings().inbound_disposition_enabled
         ):
             original = reactivation_parent.original_contact
             if original.id != reactivation_parent.reply_contact.id:
@@ -4568,6 +4688,9 @@ async def ingest_raw_email(
                 # retire that endpoint while keeping the new reply contact
                 # active so the business request can still be handled.
                 original.suppressed = True
+                if automated_reply.reply_type is AutomatedReplyType.DEPARTED:
+                    original.lifecycle_status = "DEPARTED"
+                    original.unavailable_until = None
                 personnel_change_handled = True
                 session.add(
                     AuditEvent(
@@ -4586,6 +4709,9 @@ async def ingest_raw_email(
             else:
                 # Same endpoint is the one that left; suppress it as well.
                 original.suppressed = True
+                if automated_reply.reply_type is AutomatedReplyType.DEPARTED:
+                    original.lifecycle_status = "DEPARTED"
+                    original.unavailable_until = None
                 personnel_change_handled = True
                 session.add(
                     AuditEvent(
@@ -4631,6 +4757,21 @@ async def ingest_raw_email(
         if case is not None
         else identity_contact.id if identity_contact is not None else None
     )
+    disposition_metadata = disposition.metadata() if disposition else {}
+    if (
+        disposition is not None
+        and reactivation_parent is not None
+        and automated_reply is not None
+        and automated_reply.reply_type
+        in {AutomatedReplyType.DEPARTED, AutomatedReplyType.CONTACT_CHANGE}
+    ):
+        disposition_metadata = {
+            **disposition_metadata,
+            "verified_reactivation_parent": True,
+            "original_contact_id": reactivation_parent.original_contact.id,
+            "reply_contact_id": reactivation_parent.reply_contact.id,
+            "sender_changed": reactivation_parent.sender_changed,
+        }
     try:
         async with session.begin_nested():
             automated_metadata = (
@@ -4670,6 +4811,13 @@ async def ingest_raw_email(
                     else None
                 ),
                 automated_reply_metadata=automated_metadata,
+                disposition_type=(
+                    disposition.disposition_type.value if disposition else None
+                ),
+                disposition_confidence=(
+                    Decimal(str(disposition.confidence)) if disposition else None
+                ),
+                disposition_metadata=disposition_metadata,
                 is_bounce=bool(bounce and bounce.is_bounce),
                 bounce_type=(
                     bounce.bounce_type.value
@@ -5012,10 +5160,44 @@ async def _handle_automated_reply(
         return True
 
     reply_type = email_row.automated_reply_type
+    settings = get_settings()
     facts = {
         "automated_reply_type": reply_type,
         **(email_row.automated_reply_metadata or {}),
+        "inbound_disposition": {
+            "type": email_row.disposition_type,
+            "confidence": (
+                str(email_row.disposition_confidence)
+                if email_row.disposition_confidence is not None
+                else None
+            ),
+            **(email_row.disposition_metadata or {}),
+        },
     }
+    if (
+        settings.inbound_disposition_enabled
+        and settings.inbound_disposition_apply_enabled
+        and reply_type == AutomatedReplyType.OUT_OF_OFFICE.value
+        and email_row.disposition_type == "TEMPORARY_ABSENCE"
+        and email_row.disposition_handled_at is None
+    ):
+        email_row.automated_reply_handled_at = datetime.now(UTC)
+        await audit(
+            session,
+            "inbound.automated_reply_escalated",
+            case_id=case.id,
+            actor="inbound_disposition",
+            data={"email_id": email_row.id, **facts},
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AUTOMATED_REPLY_REVIEW,
+            summary="Temporary absence could not be applied within the automatic safety boundary",
+            facts=facts,
+            source_email_id=email_row.id,
+        )
+        return True
     if reply_type in {
         AutomatedReplyType.OUT_OF_OFFICE.value,
         AutomatedReplyType.GENERIC_AUTOREPLY.value,
@@ -5048,6 +5230,44 @@ async def _handle_automated_reply(
                 data={"email_id": email_row.id, **facts},
             )
             return False
+        if settings.inbound_disposition_enabled:
+            disposition_metadata = email_row.disposition_metadata or {}
+            if not disposition_metadata.get("automated_transport_signal"):
+                if not disposition_metadata.get("personnel_observation_recorded"):
+                    email_row.disposition_metadata = {
+                        **disposition_metadata,
+                        "personnel_observation_recorded": True,
+                    }
+                    await audit(
+                        session,
+                        "inbound.personnel_change_observed",
+                        case_id=case.id,
+                        actor="inbound_disposition",
+                        data={"email_id": email_row.id, **facts},
+                    )
+                # A person may be reporting that somebody else left while also
+                # asking for a catalog or quotation. Never suppress the sender.
+                return False
+            email_row.automated_reply_handled_at = datetime.now(UTC)
+            await audit(
+                session,
+                "inbound.automated_reply_escalated",
+                case_id=case.id,
+                actor="inbound_disposition",
+                data={"email_id": email_row.id, **facts},
+            )
+            await create_handoff(
+                session,
+                case=case,
+                reason=HandoffReason.PERSONNEL_CHANGE,
+                summary=(
+                    "Personnel change could not be applied within the automatic "
+                    "safety boundary; verify the old and replacement contacts"
+                ),
+                facts=facts,
+                source_email_id=email_row.id,
+            )
+            return True
         email_row.automated_reply_handled_at = datetime.now(UTC)
         # No reactivation context: conservative fallback keeps the original
         # behavior (retire the current contact and ask a human to verify).
@@ -6626,6 +6846,49 @@ async def _maybe_handle_coa_request(
     return True
 
 
+async def _referral_outreach_eligibility_error(
+    session: AsyncSession,
+    row: Outbox,
+    *,
+    settings: Settings,
+) -> str | None:
+    if not settings.referral_auto_contact_enabled:
+        return "REFERRAL_AUTO_CONTACT_ENABLED is false"
+    referral_email = await session.scalar(
+        select(EmailMessage)
+        .where(
+            EmailMessage.message_id == row.message_id,
+            EmailMessage.direction == "OUTBOUND",
+        )
+        .limit(1)
+    )
+    referral_contact = (
+        await session.get(Contact, referral_email.contact_id)
+        if referral_email is not None and referral_email.contact_id is not None
+        else None
+    )
+    referral_customer = (
+        await session.get(Customer, referral_email.customer_id)
+        if referral_email is not None and referral_email.customer_id is not None
+        else None
+    )
+    if referral_email is None or referral_contact is None or referral_customer is None:
+        return "referral email, contact, or customer is missing"
+    if referral_contact.customer_id != referral_customer.id:
+        return "referral contact no longer belongs to the resolved customer"
+    if referral_contact.email.strip().casefold() != row.recipient.strip().casefold():
+        return "referral recipient no longer matches the contact"
+    if referral_contact.suppressed or referral_contact.lifecycle_status != "ACTIVE":
+        return "referral contact is no longer active"
+    if (
+        referral_customer.do_not_contact
+        or referral_customer.qualification_status == "NON_TARGET"
+        or not referral_customer.auto_send_allowed
+    ):
+        return "referral customer is no longer eligible"
+    return None
+
+
 async def queue_prepared_coa_reply(
     session: AsyncSession,
     *,
@@ -8194,6 +8457,9 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
     if email_row.is_bounce:
         await _handle_bounce(session, email_row)
         return
+    if await apply_email_disposition(session, email_row):
+        await session.commit()
+        return
     # A reply to a reactivation is business-significant even when a mail client
     # omitted thread headers and the normal case matcher could not link it.
     if not email_row.is_automated_reply:
@@ -9461,7 +9727,6 @@ async def send_one_outbox(
     case: SalesCase | None = None
     human_approved = _human_approval_from_outbox(row) is not None
     is_forward = row.message_kind == "FORWARD"
-    authorized_forward = False
     if is_forward:
         try:
             normalized_forward_recipient = _normalize_forward_recipient(row.recipient)
@@ -9475,7 +9740,17 @@ async def send_one_outbox(
             row.last_error = "forward requires complete human approval metadata"
             await session.commit()
             return True
-        authorized_forward = True
+    if row.message_kind == "REFERRAL_OUTREACH":
+        referral_error = await _referral_outreach_eligibility_error(
+            session,
+            row,
+            settings=settings,
+        )
+        if referral_error:
+            row.status = DeliveryStatus.CANCELLED
+            row.last_error = f"referral contact eligibility changed: {referral_error}"[:2000]
+            await session.commit()
+            return True
     internal_message = human_approved
     if row.message_kind == "REACTIVATION":
         guard = await reactivation_send_guard(session, row, settings=settings, at=now)
@@ -9501,40 +9776,23 @@ async def send_one_outbox(
         row.last_error = "commercial gate deferred automated mail until Monday"
         await session.commit()
         return True
-    if row.case_id:
-        case = await session.scalar(
-            select(SalesCase)
-            .options(
-                selectinload(SalesCase.customer),
-                selectinload(SalesCase.contact),
-            )
-            .where(SalesCase.id == row.case_id)
-        )
-        customer_ineligible = bool(
-            not authorized_forward
-            and case is not None
-            and (
-                case.contact.suppressed
-                or case.customer.do_not_contact
-                or case.contact.email.lower() != row.recipient.lower()
-                or (
-                    human_approved
-                    and case.status in {CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST}
-                )
-                or (
-                    not human_approved
-                    and (
-                        case.status != CaseStatus.ACTIVE
-                        or not case.customer.auto_send_allowed
-                    )
-                )
-            )
-        )
-        if case is None or customer_ineligible:
-            row.status = DeliveryStatus.CANCELLED
-            row.last_error = "case/contact eligibility changed after message was queued"
-            await session.commit()
-            return True
+    case, case_action, case_reason, case_available_at = await _case_outbound_gate(
+        session,
+        row,
+        at=now,
+        human_approved=human_approved,
+    )
+    if case_action == "DEFER":
+        row.status = DeliveryStatus.PENDING
+        row.available_at = case_available_at or (now + timedelta(days=7))
+        row.last_error = f"case gate deferred: {case_reason}"[:2000]
+        await session.commit()
+        return True
+    if case_action == "BLOCK":
+        row.status = DeliveryStatus.CANCELLED
+        row.last_error = f"case/contact eligibility changed: {case_reason}"[:2000]
+        await session.commit()
+        return True
     is_auto_quote = not human_approved and (
         row.message_kind == "AUTO_QUOTE" or row.quote_id is not None
     )

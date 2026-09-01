@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <title>AIEmail 来信处置审计</title>
+  <style>
+    :root { color-scheme:light; --bg:#f5f7fb; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#175cd3; --red:#b42318; --green:#067647; --amber:#b54708; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,select,input { font:inherit; }
+    .shell { max-width:1680px; margin:0 auto; padding:24px; }
+    .top,.toolbar,.summary { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:24px; }
+    .sub { color:var(--muted); }
+    .notice { margin:16px 0; padding:12px 14px; border:1px solid #fedf89; border-radius:10px; background:#fffaeb; color:#7a2e0e; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 4px 18px rgba(16,24,40,.04); overflow:hidden; }
+    .toolbar { padding:14px 16px; border-bottom:1px solid var(--line); }
+    .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button,select { border:1px solid #c7d0dd; border-radius:9px; padding:8px 11px; background:#fff; color:var(--ink); }
+    button { border:0; cursor:pointer; background:var(--blue); color:#fff; font-weight:700; }
+    button:disabled { opacity:.5; cursor:wait; }
+    button.secondary { background:#eef4ff; color:#1849a9; }
+    button.danger { background:#fff1f0; color:var(--red); }
+    .action-stack { display:grid; gap:8px; align-items:start; }
+    .action-stack label { display:flex; gap:6px; align-items:flex-start; font-size:12px; color:var(--muted); }
+    .summary { justify-content:flex-start; padding:12px 16px; border-bottom:1px solid var(--line); }
+    .pill { display:inline-flex; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:#eef4ff; color:#1849a9; white-space:nowrap; }
+    .pill.good { background:#ecfdf3; color:var(--green); }
+    .pill.warn { background:#fffaeb; color:var(--amber); }
+    .pill.bad { background:#fff1f0; color:var(--red); }
+    .table-wrap { overflow:auto; max-height:72vh; }
+    table { width:100%; min-width:1320px; border-collapse:collapse; table-layout:fixed; }
+    th,td { padding:10px 11px; text-align:left; border-bottom:1px solid #eef1f5; vertical-align:top; overflow-wrap:anywhere; }
+    th { position:sticky; top:0; z-index:1; background:#f8fafc; color:var(--muted); font-size:12px; }
+    th:nth-child(1),td:nth-child(1) { width:11%; }
+    th:nth-child(2),td:nth-child(2) { width:18%; }
+    th:nth-child(3),td:nth-child(3) { width:15%; }
+    th:nth-child(4),td:nth-child(4) { width:16%; }
+    th:nth-child(5),td:nth-child(5) { width:14%; }
+    th:nth-child(6),td:nth-child(6) { width:16%; }
+    th:nth-child(7),td:nth-child(7) { width:10%; }
+    .muted { color:var(--muted); font-size:12px; margin-top:3px; }
+    .empty { padding:32px; text-align:center; color:var(--muted); }
+    code { font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    @media (max-width:900px) { .shell { padding:14px; } .table-wrap { max-height:none; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <h1>来信处置审计</h1>
+        <div class="sub">用当前规则重新判断历史非退信邮件，预览准备执行的客户资料动作。</div>
+      </div>
+      <div><a href="/admin/contacts">客户邮箱管理</a> · <a href="/dashboard">运行看板</a></div>
+    </header>
+    <div class="notice" id="safety-notice">批量扫描固定为 dry-run。只有逐封点击“确认应用”才会修改资料；有阻断项时必须再次明确确认。联系新负责人默认关闭，撤销也会在发现后续变化或邮件已进入发送时自动阻断。</div>
+    <section class="card">
+      <div class="toolbar">
+        <div class="controls">
+          <label>扫描数量 <select id="limit"><option>100</option><option selected>500</option><option>1000</option><option>5000</option></select></label>
+          <label><input id="include-business" type="checkbox"> 包含普通业务邮件</label>
+          <label><input id="include-history" type="checkbox"> 包含历史同步邮件</label>
+          <button id="run" type="button">运行审计</button>
+        </div>
+        <div class="sub" id="status">尚未运行</div>
+      </div>
+      <div class="summary" id="summary"></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>处置</th><th>邮件</th><th>联系人解析</th><th>建议动作</th><th>安全边界</th><th>新正文</th><th>人工操作</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="7" class="empty">点击“运行审计”查看结果</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",NON_TARGET:"非目标客户",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
+    let plansByEmail = new Map();
+    async function loadSwitches() {
+      try {
+        const response = await fetch("/admin/status");
+        if (!response.ok) return;
+        const status = await response.json();
+        $("#safety-notice").insertAdjacentHTML("beforeend", `<div class="muted">当前开关：自动写入 ${status.inbound_disposition_apply_enabled ? "已开启" : "已关闭"} · 新联系人自动联系 ${status.referral_auto_contact_enabled ? "已开启" : "已关闭"} · 总自动发送 ${status.auto_send_enabled ? "已开启" : "已关闭"}</div>`);
+      } catch (_) { /* The audit remains safe when status display is unavailable. */ }
+    }
+    function pills(values, kind = "") { return (values || []).map((value) => `<span class="pill ${kind}">${esc(value)}</span>`).join(" "); }
+    function operationCell(row) {
+      const action = row.latest_action;
+      if (action?.status === "APPLIED") {
+        const queued = (action.applied_actions || []).includes("QUEUE_REFERRAL_OUTREACH");
+        const queueState = queued ? '<span class="pill warn">已加入新联系人发件队列</span>' : "";
+        return `<div class="action-stack"><span class="pill good">已应用 #${action.id}</span>${queueState}<div class="muted">${esc((action.applied_actions || []).join(", "))}<br>${esc(action.applied_by)}<br>${esc(action.applied_at)}</div><button class="danger rollback" data-action-id="${action.id}" type="button">撤销</button></div>`;
+      }
+      if (row.disposition_type === "BUSINESS") return '<span class="muted">继续原业务流程</span>';
+      const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);
+      const outreach = canOfferOutreach ? `<label><input class="outreach" data-email-id="${row.email_id}" type="checkbox"> 同时加入新联系人自动发件队列（总开关开启时可能立即发送）</label>` : "";
+      const history = action?.status === "ROLLED_BACK" ? `<span class="pill warn">曾撤销 #${action.id}</span>` : "";
+      return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" type="button">确认应用</button></div>`;
+    }
+    function render(data) {
+      $("#status").textContent = `扫描 ${data.scanned_count} 封，候选 ${data.candidate_count} 封 · ${data.mode}`;
+      $("#summary").innerHTML = Object.entries(data.counts || {}).map(([key,value]) => `<span class="pill">${esc(labels[key] || key)} ${value}</span>`).join("");
+      const plans = data.plans || [];
+      plansByEmail = new Map(plans.map((row) => [Number(row.email_id), row]));
+      $("#rows").innerHTML = plans.length ? plans.map((row) => {
+        const blocked = (row.blockers || []).length > 0;
+        const contact = row.contact_id ? `处置联系人 #${row.contact_id}` : "未唯一识别联系人";
+        const senderContact = row.sender_contact_id && row.sender_contact_id !== row.contact_id ? `<div class="muted">发件联系人 #${row.sender_contact_id}</div>` : "";
+        const customer = row.customer_id ? `客户 #${row.customer_id}` : "未识别客户";
+        const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
+        return `<tr>
+          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span><div class="muted">置信度 ${esc(row.confidence)}</div></td>
+          <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
+          <td>${esc(customer)}<br>${esc(contact)}${senderContact}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
+          <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div></td>
+          <td>${blocked ? pills(row.blockers, "bad") : '<span class="pill good">可安全处理</span>'}<div class="muted">${row.unavailable_until ? `暂停至 ${esc(row.unavailable_until)}` : ""}</div></td>
+          <td>${esc(row.body_preview)}</td>
+          <td>${operationCell(row)}</td>
+        </tr>`;
+      }).join("") : '<tr><td colspan="7" class="empty">没有匹配的处置候选</td></tr>';
+    }
+    async function runAudit() {
+      const button = $("#run"); button.disabled = true; $("#status").textContent = "正在分析…";
+      const query = new URLSearchParams({
+        limit:$("#limit").value,
+        include_business:String($("#include-business").checked),
+        include_synced_history:String($("#include-history").checked),
+      });
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/backfill?${query}`, {method:"POST"});
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        render(await response.json());
+      } catch (error) {
+        $("#status").textContent = `失败：${error.message}`;
+      } finally { button.disabled = false; }
+    }
+    $("#run").addEventListener("click", runAudit);
+    $("#rows").addEventListener("click", async (event) => {
+      const applyButton = event.target.closest("button.apply");
+      const rollbackButton = event.target.closest("button.rollback");
+      if (!applyButton && !rollbackButton) return;
+      const button = applyButton || rollbackButton;
+      button.disabled = true;
+      try {
+        if (applyButton) {
+          const emailId = Number(applyButton.dataset.emailId);
+          const row = plansByEmail.get(emailId);
+          if (!row) throw new Error("审计结果已过期，请重新运行");
+          const blockers = row.blockers || [];
+          const outreach = document.querySelector(`input.outreach[data-email-id="${emailId}"]`)?.checked || false;
+          let warning = blockers.length
+            ? `这封邮件存在以下阻断项：\n\n${blockers.join("\n")}\n\n确认你已人工核实并仍要应用？`
+            : `确认对邮件 #${emailId} 应用“${labels[row.disposition_type] || row.disposition_type}”处置？`;
+          if (outreach) warning += "\n\n你还选择了加入新联系人自动发件队列；若系统发送总开关已开启，邮件可能立即发出。";
+          if (!window.confirm(warning)) return;
+          const response = await fetch(`/admin/inbound-dispositions/emails/${emailId}/apply`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({expected_disposition_type:row.disposition_type,expected_plan_token:row.plan_token,acknowledged_blockers:blockers,queue_referral_outreach:outreach}),
+          });
+          if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+          $("#status").textContent = `邮件 #${emailId} 已应用，可从本页撤销`;
+        } else {
+          const actionId = Number(rollbackButton.dataset.actionId);
+          const reason = window.prompt("请输入撤销原因（至少 3 个字符）：", "人工复核后撤销");
+          if (reason === null) return;
+          if (reason.trim().length < 3) throw new Error("撤销原因至少需要 3 个字符");
+          const response = await fetch(`/admin/inbound-dispositions/actions/${actionId}/rollback`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({reason:reason.trim()}),
+          });
+          if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+          $("#status").textContent = `处置动作 #${actionId} 已撤销`;
+        }
+        await runAudit();
+      } catch (error) {
+        $("#status").textContent = `操作失败：${error.message}`;
+      } finally { button.disabled = false; }
+    });
+    loadSwitches();
+  </script>
+</body>
+</html>

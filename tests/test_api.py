@@ -9,17 +9,20 @@ from app.api import (
     CONTACTS_PATH,
     FAVICON_PATH,
     HANDOFF_REVIEW_PATH,
+    INBOUND_DISPOSITIONS_PATH,
     REACTIVATION_PATH,
     RECORDS_PATH,
     HandoffCaseRequest,
     _dashboard_headers,
     _suggested_handoff_reply,
+    _validate_inbound_disposition_confirmation,
     commercial_update_page,
     contacts_page,
     dashboard,
     download_prepared_product_list,
     favicon,
     health,
+    inbound_dispositions_page,
     reactivation_page,
     record_statuses,
     stream_handoff_preview,
@@ -287,6 +290,82 @@ def test_contacts_page_exposes_endpoint_level_management() -> None:
     assert "/admin/contacts/" in html
     assert "只停用此邮箱" in html
     assert "旧地址不会被覆盖" in html
+
+
+@pytest.mark.asyncio
+async def test_inbound_dispositions_page_is_protected_dry_run_html() -> None:
+    response = await inbound_dispositions_page("admin")
+
+    assert response.status_code == 200
+    assert "来信处置审计" in response.body.decode("utf-8")
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_inbound_dispositions_page_never_exposes_bulk_apply() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert "/admin/inbound-dispositions/backfill" in html
+    assert 'apply:"true"' not in html
+    assert "确认应用" in html
+    assert "/apply`" in html
+    assert "/rollback`" in html
+
+
+def test_disposition_confirmation_rejects_stale_classification() -> None:
+    error = _validate_inbound_disposition_confirmation(
+        {
+            "disposition_type": "DEPARTED",
+            "blockers": [],
+            "latest_action": None,
+            "plan_token": "a" * 64,
+        },
+        expected_disposition_type="TEMPORARY_ABSENCE",
+        expected_plan_token="a" * 64,
+        acknowledged_blockers=[],
+    )
+
+    assert error is not None and "changed since review" in error
+
+
+def test_disposition_confirmation_requires_exact_blocker_acknowledgement() -> None:
+    plan = {
+        "disposition_type": "DEPARTED",
+        "blockers": ["NO_REPLACEMENT_CONTACT"],
+        "latest_action": None,
+        "plan_token": "b" * 64,
+    }
+
+    assert _validate_inbound_disposition_confirmation(
+        plan,
+        expected_disposition_type="DEPARTED",
+        expected_plan_token="b" * 64,
+        acknowledged_blockers=[],
+    ) == "All current blockers require explicit acknowledgement: NO_REPLACEMENT_CONTACT"
+    assert (
+        _validate_inbound_disposition_confirmation(
+            plan,
+            expected_disposition_type="DEPARTED",
+            expected_plan_token="b" * 64,
+            acknowledged_blockers=["NO_REPLACEMENT_CONTACT"],
+        )
+        is None
+    )
+
+
+def test_disposition_confirmation_rejects_stale_plan_token() -> None:
+    error = _validate_inbound_disposition_confirmation(
+        {
+            "disposition_type": "NON_TARGET",
+            "blockers": [],
+            "latest_action": None,
+            "plan_token": "c" * 64,
+        },
+        expected_disposition_type="NON_TARGET",
+        expected_plan_token="d" * 64,
+        acknowledged_blockers=[],
+    )
+
+    assert error == "Disposition plan changed since review; reload before applying"
 
 
 def test_remote_images_are_only_permitted_by_the_handoff_specific_csp() -> None:

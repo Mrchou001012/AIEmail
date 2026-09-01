@@ -383,6 +383,13 @@ GENERIC_PRODUCT_LIST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+PRODUCT_LIST_NON_REQUEST_PATTERN = re.compile(
+    r"\b(?:we|i)\s+(?:will|shall|may)\s+.{0,120}?"
+    r"(?:contact|get\s+in\s+touch|reach\s+out)\s+.{0,120}?\bif\b"
+    r".{0,160}?\b(?:product\s+list|catalog(?:ue)?|product\s+range)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 COA_REQUEST_PATTERN = re.compile(
     r"\b(?:coa|certificate\s+of\s+analysis)\b",
     re.IGNORECASE,
@@ -439,18 +446,21 @@ def extract_coa_product_query(text: str) -> str | None:
 
 def explicit_product_list_requested(text: str) -> bool:
     """Return whether the customer explicitly asked to see a product catalog."""
-    lowered = (text or "").casefold()
+    value = latest_reply_text(text or "")
+    if PRODUCT_LIST_NON_REQUEST_PATTERN.search(value):
+        return False
+    lowered = value.casefold()
     return (
         any(marker in lowered for marker in PRODUCT_LIST_MARKERS)
-        or bool(PRODUCT_LIST_FILE_REQUEST_PATTERN.search(text or ""))
-        or bool(SCOPED_PRODUCT_LIST_PATTERN.search(text or ""))
+        or bool(PRODUCT_LIST_FILE_REQUEST_PATTERN.search(value))
+        or bool(SCOPED_PRODUCT_LIST_PATTERN.search(value))
     )
 
 
 def generic_product_list_requested(text: str) -> bool:
     """Return whether the request asks for the company-wide catalog."""
 
-    value = text or ""
+    value = latest_reply_text(text or "")
     lowered = value.casefold()
     # Do not widen a product- or category-scoped request just because the
     # same sentence also contains the generic words "product list".

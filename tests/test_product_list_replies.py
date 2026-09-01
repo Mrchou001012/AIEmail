@@ -1645,6 +1645,7 @@ async def test_full_customer_workbook_stores_interest_category(
 
 async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_sends(
     db_session: AsyncSession,
+    monkeypatch,
 ) -> None:
     customer_id, old_contact_id, parent = await _seed_departed_reactivation_parent(
         db_session,
@@ -1666,10 +1667,11 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
 
     assert email_row is not None and email_row.case_id is not None
     assert email_row.automated_reply_type == "DEPARTED"
-    assert email_row.automated_reply_metadata["personnel_change_handled"] is True
+    assert email_row.disposition_metadata["verified_reactivation_parent"] is True
+    assert email_row.disposition_metadata["sender_changed"] is True
 
     old_contact = await db_session.get(Contact, old_contact_id)
-    assert old_contact is not None and old_contact.suppressed is True
+    assert old_contact is not None and old_contact.suppressed is False
 
     new_contact = await db_session.scalar(
         select(Contact).where(
@@ -1684,12 +1686,16 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
     category = await db_session.get(ProductCategory, case.category_id)
     assert category is not None and category.key == "industrial_silanes"
 
+    monkeypatch.setattr(get_settings(), "inbound_disposition_apply_enabled", True)
     await process_inbound(db_session, email_row.id)
 
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
     assert "marketing001@witofly.com" in outbox.raw_message
     assert "YAC-A110" in outbox.raw_message
+    await db_session.refresh(old_contact)
+    assert old_contact.suppressed is True
+    assert old_contact.lifecycle_status == "DEPARTED"
     assert await db_session.scalar(
         select(func.count()).select_from(Handoff)
     ) == 0
@@ -1712,6 +1718,7 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
     settings = get_settings()
     monkeypatch.setattr(settings, "company_research_enabled", True)
     monkeypatch.setattr(settings, "company_research_auto_send_enabled", True)
+    monkeypatch.setattr(settings, "inbound_disposition_apply_enabled", True)
 
     async def research(*args, **kwargs):
         return (
@@ -1762,7 +1769,7 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
 
     assert email_row is not None and email_row.case_id is not None
     old_contact = await db_session.get(Contact, old_contact_id)
-    assert old_contact is not None and old_contact.suppressed is True
+    assert old_contact is not None and old_contact.suppressed is False
     new_contact = await db_session.scalar(
         select(Contact).where(
             func.lower(Contact.email) == "marketing001@witofly.com"
@@ -1777,3 +1784,6 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
     assert outbox is not None
     assert "marketing001@witofly.com" in outbox.raw_message
     assert "YAC-A110" in outbox.raw_message
+    await db_session.refresh(old_contact)
+    assert old_contact.suppressed is True
+    assert old_contact.lifecycle_status == "DEPARTED"

@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     product_list_auto_send_enabled: bool = False
     quote_auto_send_enabled: bool = False
 
+    # Inbound lifecycle/qualification classification is safe to record by
+    # default. Automatic mutation remains observation-only until the production
+    # dry-run is reviewed; an authenticated reviewer may still apply one
+    # explicitly confirmed email while the global apply switch is disabled.
+    inbound_disposition_enabled: bool = True
+    inbound_disposition_apply_enabled: bool = False
+    referral_auto_contact_enabled: bool = False
+
     # Optional, bounded web research used only when a known customer explicitly
     # requests a product list and neither CRM nor imported Excel data identifies
     # one catalog category.  Research and autonomous use are separate switches

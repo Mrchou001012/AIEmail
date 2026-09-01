@@ -115,6 +115,11 @@ class Customer(Base, TimestampMixin):
     auto_send_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
     consent_basis: Mapped[str | None] = mapped_column(String(255))
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False)
+    qualification_status: Mapped[str] = mapped_column(
+        String(32), default="UNKNOWN", index=True
+    )
+    qualification_reason: Mapped[str | None] = mapped_column(String(128), index=True)
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     contacts: Mapped[list["Contact"]] = relationship(back_populates="customer")
 
@@ -128,6 +133,12 @@ class Contact(Base, TimestampMixin):
     email: Mapped[str] = mapped_column(String(320), index=True)
     language: Mapped[str] = mapped_column(String(16), default="en")
     suppressed: Mapped[bool] = mapped_column(Boolean, default=False)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(32), default="ACTIVE", index=True
+    )
+    unavailable_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     first_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
@@ -320,6 +331,12 @@ class EmailMessage(Base):
     automated_reply_type: Mapped[str | None] = mapped_column(String(32), index=True)
     automated_reply_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     automated_reply_handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disposition_type: Mapped[str | None] = mapped_column(String(64), index=True)
+    disposition_confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
+    disposition_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    disposition_handled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     is_bounce: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     bounce_type: Mapped[str | None] = mapped_column(String(32), index=True)
     bounce_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -430,6 +447,62 @@ class Handoff(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), default="OPEN")
     dingtalk_status: Mapped[str] = mapped_column(String(32), default="PENDING")
     resolution_note: Mapped[str | None] = mapped_column(Text)
+
+
+class ContactReferral(Base, TimestampMixin):
+    """A contact proposed by an inbound lifecycle or forwarding message."""
+
+    __tablename__ = "contact_referrals"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_email_id",
+            "referred_email",
+            name="uq_contact_referrals_source_email",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE"), index=True
+    )
+    customer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customers.id", ondelete="SET NULL"), index=True
+    )
+    original_contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="SET NULL"), index=True
+    )
+    new_contact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contacts.id", ondelete="SET NULL"), index=True
+    )
+    referred_email: Mapped[str] = mapped_column(String(320), index=True)
+    referred_name: Mapped[str | None] = mapped_column(String(255))
+    relationship_type: Mapped[str] = mapped_column(
+        String(32), default="REPLACEMENT"
+    )
+    status: Mapped[str] = mapped_column(String(32), default="CANDIDATE", index=True)
+    forwarded_already: Mapped[bool] = mapped_column(Boolean, default=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class InboundDispositionAction(Base):
+    """Reversible audit record for one applied inbound disposition."""
+
+    __tablename__ = "inbound_disposition_actions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE"), index=True
+    )
+    disposition_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="APPLIED", index=True)
+    applied_by: Mapped[str] = mapped_column(String(128))
+    before_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    after_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    rolled_back_by: Mapped[str | None] = mapped_column(String(128))
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rollback_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class AgentRun(Base, TimestampMixin):

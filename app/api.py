@@ -64,6 +64,12 @@ from app.db import (
     db_health,
     get_session,
 )
+from app.disposition_service import (
+    apply_email_disposition,
+    backfill_inbound_dispositions,
+    build_disposition_plan,
+    rollback_email_disposition,
+)
 from app.domain import money
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
@@ -137,6 +143,7 @@ HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
 COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
 REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
 CONTACTS_PATH = Path(__file__).with_name("contacts.html")
+INBOUND_DISPOSITIONS_PATH = Path(__file__).with_name("inbound_dispositions.html")
 RECORDS_PATH = Path(__file__).with_name("records.html")
 ADMIN_SHARED_CSS_PATH = Path(__file__).with_name("admin_shared.css")
 HANDOFF_PRICE_LINES_JS_PATH = Path(__file__).with_name("handoff_price_lines.js")
@@ -313,6 +320,44 @@ class ReactivationCampaignCreate(BaseModel):
 class ReactivationSelectionRequest(BaseModel):
     recipient_ids: list[int] = Field(min_length=1, max_length=5000)
     selected: bool
+
+
+class InboundDispositionApplyRequest(BaseModel):
+    expected_disposition_type: str = Field(min_length=1, max_length=64)
+    expected_plan_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    acknowledged_blockers: list[str] = Field(default_factory=list, max_length=20)
+    queue_referral_outreach: bool = False
+
+
+class InboundDispositionRollbackRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=2_000)
+
+
+def _validate_inbound_disposition_confirmation(
+    plan: dict[str, Any],
+    *,
+    expected_disposition_type: str,
+    expected_plan_token: str,
+    acknowledged_blockers: Sequence[str],
+) -> str | None:
+    if plan.get("plan_token") != expected_plan_token:
+        return "Disposition plan changed since review; reload before applying"
+    if plan["disposition_type"] != expected_disposition_type:
+        return "Disposition changed since review; reload the plan before applying"
+    if plan["disposition_type"] == "BUSINESS":
+        return "Business mail must continue through the case workflow"
+    latest_action = plan.get("latest_action") or {}
+    if latest_action.get("status") == "APPLIED":
+        return "This disposition already has an active applied action"
+    blockers = set(plan["blockers"])
+    acknowledged = set(acknowledged_blockers)
+    missing = sorted(blockers - acknowledged)
+    unknown = sorted(acknowledged - blockers)
+    if missing:
+        return "All current blockers require explicit acknowledgement: " + ", ".join(missing)
+    if unknown:
+        return "Acknowledged blockers no longer match the current plan: " + ", ".join(unknown)
+    return None
 
 
 def _dashboard_headers(*, allow_remote_images: bool = False) -> dict[str, str]:
@@ -1133,6 +1178,18 @@ async def email_detail(email_id: int, _: Admin, session: Session) -> dict[str, A
             if row.automated_reply_handled_at
             else None
         ),
+        "disposition_type": row.disposition_type,
+        "disposition_confidence": (
+            str(row.disposition_confidence)
+            if row.disposition_confidence is not None
+            else None
+        ),
+        "disposition_metadata": row.disposition_metadata,
+        "disposition_handled_at": (
+            row.disposition_handled_at.isoformat()
+            if row.disposition_handled_at
+            else None
+        ),
         "is_bounce": row.is_bounce,
         "bounce_type": row.bounce_type,
         "bounce_metadata": row.bounce_metadata,
@@ -1390,6 +1447,11 @@ async def admin_status(_: Admin, session: Session, settings: Annotated[Settings,
         "coa_auto_send_enabled": settings.coa_auto_send_enabled,
         "product_list_auto_send_enabled": settings.product_list_auto_send_enabled,
         "quote_auto_send_enabled": settings.quote_auto_send_enabled,
+        "inbound_disposition_enabled": settings.inbound_disposition_enabled,
+        "inbound_disposition_apply_enabled": (
+            settings.inbound_disposition_apply_enabled
+        ),
+        "referral_auto_contact_enabled": settings.referral_auto_contact_enabled,
         "imap_sync_enabled": settings.imap_sync_enabled,
         "company_research_enabled": settings.company_research_enabled,
         "company_research_auto_send_enabled": (
@@ -1413,6 +1475,18 @@ def _configured_nas_scanner(settings: Settings) -> NASKnowledgeScanner:
         output_dir=settings.nas_knowledge_output_dir,
         max_extract_bytes=settings.nas_knowledge_max_file_mb * 1024 * 1024,
         extraction_timeout_seconds=settings.nas_knowledge_file_timeout_seconds,
+    )
+
+
+@router.get(
+    "/admin/inbound-dispositions",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def inbound_dispositions_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
     )
 
 
@@ -1643,6 +1717,137 @@ async def history_status(_: Admin, session: Session) -> dict[str, Any]:
 async def history_reconcile(_: Admin, session: Session) -> dict[str, int]:
     result = await reconcile_email_history(session)
     return result.__dict__
+
+
+@router.get("/admin/inbound-dispositions/emails/{email_id}/plan")
+async def inbound_disposition_plan(
+    email_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    row = await session.get(EmailMessage, email_id)
+    if row is None or row.direction != "INBOUND":
+        raise HTTPException(404, "Inbound email was not found")
+    if row.is_bounce:
+        raise HTTPException(409, "Bounce messages do not use business dispositions")
+    return await build_disposition_plan(session, row)
+
+
+@router.post("/admin/inbound-dispositions/emails/{email_id}/apply")
+async def inbound_disposition_apply(
+    email_id: int,
+    request: InboundDispositionApplyRequest,
+    admin: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    row = await session.scalar(
+        select(EmailMessage)
+        .where(
+            EmailMessage.id == email_id,
+            EmailMessage.direction == "INBOUND",
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(404, "Inbound email was not found")
+    if row.is_bounce:
+        raise HTTPException(409, "Bounce messages do not use business dispositions")
+    if not settings.inbound_disposition_enabled:
+        raise HTTPException(409, "INBOUND_DISPOSITION_ENABLED must be true")
+
+    initial_plan = await build_disposition_plan(session, row)
+    if initial_plan.get("customer_id") is not None:
+        await session.scalar(
+            select(Customer)
+            .where(Customer.id == initial_plan["customer_id"])
+            .with_for_update()
+        )
+    contact_ids = sorted(
+        {
+            int(contact_id)
+            for contact_id in (
+                initial_plan.get("contact_id"),
+                initial_plan.get("sender_contact_id"),
+            )
+            if contact_id is not None
+        }
+    )
+    if contact_ids:
+        await session.execute(
+            select(Contact).where(Contact.id.in_(contact_ids)).with_for_update()
+        )
+    # Rebuild after acquiring every mutable CRM lock. If another reviewer
+    # changed state while this request was waiting, the plan token now differs.
+    plan = await build_disposition_plan(session, row)
+    confirmation_error = _validate_inbound_disposition_confirmation(
+        plan,
+        expected_disposition_type=request.expected_disposition_type,
+        expected_plan_token=request.expected_plan_token,
+        acknowledged_blockers=request.acknowledged_blockers,
+    )
+    if confirmation_error:
+        raise HTTPException(409, confirmation_error)
+
+    await apply_email_disposition(
+        session,
+        row,
+        settings=settings,
+        allow_referral_outreach=request.queue_referral_outreach,
+        actor=f"admin:{admin}",
+        force_manual=True,
+    )
+    await session.flush()
+    if row.disposition_handled_at is None:
+        raise HTTPException(
+            409,
+            "The reviewed action could not be applied with the currently resolved data",
+        )
+    await session.commit()
+    return await build_disposition_plan(session, row)
+
+
+@router.post("/admin/inbound-dispositions/actions/{action_id}/rollback")
+async def inbound_disposition_rollback(
+    action_id: int,
+    request: InboundDispositionRollbackRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        result = await rollback_email_disposition(
+            session,
+            action_id=action_id,
+            actor=f"admin:{admin}",
+            reason=request.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    row = await session.get(EmailMessage, result["email_id"])
+    result["plan"] = await build_disposition_plan(session, row) if row else None
+    return result
+
+
+@router.post("/admin/inbound-dispositions/backfill")
+async def inbound_disposition_backfill(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=1000, ge=1, le=5000),
+    include_business: bool = Query(default=False),
+    include_synced_history: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        return await backfill_inbound_dispositions(
+            session,
+            apply=False,
+            limit=limit,
+            include_business=include_business,
+            include_synced_history=include_synced_history,
+            settings=settings,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/admin/demo/seed")
@@ -2514,8 +2719,16 @@ async def contact_directory(
                 "id": contact.id,
                 "customer_id": customer.id,
                 "company_name": customer.company_name,
+                "qualification_status": customer.qualification_status,
+                "qualification_reason": customer.qualification_reason,
                 "name": contact.name,
                 "email": contact.email,
+                "lifecycle_status": contact.lifecycle_status,
+                "unavailable_until": (
+                    contact.unavailable_until.isoformat()
+                    if contact.unavailable_until
+                    else None
+                ),
                 "suppressed": bool(
                     contact.suppressed
                     or (address_status is not None and address_status.suppressed)
