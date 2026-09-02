@@ -64,15 +64,23 @@ from app.db import (
     db_health,
     get_session,
 )
+from app.disposition_batches import (
+    batch_item_disposition,
+    create_disposition_batch,
+    disposition_batch_result,
+    retry_failed_disposition_batch,
+)
 from app.disposition_service import (
     apply_email_disposition,
     backfill_inbound_dispositions,
     build_disposition_plan,
+    classify_email_disposition,
     rollback_email_disposition,
 )
 from app.domain import money
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
+from app.jobs import enqueue_job
 from app.mail import (
     MAX_OUTBOUND_ATTACHMENT_BYTES,
     MAX_OUTBOUND_ATTACHMENT_COUNT,
@@ -110,7 +118,6 @@ from app.services import (
     add_customer_contact_endpoint,
     assign_handoff_case,
     create_case_for_handoff,
-    enqueue_job,
     forward_handoff_email,
     generate_handoff_draft_preview,
     ingest_raw_email,
@@ -327,6 +334,7 @@ class InboundDispositionApplyRequest(BaseModel):
     expected_plan_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     acknowledged_blockers: list[str] = Field(default_factory=list, max_length=20)
     queue_referral_outreach: bool = False
+    batch_id: int | None = Field(default=None, gt=0)
 
 
 class InboundDispositionRollbackRequest(BaseModel):
@@ -1448,6 +1456,13 @@ async def admin_status(_: Admin, session: Session, settings: Annotated[Settings,
         "product_list_auto_send_enabled": settings.product_list_auto_send_enabled,
         "quote_auto_send_enabled": settings.quote_auto_send_enabled,
         "inbound_disposition_enabled": settings.inbound_disposition_enabled,
+        "inbound_disposition_ai_enabled": settings.inbound_disposition_ai_enabled,
+        "inbound_disposition_ai_batch_enabled": (
+            settings.inbound_disposition_ai_batch_enabled
+        ),
+        "inbound_disposition_ai_min_confidence": (
+            settings.inbound_disposition_ai_min_confidence
+        ),
         "inbound_disposition_apply_enabled": (
             settings.inbound_disposition_apply_enabled
         ),
@@ -1724,13 +1739,18 @@ async def inbound_disposition_plan(
     email_id: int,
     _: Admin,
     session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
     row = await session.get(EmailMessage, email_id)
     if row is None or row.direction != "INBOUND":
         raise HTTPException(404, "Inbound email was not found")
     if row.is_bounce:
         raise HTTPException(409, "Bounce messages do not use business dispositions")
-    return await build_disposition_plan(session, row)
+    return await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+    )
 
 
 @router.post("/admin/inbound-dispositions/emails/{email_id}/apply")
@@ -1756,7 +1776,26 @@ async def inbound_disposition_apply(
     if not settings.inbound_disposition_enabled:
         raise HTTPException(409, "INBOUND_DISPOSITION_ENABLED must be true")
 
-    initial_plan = await build_disposition_plan(session, row)
+    if request.batch_id is not None:
+        reviewed = await batch_item_disposition(
+            session,
+            batch_id=request.batch_id,
+            email_id=email_id,
+        )
+        if reviewed is None:
+            raise HTTPException(
+                409,
+                "The reviewed batch result is unavailable or still processing",
+            )
+        disposition, _ = reviewed
+    else:
+        disposition = await classify_email_disposition(row, settings=settings)
+    initial_plan = await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
     if initial_plan.get("customer_id") is not None:
         await session.scalar(
             select(Customer)
@@ -1779,7 +1818,12 @@ async def inbound_disposition_apply(
         )
     # Rebuild after acquiring every mutable CRM lock. If another reviewer
     # changed state while this request was waiting, the plan token now differs.
-    plan = await build_disposition_plan(session, row)
+    plan = await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
     confirmation_error = _validate_inbound_disposition_confirmation(
         plan,
         expected_disposition_type=request.expected_disposition_type,
@@ -1796,6 +1840,7 @@ async def inbound_disposition_apply(
         allow_referral_outreach=request.queue_referral_outreach,
         actor=f"admin:{admin}",
         force_manual=True,
+        disposition=disposition,
     )
     await session.flush()
     if row.disposition_handled_at is None:
@@ -1804,7 +1849,12 @@ async def inbound_disposition_apply(
             "The reviewed action could not be applied with the currently resolved data",
         )
     await session.commit()
-    return await build_disposition_plan(session, row)
+    return await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
 
 
 @router.post("/admin/inbound-dispositions/actions/{action_id}/rollback")
@@ -1838,6 +1888,34 @@ async def inbound_disposition_backfill(
     include_synced_history: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
+        if (
+            settings.inbound_disposition_ai_enabled
+            and settings.inbound_disposition_ai_batch_enabled
+            and settings.ai_provider == "anthropic"
+        ):
+            batch = await create_disposition_batch(
+                session,
+                settings=settings,
+                created_by=f"admin:{_}",
+                limit=limit,
+                include_business=include_business,
+                include_synced_history=include_synced_history,
+            )
+            if batch.status not in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}:
+                await enqueue_job(
+                    session,
+                    "inbound_disposition_batch",
+                    {"batch_id": batch.id},
+                    f"inbound-disposition-batch:{batch.id}",
+                )
+            result = await disposition_batch_result(
+                session,
+                batch.id,
+                settings=settings,
+            )
+            if result is None:
+                raise ValueError("Created disposition batch could not be reloaded")
+            return result
         return await backfill_inbound_dispositions(
             session,
             apply=False,
@@ -1848,6 +1926,43 @@ async def inbound_disposition_backfill(
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/admin/inbound-dispositions/batches/{batch_id}")
+async def inbound_disposition_batch_status(
+    batch_id: int,
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    result = await disposition_batch_result(session, batch_id, settings=settings)
+    if result is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    return result
+
+
+@router.post("/admin/inbound-dispositions/batches/{batch_id}/retry")
+async def inbound_disposition_batch_retry(
+    batch_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        batch = await retry_failed_disposition_batch(session, batch_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if batch is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    await enqueue_job(
+        session,
+        "inbound_disposition_batch",
+        {"batch_id": batch.id},
+        f"inbound-disposition-batch-retry:{batch.id}:{batch.retry_count}",
+    )
+    result = await disposition_batch_result(session, batch.id)
+    if result is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    return result
 
 
 @router.post("/admin/demo/seed")

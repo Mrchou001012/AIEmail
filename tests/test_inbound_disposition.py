@@ -52,6 +52,23 @@ def test_quoted_history_address_is_not_a_replacement_contact() -> None:
     assert result.replacement_emails == ()
 
 
+def test_failure_notification_does_not_create_contact_referrals() -> None:
+    result = classify_inbound_disposition(
+        subject="Failure Notification",
+        body=(
+            "DO NOT REPLY TO THIS EMAIL - THIS IS AN AUTOMATED SERVER NOT "
+            "RESPONDING TO E-MAIL COMMUNICATIONS. Dear Supplier: We regret to "
+            "inform you that your e-mail was not processed. Please submit invoices "
+            "by email to ap_china@example.com, ap_hongkong@example.com, and "
+            "ap_india@example.com."
+        ),
+        sender="dfm@customer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.SYSTEM_NOTIFICATION
+    assert result.replacement_emails == ()
+
+
 def test_leave_of_absence_with_backup_stays_temporary() -> None:
     result = classify_inbound_disposition(
         subject="Automatic reply: Checking in from Lanya Chem",

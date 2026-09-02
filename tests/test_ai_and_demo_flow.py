@@ -12,6 +12,7 @@ from app.ai import (
     CompanyResearchSource,
     EmailDraftPreview,
     InboundAnalysis,
+    InboundDispositionDecision,
     _anthropic_inference_options,
     _complete_json_string_array_field,
     _complete_json_string_field,
@@ -141,6 +142,11 @@ def test_inbound_analysis_schema_has_no_optional_properties() -> None:
 
 def test_company_category_schema_has_no_optional_properties() -> None:
     schema = CompanyCategoryDecision.model_json_schema()
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_inbound_disposition_schema_has_no_optional_properties() -> None:
+    schema = InboundDispositionDecision.model_json_schema()
     assert set(schema["required"]) == set(schema["properties"])
 
 

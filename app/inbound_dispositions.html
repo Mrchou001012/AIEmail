@@ -65,6 +65,7 @@
           <label><input id="include-business" type="checkbox"> 包含普通业务邮件</label>
           <label><input id="include-history" type="checkbox"> 包含历史同步邮件</label>
           <button id="run" type="button">运行审计</button>
+          <button id="retry" type="button" hidden>仅重试 AI 失败项</button>
         </div>
         <div class="sub" id="status">尚未运行</div>
       </div>
@@ -82,12 +83,14 @@
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",NON_TARGET:"非目标客户",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
     let plansByEmail = new Map();
+    let activeBatchId = null;
+    let pollTimer = null;
     async function loadSwitches() {
       try {
         const response = await fetch("/admin/status");
         if (!response.ok) return;
         const status = await response.json();
-        $("#safety-notice").insertAdjacentHTML("beforeend", `<div class="muted">当前开关：自动写入 ${status.inbound_disposition_apply_enabled ? "已开启" : "已关闭"} · 新联系人自动联系 ${status.referral_auto_contact_enabled ? "已开启" : "已关闭"} · 总自动发送 ${status.auto_send_enabled ? "已开启" : "已关闭"}</div>`);
+        $("#safety-notice").insertAdjacentHTML("beforeend", `<div class="muted">当前开关：AI语义判断 ${status.inbound_disposition_ai_enabled ? "已开启" : "已关闭"} · 自动写入 ${status.inbound_disposition_apply_enabled ? "已开启" : "已关闭"} · 新联系人自动联系 ${status.referral_auto_contact_enabled ? "已开启" : "已关闭"} · 总自动发送 ${status.auto_send_enabled ? "已开启" : "已关闭"}</div>`);
       } catch (_) { /* The audit remains safe when status display is unavailable. */ }
     }
     function pills(values, kind = "") { return (values || []).map((value) => `<span class="pill ${kind}">${esc(value)}</span>`).join(" "); }
@@ -102,11 +105,16 @@
       const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);
       const outreach = canOfferOutreach ? `<label><input class="outreach" data-email-id="${row.email_id}" type="checkbox"> 同时加入新联系人自动发件队列（总开关开启时可能立即发送）</label>` : "";
       const history = action?.status === "ROLLED_BACK" ? `<span class="pill warn">曾撤销 #${action.id}</span>` : "";
-      return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" type="button">确认应用</button></div>`;
+      return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" data-batch-id="${row.batch_id || ""}" type="button">确认应用</button></div>`;
     }
     function render(data) {
-      $("#status").textContent = `扫描 ${data.scanned_count} 封，候选 ${data.candidate_count} 封 · ${data.mode}`;
-      $("#summary").innerHTML = Object.entries(data.counts || {}).map(([key,value]) => `<span class="pill">${esc(labels[key] || key)} ${value}</span>`).join("");
+      activeBatchId = data.batch_id || activeBatchId;
+      const ai = data.ai_summary || {};
+      const progress = data.batch_id ? ` · 批次 #${data.batch_id} ${data.batch_status} · AI成功 ${ai.succeeded || 0} / 失败 ${ai.failed || 0} / 待处理 ${ai.pending || 0}` : "";
+      $("#status").textContent = `扫描 ${data.scanned_count} 封，候选 ${data.candidate_count} 封 · ${data.mode}${progress}`;
+      const aiSummary = data.batch_id ? `<span class="pill good">AI成功 ${ai.succeeded || 0}</span><span class="pill ${ai.failed ? "bad" : ""}">AI失败 ${ai.failed || 0}</span><span class="pill">规则直判 ${ai.rule_only || 0}</span><span class="pill">重试轮次 ${ai.retry_count || 0}</span>` : "";
+      $("#summary").innerHTML = aiSummary + Object.entries(data.counts || {}).map(([key,value]) => `<span class="pill">${esc(labels[key] || key)} ${value}</span>`).join("");
+      $("#retry").hidden = !(data.complete && ai.retry_available);
       const plans = data.plans || [];
       plansByEmail = new Map(plans.map((row) => [Number(row.email_id), row]));
       $("#rows").innerHTML = plans.length ? plans.map((row) => {
@@ -116,17 +124,18 @@
         const customer = row.customer_id ? `客户 #${row.customer_id}` : "未识别客户";
         const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
         return `<tr>
-          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span><div class="muted">置信度 ${esc(row.confidence)}</div></td>
+          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span>${row.ai_failed ? '<div><span class="pill bad">AI判断失败·规则兜底</span></div>' : ""}<div class="muted">${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? `<br>${esc(row.classifier_model)}` : ""}</div></td>
           <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
           <td>${esc(customer)}<br>${esc(contact)}${senderContact}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
-          <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div></td>
-          <td>${blocked ? pills(row.blockers, "bad") : '<span class="pill good">可安全处理</span>'}<div class="muted">${row.unavailable_until ? `暂停至 ${esc(row.unavailable_until)}` : ""}</div></td>
+          <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div>${(row.evidence || []).length ? `<div class="muted">依据：${esc(row.evidence.join(" ｜ "))}</div>` : ""}</td>
+          <td>${blocked ? pills(row.blockers, "bad") : '<span class="pill good">可安全处理</span>'}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；人工复核时请重点核对原文，建议先重试。</div>` : ""}<div class="muted">${row.unavailable_until ? `暂停至 ${esc(row.unavailable_until)}` : ""}</div></td>
           <td>${esc(row.body_preview)}</td>
           <td>${operationCell(row)}</td>
         </tr>`;
       }).join("") : '<tr><td colspan="7" class="empty">没有匹配的处置候选</td></tr>';
     }
     async function runAudit() {
+      if (pollTimer) clearTimeout(pollTimer);
       const button = $("#run"); button.disabled = true; $("#status").textContent = "正在分析…";
       const query = new URLSearchParams({
         limit:$("#limit").value,
@@ -136,12 +145,43 @@
       try {
         const response = await fetch(`/admin/inbound-dispositions/backfill?${query}`, {method:"POST"});
         if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
-        render(await response.json());
+        const data = await response.json();
+        render(data);
+        if (data.batch_id && !data.complete) schedulePoll(data.batch_id);
       } catch (error) {
         $("#status").textContent = `失败：${error.message}`;
       } finally { button.disabled = false; }
     }
+    async function pollBatch(batchId) {
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/batches/${batchId}`);
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const data = await response.json();
+        render(data);
+        if (!data.complete) schedulePoll(batchId);
+      } catch (error) {
+        $("#status").textContent = `批次状态查询失败：${error.message}`;
+        schedulePoll(batchId);
+      }
+    }
+    function schedulePoll(batchId) {
+      pollTimer = setTimeout(() => pollBatch(batchId), 5000);
+    }
+    async function retryFailed() {
+      if (!activeBatchId) return;
+      const button = $("#retry"); button.disabled = true;
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/batches/${activeBatchId}/retry`, {method:"POST"});
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const data = await response.json();
+        render(data);
+        schedulePoll(activeBatchId);
+      } catch (error) {
+        $("#status").textContent = `失败项重试启动失败：${error.message}`;
+      } finally { button.disabled = false; }
+    }
     $("#run").addEventListener("click", runAudit);
+    $("#retry").addEventListener("click", retryFailed);
     $("#rows").addEventListener("click", async (event) => {
       const applyButton = event.target.closest("button.apply");
       const rollbackButton = event.target.closest("button.rollback");
@@ -151,6 +191,7 @@
       try {
         if (applyButton) {
           const emailId = Number(applyButton.dataset.emailId);
+          const batchId = Number(applyButton.dataset.batchId) || null;
           const row = plansByEmail.get(emailId);
           if (!row) throw new Error("审计结果已过期，请重新运行");
           const blockers = row.blockers || [];
@@ -163,7 +204,7 @@
           const response = await fetch(`/admin/inbound-dispositions/emails/${emailId}/apply`, {
             method:"POST",
             headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({expected_disposition_type:row.disposition_type,expected_plan_token:row.plan_token,acknowledged_blockers:blockers,queue_referral_outreach:outreach}),
+            body:JSON.stringify({expected_disposition_type:row.disposition_type,expected_plan_token:row.plan_token,acknowledged_blockers:blockers,queue_referral_outreach:outreach,batch_id:batchId}),
           });
           if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
           $("#status").textContent = `邮件 #${emailId} 已应用，可从本页撤销`;
@@ -180,7 +221,8 @@
           if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
           $("#status").textContent = `处置动作 #${actionId} 已撤销`;
         }
-        await runAudit();
+        if (activeBatchId) await pollBatch(activeBatchId);
+        else await runAudit();
       } catch (error) {
         $("#status").textContent = `操作失败：${error.message}`;
       } finally { button.disabled = false; }

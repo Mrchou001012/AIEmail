@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.ai import InboundDispositionDecision
 from app.api import (
     InboundDispositionApplyRequest,
     InboundDispositionRollbackRequest,
@@ -40,11 +41,31 @@ from app.disposition_service import (
     apply_email_disposition,
     backfill_inbound_dispositions,
     build_disposition_plan,
+    classify_email_disposition,
     rollback_email_disposition,
 )
 from app.domain import HandoffReason
+from app.inbound_disposition import InboundDispositionType
 from app.services import _handle_automated_reply
-from app.settings import get_settings
+from app.settings import Settings, get_settings
+
+
+class _DispositionAI:
+    def __init__(self, decision: InboundDispositionDecision) -> None:
+        self.decision = decision
+
+    async def classify_inbound_disposition(self, **_: object):
+        return self.decision, {
+            "provider": "anthropic",
+            "model": "claude-test",
+            "request_hash": "a" * 64,
+            "request_id": "req_test",
+        }
+
+
+class _FailingDispositionAI:
+    async def classify_inbound_disposition(self, **_: object):
+        raise PermissionError("test model access denied")
 
 
 @pytest_asyncio.fixture
@@ -113,6 +134,158 @@ def _email(
         ),
         received_at=datetime(2026, 8, 4, 8, tzinfo=UTC),
     )
+
+
+async def test_ai_semantic_disposition_supplies_confidence_and_evidence(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="AI Referral Review",
+        name="Original Buyer",
+        email="buyer@ai-referral.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: Checking in",
+        body=(
+            "Please contact our new procurement manager Maya at "
+            "maya@ai-referral.example for future requirements."
+        ),
+        token="z",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    decision = InboundDispositionDecision(
+        disposition_type="CONTACT_REFERRAL",
+        confidence=0.87,
+        reason="The sender explicitly names the future procurement contact.",
+        evidence=["Please contact our new procurement manager Maya"],
+        replacement_emails=[
+            "maya@ai-referral.example",
+            "hallucinated@ai-referral.example",
+        ],
+        return_hint=None,
+        forwarded_to_replacement=False,
+        non_target_reason=None,
+        product_list_requested=False,
+    )
+    settings = Settings(
+        _env_file=None,
+        ai_provider="anthropic",
+        anthropic_api_key="test-only",
+        inbound_disposition_ai_enabled=True,
+    )
+
+    disposition = await classify_email_disposition(
+        row,
+        settings=settings,
+        ai_client=_DispositionAI(decision),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.CONTACT_REFERRAL
+    assert disposition.classifier_source == "anthropic"
+    assert disposition.confidence == 0.87
+    assert disposition.replacement_emails == ("maya@ai-referral.example",)
+    assert plan["classifier_model"] == "claude-test"
+    assert plan["evidence"] == ["Please contact our new procurement manager Maya"]
+
+
+async def test_low_confidence_ai_mutation_is_blocked(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="AI Confidence Gate",
+        name="Maybe Buyer",
+        email="buyer@ai-confidence.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: Checking in",
+        body="We may be changing responsibilities internally.",
+        token="y",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="DEPARTED",
+                confidence=0.55,
+                reason="The wording might indicate a personnel change.",
+                evidence=["changing responsibilities internally"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        settings=Settings(_env_file=None),
+        disposition=disposition,
+    )
+
+    assert "AI_CONFIDENCE_BELOW_THRESHOLD" in plan["blockers"]
+
+
+async def test_ai_failure_falls_back_with_mutation_blocker(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="AI Failure Gate",
+        name="Departed Buyer",
+        email="buyer@ai-failure.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Automatic reply: Checking in",
+        body="The buyer is no longer employed here.",
+        token="x",
+        auto=True,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    settings = Settings(
+        _env_file=None,
+        ai_provider="anthropic",
+        anthropic_api_key="test-only",
+        inbound_disposition_ai_enabled=True,
+    )
+
+    disposition = await classify_email_disposition(
+        row,
+        settings=settings,
+        ai_client=_FailingDispositionAI(),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+
+    assert disposition.classifier_source == "deterministic_fallback"
+    assert disposition.classification_error == "PermissionError"
+    assert "AI_CLASSIFICATION_UNAVAILABLE" in plan["blockers"]
 
 
 async def test_dry_run_does_not_mutate_customer_or_contact(

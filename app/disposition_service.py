@@ -3,6 +3,7 @@ import html
 import json
 import re
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from email.utils import parseaddr, parsedate_to_datetime
@@ -12,6 +13,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime import finalize_handoff_agent_run
+from app.ai import AIClient, InboundDispositionDecision
+from app.auto_replies import AutomatedReplyType
 from app.db import (
     AgentRun,
     AgentRunStatus,
@@ -85,12 +88,193 @@ def _headers(row: EmailMessage) -> dict[str, str]:
     return {str(key): str(value) for key, value in raw.items()}
 
 
-def classify_email_disposition(row: EmailMessage) -> InboundDisposition:
+def rule_classify_email_disposition(row: EmailMessage) -> InboundDisposition:
     return classify_inbound_disposition(
         subject=row.subject,
         body=row.body_text,
         headers=_headers(row),
         sender=row.from_address,
+    )
+
+
+def _ai_reply_type(disposition_type: InboundDispositionType) -> AutomatedReplyType | None:
+    return {
+        InboundDispositionType.TEMPORARY_ABSENCE: AutomatedReplyType.OUT_OF_OFFICE,
+        InboundDispositionType.DEPARTED: AutomatedReplyType.DEPARTED,
+        InboundDispositionType.CONTACT_REFERRAL: AutomatedReplyType.CONTACT_CHANGE,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE: AutomatedReplyType.CONTACT_CHANGE,
+        InboundDispositionType.AUTOMATED_ACKNOWLEDGEMENT: AutomatedReplyType.GENERIC_AUTOREPLY,
+        InboundDispositionType.SYSTEM_NOTIFICATION: AutomatedReplyType.SYSTEM_NOTIFICATION,
+    }.get(disposition_type)
+
+
+def decision_to_disposition(
+    row: EmailMessage,
+    *,
+    rule: InboundDisposition,
+    decision: InboundDispositionDecision,
+    metadata: dict[str, Any],
+) -> InboundDisposition:
+    disposition_type = InboundDispositionType(decision.disposition_type)
+    authored_casefold = rule.authored_text.casefold()
+    sender = row.from_address.strip().casefold()
+    replacement_emails: list[str] = []
+    for raw_address in decision.replacement_emails:
+        validation = validate_address_format(raw_address)
+        address = validation.normalized if validation.valid else None
+        if (
+            address
+            and address != sender
+            and address.casefold() in authored_casefold
+            and address not in replacement_emails
+        ):
+            replacement_emails.append(address)
+    return_hint = (decision.return_hint or "").strip() or None
+    if return_hint and return_hint.casefold() not in authored_casefold:
+        return_hint = None
+    evidence_source = f"{row.subject}\n{rule.authored_text}".casefold()
+    evidence = tuple(
+        snippet.strip()[:500]
+        for snippet in decision.evidence
+        if snippet.strip() and snippet.strip().casefold() in evidence_source
+    )
+    return InboundDisposition(
+        disposition_type=disposition_type,
+        confidence=decision.confidence,
+        reason=decision.reason.strip()[:500],
+        authored_text=rule.authored_text,
+        replacement_emails=tuple(replacement_emails),
+        return_hint=return_hint,
+        forwarded_to_replacement=decision.forwarded_to_replacement,
+        non_target_reason=decision.non_target_reason,
+        product_list_requested=(
+            decision.product_list_requested or rule.product_list_requested
+        ),
+        automated_reply_type=_ai_reply_type(disposition_type),
+        # Transport authenticity is never delegated to the model.
+        automated_transport_signal=rule.automated_transport_signal,
+        classifier_source="anthropic",
+        classifier_model=str(metadata.get("model") or "") or None,
+        classifier_request_hash=(
+            str(metadata.get("request_hash") or "") or None
+        ),
+        classifier_request_id=(
+            str(metadata.get("request_id") or "") or None
+        ),
+        evidence=evidence,
+    )
+
+
+async def classify_email_disposition(
+    row: EmailMessage,
+    *,
+    settings: Settings | None = None,
+    ai_client: AIClient | None = None,
+) -> InboundDisposition:
+    """Use AI for semantics while retaining deterministic safety signals."""
+
+    settings = settings or get_settings()
+    rule = rule_classify_email_disposition(row)
+    # Trusted machine-notification rules are deterministic and do not justify
+    # the cost or latency of a model call. Bounces are excluded by the caller.
+    if rule.disposition_type is InboundDispositionType.SYSTEM_NOTIFICATION:
+        return rule
+    if not settings.inbound_disposition_ai_enabled:
+        return rule
+    try:
+        client = ai_client or AIClient(settings)
+        decision, metadata = await client.classify_inbound_disposition(
+            subject=row.subject,
+            body=row.body_text,
+            sender=row.from_address,
+            headers=_headers(row),
+        )
+    except Exception as exc:  # fail closed; the plan exposes a blocker
+        return replace(
+            rule,
+            classifier_source="deterministic_fallback",
+            classification_error=type(exc).__name__,
+        )
+    if decision is None:
+        return replace(rule, classifier_source="deterministic_stub")
+    return decision_to_disposition(
+        row,
+        rule=rule,
+        decision=decision,
+        metadata=metadata,
+    )
+
+
+def disposition_to_payload(disposition: InboundDisposition) -> dict[str, Any]:
+    return {
+        "disposition_type": disposition.disposition_type.value,
+        "confidence": disposition.confidence,
+        **disposition.metadata(),
+    }
+
+
+def disposition_from_payload(
+    row: EmailMessage,
+    payload: dict[str, Any],
+) -> InboundDisposition:
+    rule = rule_classify_email_disposition(row)
+    raw_type = payload.get("disposition_type")
+    if not raw_type:
+        return rule
+    try:
+        disposition_type = InboundDispositionType(str(raw_type))
+    except ValueError:
+        return rule
+    automated_type_value = payload.get("automated_reply_type")
+    try:
+        automated_type = (
+            AutomatedReplyType(str(automated_type_value))
+            if automated_type_value
+            else _ai_reply_type(disposition_type)
+        )
+    except ValueError:
+        automated_type = _ai_reply_type(disposition_type)
+    raw_confidence = payload.get("confidence")
+    confidence = (
+        float(raw_confidence) if raw_confidence is not None else rule.confidence
+    )
+    return replace(
+        rule,
+        disposition_type=disposition_type,
+        confidence=confidence,
+        reason=str(payload.get("reason") or rule.reason),
+        replacement_emails=tuple(payload.get("replacement_emails") or ()),
+        return_hint=payload.get("return_hint"),
+        forwarded_to_replacement=bool(payload.get("forwarded_to_replacement")),
+        non_target_reason=payload.get("non_target_reason"),
+        product_list_requested=bool(payload.get("product_list_requested")),
+        automated_reply_type=automated_type,
+        automated_transport_signal=bool(
+            payload.get("automated_transport_signal")
+        ),
+        classifier_source=str(
+            payload.get("classifier_source") or rule.classifier_source
+        ),
+        classifier_model=payload.get("classifier_model"),
+        classifier_request_hash=payload.get("classifier_request_hash"),
+        classifier_request_id=payload.get("classifier_request_id"),
+        evidence=tuple(payload.get("evidence") or ()),
+        classification_error=payload.get("classification_error"),
+    )
+
+
+def _stored_or_rule_disposition(row: EmailMessage) -> InboundDisposition:
+    return disposition_from_payload(
+        row,
+        {
+            "disposition_type": row.disposition_type,
+            "confidence": (
+                float(row.disposition_confidence)
+                if row.disposition_confidence is not None
+                else None
+            ),
+            **(row.disposition_metadata or {}),
+        },
     )
 
 
@@ -218,8 +402,15 @@ async def _resolved_customer(
 async def build_disposition_plan(
     session: AsyncSession,
     row: EmailMessage,
+    *,
+    settings: Settings | None = None,
+    disposition: InboundDisposition | None = None,
 ) -> dict[str, Any]:
-    disposition = classify_email_disposition(row)
+    settings = settings or get_settings()
+    disposition = disposition or await classify_email_disposition(
+        row,
+        settings=settings,
+    )
     sender_contact = await _unique_sender_contact(session, row)
     contact = await _disposition_contact(session, row, disposition, sender_contact)
     customer = await _resolved_customer(session, row, contact)
@@ -229,6 +420,27 @@ async def build_disposition_plan(
     )
     proposed_actions: list[str] = []
     blockers: list[str] = []
+    mutating_types = {
+        InboundDispositionType.TEMPORARY_ABSENCE,
+        InboundDispositionType.DEPARTED,
+        InboundDispositionType.CONTACT_REFERRAL,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+        InboundDispositionType.NON_TARGET,
+    }
+    if disposition.disposition_type in mutating_types:
+        if disposition.classifier_source == "deterministic_fallback":
+            blockers.append("AI_CLASSIFICATION_UNAVAILABLE")
+        if (
+            disposition.classifier_source == "anthropic"
+            and disposition.confidence
+            < settings.inbound_disposition_ai_min_confidence
+        ):
+            blockers.append("AI_CONFIDENCE_BELOW_THRESHOLD")
+        if (
+            disposition.classifier_source == "anthropic"
+            and not disposition.evidence
+        ):
+            blockers.append("AI_EVIDENCE_MISSING")
 
     if disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
         proposed_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
@@ -367,6 +579,12 @@ async def build_disposition_plan(
         "disposition_handled_at": _iso(row.disposition_handled_at),
         "disposition_type": disposition.disposition_type.value,
         "confidence": disposition.confidence,
+        "classifier_source": disposition.classifier_source,
+        "classifier_model": disposition.classifier_model,
+        "classifier_request_hash": disposition.classifier_request_hash,
+        "classifier_request_id": disposition.classifier_request_id,
+        "evidence": list(disposition.evidence),
+        "classification_error": disposition.classification_error,
         "reason": disposition.reason,
         "return_hint": disposition.return_hint,
         "unavailable_until": return_until.isoformat() if return_until else None,
@@ -746,8 +964,10 @@ async def _lock_disposition_related_resources(
 async def _disposition_state_snapshot(
     session: AsyncSession,
     row: EmailMessage,
+    *,
+    disposition: InboundDisposition | None = None,
 ) -> dict[str, Any]:
-    disposition = classify_email_disposition(row)
+    disposition = disposition or _stored_or_rule_disposition(row)
     sender_contact = await _unique_sender_contact(session, row)
     contact = await _disposition_contact(session, row, disposition, sender_contact)
     customer = await _resolved_customer(session, row, contact)
@@ -960,13 +1180,17 @@ async def apply_email_disposition(
     allow_referral_outreach: bool = True,
     actor: str = "inbound_disposition",
     force_manual: bool = False,
+    disposition: InboundDisposition | None = None,
 ) -> bool:
     """Record/apply one disposition; return True when no business work remains."""
 
     settings = settings or get_settings()
     if not settings.inbound_disposition_enabled or row.is_bounce:
         return False
-    disposition = classify_email_disposition(row)
+    disposition = disposition or await classify_email_disposition(
+        row,
+        settings=settings,
+    )
     previous_metadata = dict(row.disposition_metadata or {})
     classification_metadata = {
         **disposition.metadata(),
@@ -987,7 +1211,8 @@ async def apply_email_disposition(
     if locked_row is None:
         return False
     row = locked_row
-    disposition = classify_email_disposition(row)
+    # The email body is immutable; retain the reviewed model decision after
+    # acquiring locks instead of paying for or trusting a second model sample.
     previous_metadata = dict(row.disposition_metadata or {})
     classification_metadata = {
         **disposition.metadata(),
@@ -1031,14 +1256,23 @@ async def apply_email_disposition(
     contact = await _disposition_contact(session, row, disposition, sender_contact)
     customer = await _resolved_customer(session, row, contact)
     if not force_manual:
-        automatic_plan = await build_disposition_plan(session, row)
+        automatic_plan = await build_disposition_plan(
+            session,
+            row,
+            settings=settings,
+            disposition=disposition,
+        )
         if automatic_plan["blockers"]:
             row.disposition_type = disposition.disposition_type.value
             row.disposition_confidence = Decimal(str(disposition.confidence))
             row.disposition_metadata = classification_metadata
             return False
     await _lock_disposition_related_resources(session, row)
-    before_snapshot = await _disposition_state_snapshot(session, row)
+    before_snapshot = await _disposition_state_snapshot(
+        session,
+        row,
+        disposition=disposition,
+    )
     row.disposition_type = disposition.disposition_type.value
     row.disposition_confidence = Decimal(str(disposition.confidence))
     row.disposition_metadata = classification_metadata
@@ -1215,7 +1449,11 @@ async def apply_email_disposition(
         )
     )
     await session.flush()
-    after_snapshot = await _disposition_state_snapshot(session, row)
+    after_snapshot = await _disposition_state_snapshot(
+        session,
+        row,
+        disposition=disposition,
+    )
     session.add(
         InboundDispositionAction(
             source_email_id=row.id,
@@ -1577,7 +1815,13 @@ async def backfill_inbound_dispositions(
     plans: list[dict[str, Any]] = []
     applied_count = 0
     for row in rows:
-        plan = await build_disposition_plan(session, row)
+        disposition = None
+        plan = await build_disposition_plan(
+            session,
+            row,
+            settings=settings,
+            disposition=disposition,
+        )
         if (
             include_business
             or plan["disposition_type"] != InboundDispositionType.BUSINESS.value
@@ -1590,6 +1834,7 @@ async def backfill_inbound_dispositions(
                 row,
                 settings=settings,
                 allow_referral_outreach=False,
+                disposition=disposition,
             )
             if was_unhandled and row.disposition_handled_at is not None:
                 applied_count += 1

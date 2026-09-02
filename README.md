@@ -586,13 +586,20 @@ Start production in observation mode:
 
 ```dotenv
 INBOUND_DISPOSITION_ENABLED=true
+INBOUND_DISPOSITION_AI_ENABLED=true
+INBOUND_DISPOSITION_AI_MIN_CONFIDENCE=0.80
+INBOUND_DISPOSITION_AI_BATCH_ENABLED=true
+INBOUND_DISPOSITION_AI_MAX_BATCH=250
+INBOUND_DISPOSITION_AI_BATCH_POLL_SECONDS=20
+INBOUND_DISPOSITION_AI_BATCH_MAX_ATTEMPTS=3
 INBOUND_DISPOSITION_APPLY_ENABLED=false
 REFERRAL_AUTO_CONTACT_ENABLED=false
 ```
 
 The protected page `/admin/inbound-dispositions` runs a historical dry-run and
-shows proposed actions, resolved customer/contact IDs, referral candidates, and
-every blocker. Bulk scanning never applies changes. A reviewer may then confirm
+shows proposed actions, resolved customer/contact IDs, referral candidates, the
+classifier/model confidence, verbatim evidence, and every blocker. Bulk scanning
+never applies changes. A reviewer may then confirm
 one email at a time; blockers must be acknowledged against the current plan, so
 a stale browser result cannot silently apply a changed classification. The apply
 request also carries the SHA-256 token of the reviewed plan and is rejected when
@@ -600,6 +607,8 @@ customer/contact state changed before confirmation. Equivalent endpoints are:
 
 - `GET /admin/inbound-dispositions/emails/{email_id}/plan`
 - `POST /admin/inbound-dispositions/backfill?limit=1000&include_synced_history=false`
+- `GET /admin/inbound-dispositions/batches/{batch_id}`
+- `POST /admin/inbound-dispositions/batches/{batch_id}/retry`
 - `POST /admin/inbound-dispositions/emails/{email_id}/apply`
 - `POST /admin/inbound-dispositions/actions/{action_id}/rollback`
 
@@ -607,6 +616,13 @@ Each applied action stores its before/after state and reviewer identity. Rollbac
 is refused if a changed CRM record would be overwritten or referral mail has
 already entered an irreversible delivery state; a safe rollback cancels staged
 mail, removes action-created referral contacts, and restores the previous state.
+
+Bulk AI review uses Anthropic Message Batches. Each email has an independent,
+durable result matched by `custom_id`; successful items remain usable when other
+items fail. Transient, canceled, expired, provider, and parse failures are retried
+up to the configured attempt limit. Exhausted items use deterministic rules only,
+are marked `AI判断失败·规则兜底`, and carry an automatic mutation blocker plus an
+explicit manual retry action.
 
 After review, the apply switch permits automatic lifecycle and qualification updates;
 explicit one-email reviewer confirmation remains available while that switch is off:
@@ -666,7 +682,13 @@ By default, sending an approved reply leaves the case in `HUMAN_TAKEOVER`. The r
 
 ### Vacation and personnel-change automatic replies
 
-Inbound messages are checked deterministically before Claude is called. The parser records standard automatic-response headers, the classified reply type, any return-date text, replacement email addresses, the handling timestamp, and an audit event.
+Inbound messages first pass deterministic bounce and trusted system-notification
+checks. When `INBOUND_DISPOSITION_AI_ENABLED=true` with the Anthropic provider,
+Claude then reviews the newly authored text for lifecycle and business semantics.
+Deterministic code validates extracted addresses, preserves transport evidence,
+and controls every CRM mutation and send boundary. The application records the
+classifier source/model, confidence, verbatim evidence, return-date text,
+replacement addresses, handling timestamp, and audit data.
 
 - Out-of-office/vacation replies and generic automated acknowledgements are recorded and silently handled. The application does not reply to them and leaves the sales case active.
 - Clear departure notices suppress the old contact and create a `PERSONNEL_CHANGE` handoff.

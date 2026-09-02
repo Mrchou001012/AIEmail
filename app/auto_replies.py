@@ -50,6 +50,18 @@ AUTO_SUBJECT_PATTERNS = (
     r"不在办公室",
 )
 
+SYSTEM_NOTIFICATION_SUBJECT_PATTERNS = (
+    r"^\s*failure notification\s*$",
+    r"^\s*(?:delivery status notification|non-delivery report|undeliverable)\b",
+    r"^\s*(?:mail delivery failed|returned mail)\b",
+)
+
+SYSTEM_NOTIFICATION_BODY_PATTERNS = (
+    r"\bdo not reply to this e-?mail\b",
+    r"\bthis is an automated (?:server|system)\b",
+    r"\bautomated server not responding to e-?mail communications\b",
+)
+
 OUT_OF_OFFICE_PATTERNS = (
     r"\bi am (?:currently )?(?:out of|away from) (?:the )?office\b",
     r"\bi am (?:currently )?on (?:annual |maternity |parental |medical )?leave\b",
@@ -222,11 +234,19 @@ def classify_automated_reply(
             1.0,
             (f"sender:system-notification:{normalized_sender}",),
         )
+    authored_body = latest_authored_text(body)
+    if _matches(SYSTEM_NOTIFICATION_SUBJECT_PATTERNS, subject) or _matches(
+        SYSTEM_NOTIFICATION_BODY_PATTERNS, authored_body
+    ):
+        return AutomatedReplyClassification(
+            AutomatedReplyType.SYSTEM_NOTIFICATION,
+            1.0,
+            ("content:system-notification",),
+        )
     auto_header, detected_by = _auto_header_signal(normalized_headers)
     subject_signal = _matches(AUTO_SUBJECT_PATTERNS, subject)
     if subject_signal:
         detected_by.append("subject:auto-reply")
-    authored_body = latest_authored_text(body)
     text = f"{subject}\n{authored_body}"[:100_000]
     replacement_emails = _contextual_replacement_emails(authored_body, sender)
     return_hint = _return_hint(text)

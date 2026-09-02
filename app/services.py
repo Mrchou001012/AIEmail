@@ -37,7 +37,6 @@ from app.ai import (
     render_draft_preview,
     requested_product_list_file_format,
     stub_analyze,
-    validate_rendered_email,
 )
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.bounces import (
@@ -47,6 +46,15 @@ from app.bounces import (
     has_permanent_failure_evidence,
 )
 from app.coa_catalog import COACatalog, COAFindStatus
+from app.coa_delivery import (
+    coa_reply_draft as _coa_reply_draft,
+)
+from app.coa_delivery import (
+    prepare_coa_attachments as _prepare_coa_attachments,
+)
+from app.coa_delivery import (
+    read_prepared_coa_attachments as _read_prepared_coa_attachments,
+)
 from app.commercial import (
     QuoteContext,
     QuoteContextStatus,
@@ -101,10 +109,19 @@ from app.domain import (
     quote_valid_until,
     transition,
 )
+from app.email_identity import (
+    reply_contact_name as _reply_contact_name,
+)
+from app.email_identity import (
+    strip_duplicate_signature_lead as _strip_duplicate_signature_lead,
+)
 from app.history import resolve_unique_contact
-from app.imports import ContentBundle, load_content
+from app.imports import load_content
 from app.inbound_disposition import classify_inbound_disposition
 from app.integrations import DingTalkNotifier
+from app.jobs import JOB_HANDLERS as JOB_HANDLERS
+from app.jobs import JobDeferred, enqueue_job
+from app.jobs import claim_and_run_job as claim_and_run_job
 from app.mail import (
     FullReplySource,
     GmailIMAPClient,
@@ -135,6 +152,7 @@ from app.products import (
     product_codes_match,
     product_text_key,
 )
+from app.quote_rendering import render_multi_quote, render_quote, standard_quote_valid_until
 from app.rag_retrieval import LocalRAGRetriever
 from app.reactivation import reactivation_send_guard, record_reactivation_reply
 from app.settings import Settings, get_settings
@@ -148,56 +166,6 @@ PAYMENT_DETAILS_REQUEST_PATTERN = re.compile(
     r"how\s+(?:can|do|should)\s+(?:we|i)\s+pay)\b",
     re.IGNORECASE,
 )
-
-CONTACT_NAME_PLACEHOLDER_PATTERN = re.compile(
-    r"^(?:customer(?:\s+name)?|buyer|contact|unknown|n/?a|sir\s*/?\s*madam)$",
-    re.IGNORECASE,
-)
-SIGNATURE_SIGNOFF_PATTERN = re.compile(
-    r"^(?:thanks?(?:\s+and)?\s+regards|best\s+regards|kind\s+regards|regards|"
-    r"sincerely|yours\s+sincerely|yours\s+faithfully|thank\s+you)[,!.]*$",
-    re.IGNORECASE,
-)
-SIGNATURE_NON_NAME_PATTERN = re.compile(
-    r"\b(?:sales|marketing|manager|director|officer|executive|engineer|department|"
-    r"team|company|chemical|chemicals|biotech|limited|ltd|inc|corp|llc|pvt|export|"
-    r"import)\b",
-    re.IGNORECASE,
-)
-SIGNATURE_NAME_PATTERN = re.compile(
-    r"[^\W\d_]+(?:['’.-][^\W\d_]+)*(?:\s+[^\W\d_]+(?:['’.-][^\W\d_]+)*){0,3}",
-    re.UNICODE,
-)
-
-
-def _reply_contact_name(stored_name: str | None, message_body: str) -> str:
-    """Resolve a conservative greeting name from a verified contact or signature."""
-
-    clean_stored_name = str(stored_name or "").strip()
-    if clean_stored_name and not CONTACT_NAME_PLACEHOLDER_PATTERN.fullmatch(
-        clean_stored_name
-    ):
-        return clean_stored_name
-
-    lines = [
-        html.unescape(line).replace("\xa0", " ").strip()
-        for line in str(message_body or "").replace("\r\n", "\n").split("\n")
-    ]
-    for index, line in enumerate(lines):
-        if not SIGNATURE_SIGNOFF_PATTERN.fullmatch(line):
-            continue
-        candidate = next((value for value in lines[index + 1 :] if value), "")
-        candidate = candidate.strip(" \t*_~#|:;")
-        if (
-            not candidate
-            or len(candidate) > 80
-            or SIGNATURE_NON_NAME_PATTERN.search(candidate)
-            or not SIGNATURE_NAME_PATTERN.fullmatch(candidate)
-        ):
-            return "Customer"
-        return candidate
-    return "Customer"
-
 
 def _retrieve_historical_style_examples(
     settings: Settings,
@@ -415,15 +383,6 @@ def _atomic_business_operation[**P, T](
             raise
 
     return wrapped
-
-
-class JobDeferred(RuntimeError):
-    """A durable business wait that must not consume the job retry budget."""
-
-    def __init__(self, reason: str, available_at: datetime):
-        super().__init__(reason)
-        self.reason = reason
-        self.available_at = available_at
 
 
 def _nonfree_email_domain(email_address: str) -> str | None:
@@ -1428,33 +1387,6 @@ async def replace_handoff_recipient(
     return handoff, new_contact, created
 
 
-async def enqueue_job(
-    session: AsyncSession,
-    kind: str,
-    payload: dict[str, Any],
-    idempotency_key: str,
-    available_at: datetime | None = None,
-) -> Job | None:
-    try:
-        async with session.begin_nested():
-            job = Job(
-                kind=kind,
-                payload=payload,
-                idempotency_key=idempotency_key,
-                available_at=available_at or datetime.now(UTC),
-            )
-            session.add(job)
-            await session.flush()
-        await session.commit()
-        return job
-    except IntegrityError:
-        # The nested transaction already rolled back the conflicting insert.
-        # Commit the still-valid outer transaction without expiring unrelated
-        # ORM instances that callers may continue to use.
-        await session.commit()
-        return None
-
-
 async def ensure_weekly_commercial_refresh(
     session: AsyncSession,
     settings: Settings | None = None,
@@ -2255,28 +2187,6 @@ async def update_handoff_case_product(
     )
     await session.commit()
     return sales_case
-
-
-def _strip_duplicate_signature_lead(
-    body_text: str,
-    signature_text: str,
-) -> str:
-    signature_lead = next(
-        (
-            line.strip()
-            for line in signature_text.splitlines()
-            if line.strip()
-        ),
-        "",
-    )
-    body_lines = body_text.splitlines()
-    if (
-        signature_lead
-        and body_lines
-        and body_lines[-1].strip().casefold() == signature_lead.casefold()
-    ):
-        return "\n".join(body_lines[:-1]).rstrip()
-    return body_text
 
 
 async def queue_human_reply(
@@ -3249,131 +3159,6 @@ async def seed_demo_data(session: AsyncSession) -> dict[str, int]:
         await session.flush()
     await session.commit()
     return {"product_id": product.id, "customer_id": customer.id, "contact_id": contact.id}
-
-
-def render_quote(
-    *,
-    plan: Any,
-    bundle: ContentBundle,
-    product_key: str,
-    product_name: str,
-    price: Decimal,
-    currency: str,
-    quantity: int,
-    unit: str,
-    incoterm: str,
-    payment_term: str,
-    valid_until: date,
-    taxes_included: bool = False,
-    freight_included: bool = False,
-    availability: str = "Ready stock",
-) -> tuple[str, str]:
-    snippet = bundle.product_snippets[product_key]
-    # Free-form model prose is deliberately not inserted into a commercial email.
-    # The structured plan selects tone/snippet IDs; factual language remains local and reviewed.
-    safe_greeting = plan.greeting.lower().startswith("dear ") and not any(ch.isdigit() for ch in plan.greeting)
-    greeting = plan.greeting if safe_greeting else "Dear Customer,"
-    opening = "Thank you for your inquiry."
-    price_lead_in = "Please find our standard quotation details below."
-    closing = "Please let us know if you have questions about this non-binding standard quotation."
-    body_lines = [
-        greeting,
-        "",
-        opening,
-        snippet,
-        "",
-        price_lead_in,
-        f"Product: {product_name}",
-        f"Quantity: {quantity} {unit}",
-        f"Unit price: {currency} {price:.4f} per {unit}",
-        f"Availability: {availability}",
-        f"Price basis: {incoterm} (ex-warehouse)",
-        f"Taxes: {'included' if taxes_included else 'excluded'}",
-        f"Freight: {'included' if freight_included else 'excluded'}",
-        f"Payment term: {payment_term}",
-        f"Quote valid until: {valid_until.isoformat()} ({valid_until.strftime('%A')})",
-        "",
-        closing,
-    ]
-    business_text = "\n".join(body_lines)
-    validate_rendered_email(business_text, exact_price=price, currency=currency, approved_fragments=[snippet])
-    text = "\n".join([business_text, "", bundle.signature_text.strip()])
-    html_body = (
-        "<p>"
-        + "</p><p>".join(html.escape(line) if line else "&nbsp;" for line in body_lines)
-        + "</p>"
-        + bundle.signature_html
-    )
-    return text, html_body
-
-
-def render_multi_quote(
-    *,
-    plan: Any,
-    bundle: ContentBundle,
-    lines: list[dict[str, object]],
-    currency: str,
-    valid_until: date,
-    availability_note: str,
-) -> tuple[str, str]:
-    """Render one non-binding quotation covering several products."""
-    safe_greeting = plan.greeting.lower().startswith("dear ") and not any(
-        ch.isdigit() for ch in plan.greeting
-    )
-    greeting = plan.greeting if safe_greeting else "Dear Customer,"
-    opening = "Thank you for your inquiry."
-    price_lead_in = "Please find our standard quotation details below."
-    closing = "Please let us know if you have questions about this non-binding standard quotation."
-    body_lines: list[str] = [greeting, "", opening, "", price_lead_in]
-    for index, line in enumerate(lines):
-        body_lines.extend(
-            [
-                f"Product: {line['product_name']}",
-                f"Quantity: {line['quantity']} {line['unit']}",
-                f"Unit price: {currency} {line['unit_price']:.4f} per {line['unit']}",
-                f"Availability: {availability_note}",
-                f"Price basis: {line['incoterm']} (ex-warehouse)",
-                f"Taxes: {'included' if line['taxes_included'] else 'excluded'}",
-                f"Freight: {'included' if line['freight_included'] else 'excluded'}",
-                f"Payment term: {line['payment_term']}",
-            ]
-        )
-        if index < len(lines) - 1:
-            body_lines.append("---")
-    body_lines.extend(
-        [
-            f"Quote valid until: {valid_until.isoformat()} ({valid_until.strftime('%A')})",
-            "",
-            closing,
-        ]
-    )
-    business_text = "\n".join(body_lines)
-    text = "\n".join([business_text, "", bundle.signature_text.strip()])
-    html_body = (
-        "<p>"
-        + "</p><p>".join(html.escape(line) if line else "&nbsp;" for line in body_lines)
-        + "</p>"
-        + bundle.signature_html
-    )
-    return text, html_body
-
-
-def standard_quote_valid_until(
-    settings: Settings,
-    at: datetime | None = None,
-) -> date:
-    """Quotations expire on the coming Monday.
-
-    The weekly price refresh covers only the current week, so every quotation
-    is anchored to the Monday of the following week regardless of the product
-    or the day it was issued.
-    """
-    observed = at or datetime.now(UTC)
-    today = observed.astimezone(ZoneInfo(settings.business_timezone)).date()
-    days_until_monday = (0 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    return today + timedelta(days=days_until_monday)
 
 
 async def stage_outbox(
@@ -6543,80 +6328,6 @@ def _product_list_outbound_attachments(
         ),
         catalog_file.filename,
     )
-
-
-def _coa_reply_draft(
-    *,
-    contact_name: str,
-    original_subject: str,
-    product_name: str,
-) -> tuple[str, str]:
-    subject = (
-        f"Re: {original_subject.strip()}"
-        if original_subject.strip() and not original_subject.strip().casefold().startswith("re:")
-        else (original_subject.strip() or f"COA for {product_name}")
-    )
-    greeting_name = contact_name.strip() or "Customer"
-    body = (
-        f"Dear {greeting_name},\n\n"
-        f"Please find attached the Certificate of Analysis (COA) for {product_name}."
-    )
-    return subject[:998], body
-
-
-def _prepare_coa_attachments(
-    *,
-    settings: Settings,
-    product_codes: list[str],
-) -> list[dict[str, Any]]:
-    if not settings.coa_catalog_enabled:
-        raise ValueError("approved COA catalog is disabled")
-    catalog = COACatalog(settings.coa_catalog_path)
-    prepared: list[dict[str, Any]] = []
-    for code in product_codes:
-        result = catalog.find(code)
-        if (
-            result.status is not COAFindStatus.FOUND
-            or len(result.matches) != 1
-            or not result.auto_send_eligible
-        ):
-            raise ValueError(f"no unique approved standard English COA for {code}")
-        entry = dict(result.matches[0])
-        relative_path = str(entry["path"])
-        prepared.append(
-            {
-                "product_code": code,
-                "path": relative_path,
-                "filename": relative_path.replace("\\", "/").rsplit("/", 1)[-1],
-                "sha256": str(entry["sha256"]),
-                "size": int(entry["size"]),
-                "match_basis": result.match_basis,
-            }
-        )
-    return prepared
-
-
-def _read_prepared_coa_attachments(
-    *,
-    settings: Settings,
-    prepared_coas: list[dict[str, Any]],
-) -> tuple[OutboundAttachment, ...]:
-    if not prepared_coas:
-        return ()
-    catalog = COACatalog(settings.coa_catalog_path)
-    attachments: list[OutboundAttachment] = []
-    for prepared in prepared_coas:
-        entry = catalog.entry_for_path(str(prepared.get("path") or ""))
-        if str(entry.get("sha256") or "") != str(prepared.get("sha256") or ""):
-            raise ValueError("prepared COA no longer matches the approved catalog")
-        attachments.append(
-            OutboundAttachment(
-                filename=str(prepared.get("filename") or "COA.pdf"),
-                content_type="application/pdf",
-                payload=catalog.read_verified_attachment(entry),
-            )
-        )
-    return tuple(attachments)
 
 
 async def _maybe_handle_coa_request(
@@ -10064,108 +9775,4 @@ async def reconcile_unknown_outbox(session: AsyncSession, settings: Settings | N
         row.available_at = datetime.now(UTC)
         row.last_error = "Gmail Sent confirmed Message-ID absent; retry permitted"
     await session.commit()
-    return True
-
-
-JOB_HANDLERS = {
-    "demo_outreach": lambda session, payload: create_demo_outreach(session, payload),
-    "case_outreach": lambda session, payload: create_case_outreach(session, payload),
-    "process_inbound": lambda session, payload: process_inbound(session, int(payload["email_id"])),
-    "resume_agent_run": lambda session, payload: resume_agent_run(
-        session,
-        run_id=int(payload["run_id"]),
-        expected_version=int(payload["run_version"]),
-        assistance_request_id=int(payload["assistance_request_id"]),
-    ),
-    "notify_handoff": lambda session, payload: notify_handoff(session, int(payload["handoff_id"])),
-    "notify_commercial_refresh": lambda session, payload: notify_commercial_refresh(
-        session, int(payload["cycle_id"])
-    ),
-}
-
-
-async def claim_and_run_job(
-    session: AsyncSession,
-    worker_id: str,
-    settings: Settings | None = None,
-) -> bool:
-    settings = settings or get_settings()
-    stale_before = datetime.now(UTC) - timedelta(seconds=settings.job_lease_seconds)
-    job = await session.scalar(
-        select(Job)
-        .where(
-            or_(
-                Job.status == JobStatus.PENDING,
-                and_(Job.status == JobStatus.RUNNING, Job.locked_at < stale_before),
-            ),
-            Job.available_at <= datetime.now(UTC),
-        )
-        .order_by(Job.id)
-        .with_for_update(skip_locked=True)
-    )
-    if job is None:
-        return False
-    job.status = JobStatus.RUNNING
-    job.locked_at = datetime.now(UTC)
-    job.locked_by = worker_id
-    job.attempts += 1
-    await session.commit()
-    job_id = job.id
-    try:
-        handler = JOB_HANDLERS[job.kind]
-        await handler(session, job.payload)
-        job.status = JobStatus.DONE
-        job.last_error = None
-        job.locked_at = None
-        job.locked_by = None
-        job.updated_at = datetime.now(UTC)
-        await session.commit()
-    except JobDeferred as exc:
-        await session.rollback()
-        job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
-        if job is None:
-            raise RuntimeError(f"claimed job {job_id} disappeared") from exc
-        job.status = JobStatus.PENDING
-        job.attempts = max(0, job.attempts - 1)
-        job.available_at = exc.available_at
-        job.locked_at = None
-        job.locked_by = None
-        job.last_error = f"DEFERRED: {exc.reason}"[:2000]
-        job.updated_at = datetime.now(UTC)
-        await session.commit()
-    except asyncio.CancelledError:
-        # Cancellation must not leave handler state pending in a reusable
-        # session or hold the durable job lease until it expires.
-        await session.rollback()
-        job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
-        if job is not None:
-            job.status = JobStatus.PENDING
-            job.attempts = max(0, job.attempts - 1)
-            job.available_at = datetime.now(UTC)
-            job.locked_at = None
-            job.locked_by = None
-            job.last_error = "CANCELLED: worker task was interrupted"
-            job.updated_at = datetime.now(UTC)
-            await session.commit()
-        raise
-    except Exception as exc:
-        logger.exception("job %s failed", job_id)
-        error = f"{type(exc).__name__}: {exc}"[:2000]
-        # Discard every uncommitted handler mutation before recording retry
-        # bookkeeping. Otherwise a failed draft can leave an orphan quote or
-        # consume a negotiation round without an outbound message.
-        await session.rollback()
-        job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
-        if job is None:
-            raise RuntimeError(f"claimed job {job_id} disappeared") from exc
-        job.last_error = error
-        if job.attempts >= job.max_attempts:
-            job.status = JobStatus.FAILED
-        else:
-            job.status = JobStatus.PENDING
-            job.available_at = datetime.now(UTC) + timedelta(seconds=min(300, 2**job.attempts))
-        job.locked_at = None
-        job.locked_by = None
-        job.updated_at = datetime.now(UTC)
-        await session.commit()
     return True

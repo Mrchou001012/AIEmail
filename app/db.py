@@ -484,6 +484,66 @@ class ContactReferral(Base, TimestampMixin):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class InboundDispositionBatch(Base, TimestampMixin):
+    """Durable logical AI batch, including automatic retry submissions."""
+
+    __tablename__ = "inbound_disposition_batches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    created_by: Mapped[str] = mapped_column(String(128))
+    options_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider_batch_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    provider_batch_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    ai_requested_count: Mapped[int] = mapped_column(Integer, default=0)
+    rule_count: Mapped[int] = mapped_column(Integer, default=0)
+    pending_count: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class InboundDispositionBatchItem(Base, TimestampMixin):
+    """Per-email result whose status is independent from the rest of a batch."""
+
+    __tablename__ = "inbound_disposition_batch_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "batch_id",
+            "email_id",
+            name="uq_inbound_disposition_batch_email",
+        ),
+        UniqueConstraint(
+            "batch_id",
+            "custom_id",
+            name="uq_inbound_disposition_batch_custom_id",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("inbound_disposition_batches.id", ondelete="CASCADE"), index=True
+    )
+    email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE"), index=True
+    )
+    custom_id: Mapped[str] = mapped_column(String(64))
+    input_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    classification_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider_result_type: Mapped[str | None] = mapped_column(String(32))
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    attempt_history_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    needs_attention: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class InboundDispositionAction(Base):
     """Reversible audit record for one applied inbound disposition."""
 

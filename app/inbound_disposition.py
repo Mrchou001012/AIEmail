@@ -69,6 +69,12 @@ class InboundDisposition:
     product_list_requested: bool = False
     automated_reply_type: AutomatedReplyType | None = None
     automated_transport_signal: bool = False
+    classifier_source: str = "deterministic_rule"
+    classifier_model: str | None = None
+    classifier_request_hash: str | None = None
+    classifier_request_id: str | None = None
+    evidence: tuple[str, ...] = ()
+    classification_error: str | None = None
 
     @property
     def continue_business_processing(self) -> bool:
@@ -96,6 +102,12 @@ class InboundDisposition:
                 self.automated_reply_type.value if self.automated_reply_type else None
             ),
             "automated_transport_signal": self.automated_transport_signal,
+            "classifier_source": self.classifier_source,
+            "classifier_model": self.classifier_model,
+            "classifier_request_hash": self.classifier_request_hash,
+            "classifier_request_id": self.classifier_request_id,
+            "evidence": list(self.evidence),
+            "classification_error": self.classification_error,
             "continue_business_processing": self.continue_business_processing,
         }
 

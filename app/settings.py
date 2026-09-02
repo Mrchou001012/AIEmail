@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # dry-run is reviewed; an authenticated reviewer may still apply one
     # explicitly confirmed email while the global apply switch is disabled.
     inbound_disposition_enabled: bool = True
+    inbound_disposition_ai_enabled: bool = True
+    inbound_disposition_ai_min_confidence: float = Field(default=0.80, ge=0, le=1)
+    inbound_disposition_ai_batch_enabled: bool = True
+    inbound_disposition_ai_max_batch: int = Field(default=250, ge=1, le=1000)
+    inbound_disposition_ai_batch_poll_seconds: int = Field(default=20, ge=5, le=300)
+    inbound_disposition_ai_batch_max_attempts: int = Field(default=3, ge=1, le=10)
     inbound_disposition_apply_enabled: bool = False
     referral_auto_contact_enabled: bool = False
 
