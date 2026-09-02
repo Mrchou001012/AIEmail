@@ -573,10 +573,13 @@ An inbound message without thread headers that does not satisfy the narrow reply
 
 ### Inbound disposition and CRM cleanup
 
-Migration `0022` adds an audited disposition layer before normal case processing.
+Migrations `0022` and `0023` add an audited disposition layer and durable AI
+batch history before normal case processing.
 It classifies only the newly authored portion of a message and keeps temporary
 absence, permanent departure, explicit referral/forwarding, and an explicit
-non-target logistics role separate. Replacement addresses are extracted only
+non-target logistics/supplier role separate. Contact-identity mismatches and
+uncertain semantic results are routed to human review instead of entering the
+ordinary reply pipeline. Replacement addresses are extracted only
 from contact directives, not from signatures or quoted history.
 
 The direct-systemd production checklist is in
@@ -599,7 +602,9 @@ REFERRAL_AUTO_CONTACT_ENABLED=false
 The protected page `/admin/inbound-dispositions` runs a historical dry-run and
 shows proposed actions, resolved customer/contact IDs, referral candidates, the
 classifier/model confidence, verbatim evidence, and every blocker. Bulk scanning
-never applies changes. A reviewer may then confirm
+never applies changes. The page lists the most recent 50 batches and can switch
+between them without editing the URL; historical batches are read-only in both
+the UI and API. A reviewer may then confirm
 one email at a time; blockers must be acknowledged against the current plan, so
 a stale browser result cannot silently apply a changed classification. The apply
 request also carries the SHA-256 token of the reviewed plan and is rejected when
@@ -607,6 +612,7 @@ customer/contact state changed before confirmation. Equivalent endpoints are:
 
 - `GET /admin/inbound-dispositions/emails/{email_id}/plan`
 - `POST /admin/inbound-dispositions/backfill?limit=1000&include_synced_history=false`
+- `GET /admin/inbound-dispositions/batches?limit=50`
 - `GET /admin/inbound-dispositions/batches/{batch_id}`
 - `POST /admin/inbound-dispositions/batches/{batch_id}/retry`
 - `POST /admin/inbound-dispositions/emails/{email_id}/apply`
@@ -617,12 +623,21 @@ is refused if a changed CRM record would be overwritten or referral mail has
 already entered an irreversible delivery state; a safe rollback cancels staged
 mail, removes action-created referral contacts, and restores the previous state.
 
-Bulk AI review uses Anthropic Message Batches. Each email has an independent,
+Bulk AI review uses Anthropic Message Batches with low-variance sampling. Each email has an independent,
 durable result matched by `custom_id`; successful items remain usable when other
 items fail. Transient, canceled, expired, provider, and parse failures are retried
 up to the configured attempt limit. Exhausted items use deterministic rules only,
 are marked `AI判断失败·规则兜底`, and carry an automatic mutation blocker plus an
 explicit manual retry action.
+
+Deterministic post-classification guards define the operational precedence for
+overlapping facts. A temporary absence remains the primary category when a
+backup contact is also supplied, while the address is preserved as a referral.
+Contact referrals without a valid address become `UNCERTAIN`. Customer-wide
+`NON_TARGET` changes require explicit newly authored role/offer evidence, and a
+message rejecting the named contact becomes `CONTACT_IDENTITY_MISMATCH` rather
+than disqualifying the company. A stored AI decision is reused only when its
+model, prompt/schema, parameters, and email-content request hash still match.
 
 After review, the apply switch permits automatic lifecycle and qualification updates;
 explicit one-email reviewer confirmation remains available while that switch is off:

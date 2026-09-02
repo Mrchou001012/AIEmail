@@ -13,14 +13,17 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.ai import inbound_disposition_message_params
 from app.db import (
     Base,
     EmailMessage,
     InboundDispositionBatchItem,
 )
 from app.disposition_batches import (
+    batch_item_disposition,
     create_disposition_batch,
     disposition_batch_result,
+    list_disposition_batches,
     process_disposition_batch,
     retry_failed_disposition_batch,
 )
@@ -50,6 +53,17 @@ def _settings(*, attempts: int = 2) -> Settings:
         inbound_disposition_ai_batch_max_attempts=attempts,
         inbound_disposition_ai_batch_poll_seconds=5,
     )
+
+
+def test_disposition_requests_use_low_variance_sampling() -> None:
+    params, _ = inbound_disposition_message_params(
+        settings=_settings(),
+        subject="Re: Checking in",
+        body="Please contact buyer@example.com.",
+        sender="sender@example.com",
+    )
+
+    assert params["temperature"] == 0
 
 
 def _email(token: str, body: str, *, subject: str = "Re: Checking in") -> EmailMessage:
@@ -436,3 +450,40 @@ async def test_trusted_system_notification_uses_rules_without_ai(
     assert result["ai_summary"]["requested"] == 0
     assert result["ai_summary"]["rule_only"] == 1
     assert result["plans"][0]["disposition_type"] == "SYSTEM_NOTIFICATION"
+
+
+@pytest.mark.asyncio
+async def test_batch_history_lists_newest_first(db_session: AsyncSession) -> None:
+    settings = _settings()
+    first = await _new_batch(
+        db_session,
+        settings,
+        _email("m", "Please send your product list"),
+    )
+    second = await create_disposition_batch(
+        db_session,
+        settings=settings,
+        created_by="test",
+        limit=50,
+        include_business=False,
+        include_synced_history=False,
+    )
+
+    history = await list_disposition_batches(db_session, limit=20)
+
+    assert [row["id"] for row in history[:2]] == [second.id, first.id]
+    assert history[0]["total_count"] == 1
+    assert history[0]["options"]["include_business"] is False
+
+    first_item = await db_session.scalar(
+        select(InboundDispositionBatchItem).where(
+            InboundDispositionBatchItem.batch_id == first.id
+        )
+    )
+    assert first_item is not None
+    with pytest.raises(ValueError, match="Historical disposition batches are read-only"):
+        await batch_item_disposition(
+            db_session,
+            batch_id=first.id,
+            email_id=first_item.email_id,
+        )

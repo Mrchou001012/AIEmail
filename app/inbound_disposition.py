@@ -17,7 +17,9 @@ class InboundDispositionType(StrEnum):
     DEPARTED = "DEPARTED"
     CONTACT_REFERRAL = "CONTACT_REFERRAL"
     FORWARDED_TO_COLLEAGUE = "FORWARDED_TO_COLLEAGUE"
+    CONTACT_IDENTITY_MISMATCH = "CONTACT_IDENTITY_MISMATCH"
     NON_TARGET = "NON_TARGET"
+    UNCERTAIN = "UNCERTAIN"
     AUTOMATED_ACKNOWLEDGEMENT = "AUTOMATED_ACKNOWLEDGEMENT"
     SYSTEM_NOTIFICATION = "SYSTEM_NOTIFICATION"
 
@@ -39,6 +41,37 @@ NON_TARGET_ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?:freight\s+forwarding|customs\s+clearance|logistics\s+services)\b",
             re.I,
         ),
+    ),
+    (
+        "SUPPLIER_VENDOR",
+        re.compile(
+            r"\b(?:please|kindly)\s+find\s+our\s+(?:best\s+|updated\s+|current\s+)?"
+            r"(?:offer|quotation|quote)\b|"
+            r"\b(?:our|the)\s+(?:updated\s+|best\s+|current\s+)?price\s+"
+            r"(?:of\s+this\s+week\s+)?"
+            r"(?:is|would\s+be|could\s+be)\b",
+            re.I,
+        ),
+    ),
+)
+
+CONTACT_IDENTITY_MISMATCH_PATTERNS = (
+    re.compile(
+        r"(?i:\bthere\s+(?:is|are)\s+no\s+)"
+        r"(?:[A-Z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"
+        r"(?i:\s+(?:in|at|with)\s+(?:our|this)\s+"
+        r"(?:company|organisation|organization)\b)",
+    ),
+    re.compile(
+        r"\bwe\s+(?:do\s+not|don't)\s+(?:have|employ|know)\s+"
+        r"(?:anyone|anybody|an?\s+(?:employee|person|contact))\s+"
+        r"(?:named\s+|called\s+)?[a-z][a-z .'-]{1,80}\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:you\s+have|this\s+is|you(?:'|’)ve\s+reached)\s+"
+        r"(?:the\s+)?wrong\s+(?:person|contact|company|address|email)\b",
+        re.I,
     ),
 )
 
@@ -75,6 +108,7 @@ class InboundDisposition:
     classifier_request_id: str | None = None
     evidence: tuple[str, ...] = ()
     classification_error: str | None = None
+    normalization_notes: tuple[str, ...] = ()
 
     @property
     def continue_business_processing(self) -> bool:
@@ -108,6 +142,7 @@ class InboundDisposition:
             "classifier_request_id": self.classifier_request_id,
             "evidence": list(self.evidence),
             "classification_error": self.classification_error,
+            "normalization_notes": list(self.normalization_notes),
             "continue_business_processing": self.continue_business_processing,
         }
 
@@ -187,6 +222,14 @@ def classify_inbound_disposition(
             InboundDispositionType.TEMPORARY_ABSENCE,
             automated.confidence,
             "temporary absence or office closure",
+            **common,
+        )
+
+    if any(pattern.search(authored) for pattern in CONTACT_IDENTITY_MISMATCH_PATTERNS):
+        return InboundDisposition(
+            InboundDispositionType.CONTACT_IDENTITY_MISMATCH,
+            0.99,
+            "sender explicitly rejects the named contact or recipient identity",
             **common,
         )
 

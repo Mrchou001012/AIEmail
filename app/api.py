@@ -68,6 +68,7 @@ from app.disposition_batches import (
     batch_item_disposition,
     create_disposition_batch,
     disposition_batch_result,
+    list_disposition_batches,
     retry_failed_disposition_batch,
 )
 from app.disposition_service import (
@@ -1777,11 +1778,14 @@ async def inbound_disposition_apply(
         raise HTTPException(409, "INBOUND_DISPOSITION_ENABLED must be true")
 
     if request.batch_id is not None:
-        reviewed = await batch_item_disposition(
-            session,
-            batch_id=request.batch_id,
-            email_id=email_id,
-        )
+        try:
+            reviewed = await batch_item_disposition(
+                session,
+                batch_id=request.batch_id,
+                email_id=email_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         if reviewed is None:
             raise HTTPException(
                 409,
@@ -1926,6 +1930,16 @@ async def inbound_disposition_backfill(
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/admin/inbound-dispositions/batches")
+async def inbound_disposition_batch_history(
+    _: Admin,
+    session: Session,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    batches = await list_disposition_batches(session, limit=limit)
+    return {"count": len(batches), "batches": batches}
 
 
 @router.get("/admin/inbound-dispositions/batches/{batch_id}")

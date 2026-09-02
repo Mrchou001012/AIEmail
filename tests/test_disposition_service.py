@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.ai import InboundDispositionDecision
+from app.ai import InboundDispositionDecision, inbound_disposition_message_params
 from app.api import (
     InboundDispositionApplyRequest,
     InboundDispositionRollbackRequest,
@@ -66,6 +66,38 @@ class _DispositionAI:
 class _FailingDispositionAI:
     async def classify_inbound_disposition(self, **_: object):
         raise PermissionError("test model access denied")
+
+
+class _HashAwareDispositionAI:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.calls = 0
+
+    async def classify_inbound_disposition(self, **kwargs: object):
+        self.calls += 1
+        _, request_hash = inbound_disposition_message_params(
+            settings=self.settings,
+            subject=str(kwargs["subject"]),
+            body=str(kwargs["body"]),
+            sender=str(kwargs["sender"]),
+            headers=kwargs.get("headers"),  # type: ignore[arg-type]
+        )
+        return InboundDispositionDecision(
+            disposition_type="BUSINESS",
+            confidence=0.91,
+            reason="The sender is continuing a business conversation.",
+            evidence=["Thank you for following up"],
+            replacement_emails=[],
+            return_hint=None,
+            forwarded_to_replacement=False,
+            non_target_reason=None,
+            product_list_requested=False,
+        ), {
+            "provider": "anthropic",
+            "model": self.settings.anthropic_model,
+            "request_hash": request_hash,
+            "request_id": f"req_{self.calls}",
+        }
 
 
 @pytest_asyncio.fixture
@@ -195,6 +227,287 @@ async def test_ai_semantic_disposition_supplies_confidence_and_evidence(
     assert disposition.replacement_emails == ("maya@ai-referral.example",)
     assert plan["classifier_model"] == "claude-test"
     assert plan["evidence"] == ["Please contact our new procurement manager Maya"]
+
+
+async def test_live_processing_reuses_fresh_stored_ai_classification(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Stored AI Result",
+        name="Buyer",
+        email="buyer@stored-ai.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: Checking in",
+        body="Thank you for following up. We will review our requirements.",
+        token="w",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    settings = Settings(
+        _env_file=None,
+        ai_provider="anthropic",
+        anthropic_api_key="test-only",
+        inbound_disposition_ai_enabled=True,
+        inbound_disposition_apply_enabled=False,
+    )
+    client = _HashAwareDispositionAI(settings)
+
+    assert not await apply_email_disposition(
+        db_session,
+        row,
+        settings=settings,
+        disposition=await classify_email_disposition(
+            row,
+            settings=settings,
+            ai_client=client,  # type: ignore[arg-type]
+        ),
+    )
+    assert not await apply_email_disposition(
+        db_session,
+        row,
+        settings=settings,
+        disposition=await classify_email_disposition(
+            row,
+            settings=settings,
+            ai_client=client,  # type: ignore[arg-type]
+        ),
+    )
+
+    assert client.calls == 1
+
+
+async def test_absence_is_primary_and_keeps_ai_referral(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Temporary Backup",
+        name="Pam",
+        email="pam@temporary-backup.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Automatic reply: Checking in",
+        body=(
+            "I am currently on a leave of absence. Please contact Jared Straley "
+            "at jared@temporary-backup.example for help in directing your inquiry."
+        ),
+        token="v",
+        auto=True,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="CONTACT_REFERRAL",
+                confidence=0.95,
+                reason="The message directs correspondence to Jared.",
+                evidence=["Please contact Jared Straley"],
+                replacement_emails=["jared@temporary-backup.example"],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        disposition=disposition,
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE
+    assert disposition.replacement_emails == ("jared@temporary-backup.example",)
+    assert disposition.normalization_notes == (
+        "PRIMARY_CATEGORY_NORMALIZED:CONTACT_REFERRAL->TEMPORARY_ABSENCE",
+    )
+    assert "SAVE_REFERRALS" in plan["proposed_actions"]
+
+
+async def test_referral_without_valid_address_becomes_uncertain(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="No Referral Address",
+        name="Buyer",
+        email="buyer@no-referral.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: Checking in",
+        body="Please speak with our procurement department going forward.",
+        token="u",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="CONTACT_REFERRAL",
+                confidence=0.94,
+                reason="The message recommends another department.",
+                evidence=["procurement department"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        disposition=disposition,
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.UNCERTAIN
+    assert "CONTACT_REFERRAL_WITHOUT_VALID_EMAIL" in disposition.normalization_notes
+    assert plan["blockers"] == ["AI_CLASSIFICATION_UNCERTAIN"]
+
+
+async def test_explicit_supplier_offer_overrides_ai_business_label(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Supplier Offer",
+        name="Supplier",
+        email="supplier@supplier-offer.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: HMDS",
+        body=(
+            "The updated price of this week could be CIF Nhava Sheva, India "
+            "USD5.40/kg, may I ask is it workable for you?"
+        ),
+        token="t",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="BUSINESS",
+                confidence=0.95,
+                reason="This is a business quotation.",
+                evidence=["updated price of this week"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.NON_TARGET
+    assert disposition.non_target_reason == "SUPPLIER_VENDOR"
+    assert disposition.normalization_notes == (
+        "PRIMARY_CATEGORY_NORMALIZED:BUSINESS->NON_TARGET",
+    )
+
+
+@pytest.mark.parametrize("ai_type", ["CONTACT_REFERRAL", "NON_TARGET"])
+async def test_identity_mismatch_stops_linked_case_and_creates_review(
+    db_session: AsyncSession,
+    ai_type: str,
+) -> None:
+    customer, contact = await _seed_contact(
+        db_session,
+        company="Identity Review",
+        name="Michel",
+        email="excel@identity-review.example",
+    )
+    case = SalesCase(customer_id=customer.id, contact_id=contact.id)
+    db_session.add(case)
+    await db_session.flush()
+    row = _email(
+        contact=contact,
+        subject="RE: Checking in",
+        body="THERE IS NO MICHEL IN OUR COMPANY. Please be aware.",
+        token="s" if ai_type == "CONTACT_REFERRAL" else "r",
+    )
+    row.case_id = case.id
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type=ai_type,  # type: ignore[arg-type]
+                confidence=0.95,
+                reason="Ambiguous model label.",
+                evidence=["THERE IS NO MICHEL IN OUR COMPANY"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason="OTHER" if ai_type == "NON_TARGET" else None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    handled = await apply_email_disposition(
+        db_session,
+        row,
+        settings=Settings(
+            _env_file=None,
+            inbound_disposition_apply_enabled=False,
+        ),
+        disposition=disposition,
+    )
+    await db_session.commit()
+
+    handoff = await db_session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id)
+    )
+    notify_job = await db_session.scalar(
+        select(Job).where(Job.idempotency_key == f"handoff-notify:{handoff.id}")
+    ) if handoff else None
+    assert handled is True
+    assert disposition.disposition_type is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+    assert customer.qualification_status == "UNKNOWN"
+    assert contact.suppressed is False
+    assert handoff is not None and handoff.status == "OPEN"
+    assert notify_job is not None and notify_job.status is JobStatus.PENDING
+    assert await db_session.scalar(
+        select(func.count()).select_from(InboundDispositionAction)
+    ) == 0
 
 
 async def test_low_confidence_ai_mutation_is_blocked(

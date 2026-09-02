@@ -129,7 +129,9 @@ class InboundDispositionDecision(BaseModel):
         "DEPARTED",
         "CONTACT_REFERRAL",
         "FORWARDED_TO_COLLEAGUE",
+        "CONTACT_IDENTITY_MISMATCH",
         "NON_TARGET",
+        "UNCERTAIN",
         "AUTOMATED_ACKNOWLEDGEMENT",
         "SYSTEM_NOTIFICATION",
     ]
@@ -141,6 +143,7 @@ class InboundDispositionDecision(BaseModel):
     forwarded_to_replacement: bool = False
     non_target_reason: Literal[
         "LOGISTICS_SERVICE_PROVIDER",
+        "SUPPLIER_VENDOR",
         "SERVICE_PROVIDER",
         "OTHER",
     ] | None = None
@@ -225,8 +228,13 @@ disposition only:
 - DEPARTED: the sender or a specifically named employee has permanently left the organization.
 - CONTACT_REFERRAL: the message explicitly directs future business correspondence to another person.
 - FORWARDED_TO_COLLEAGUE: the message explicitly says this inquiry/email was already forwarded.
+- CONTACT_IDENTITY_MISMATCH: the sender explicitly says the named person does not exist, does not
+  belong to the organization, or the message reached the wrong person; this is about the contact,
+  not evidence that the whole company is a non-target customer.
 - NON_TARGET: the sender explicitly identifies their organization as a logistics provider, freight
-  forwarder, customs broker, or other service vendor rather than a prospective chemical customer.
+  forwarder, customs broker, supplier/vendor selling to Lanya Chem, or other service vendor rather
+  than a prospective chemical customer.
+- UNCERTAIN: the new body does not support one of the operational categories safely enough.
 - AUTOMATED_ACKNOWLEDGEMENT: a generic receipt/auto-response without another actionable category.
 - SYSTEM_NOTIFICATION: a machine-generated delivery, security, invoice-routing, mail-server, or
   workflow notification that is not a person responding to the sales email.
@@ -235,6 +243,12 @@ Do not treat email addresses in signatures, quoted history, recipient lists, tec
 instructions, invoice-submission lists, privacy notices, or system notifications as replacement
 contacts. replacement_emails may contain only addresses explicitly presented as the person(s) who
 should handle future sales correspondence. Use exact email strings found in the supplied body.
+CONTACT_REFERRAL requires at least one such replacement email. If no valid replacement address is
+present, use CONTACT_IDENTITY_MISMATCH when the message rejects the named contact, otherwise use
+UNCERTAIN. When more than one category applies, use this primary-category order: DEPARTED,
+TEMPORARY_ABSENCE, FORWARDED_TO_COLLEAGUE, CONTACT_REFERRAL, CONTACT_IDENTITY_MISMATCH, NON_TARGET,
+BUSINESS, AUTOMATED_ACKNOWLEDGEMENT, UNCERTAIN. A temporary-absence message that supplies a backup
+contact is TEMPORARY_ABSENCE and still includes that address in replacement_emails.
 return_hint must be the exact date/return phrase from the body, or null. Set product_list_requested
 true only when the new message actually asks Lanya Chem to provide a list/catalog; statements such
 as "we will contact you if we need products" are false. Evidence entries must be short verbatim
@@ -283,10 +297,25 @@ def inbound_disposition_message_params(
         f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
         "</EMAIL_DATA>"
     )
-    request_hash = hashlib.sha256(request_text.encode()).hexdigest()
+    output_schema = transform_schema(InboundDispositionDecision.model_json_schema())
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "model": settings.anthropic_model,
+                "temperature": 0,
+                "system": INBOUND_DISPOSITION_PROMPT,
+                "output_schema": output_schema,
+                "request": request_text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     params: dict[str, Any] = {
         "model": settings.anthropic_model,
         "max_tokens": 1400,
+        "temperature": 0,
         "system": [
             {
                 "type": "text",
@@ -298,9 +327,7 @@ def inbound_disposition_message_params(
         "output_config": {
             "format": {
                 "type": "json_schema",
-                "schema": transform_schema(
-                    InboundDispositionDecision.model_json_schema()
-                ),
+                "schema": output_schema,
             }
         },
     }

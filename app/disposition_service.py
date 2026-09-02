@@ -13,7 +13,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime import finalize_handoff_agent_run
-from app.ai import AIClient, InboundDispositionDecision
+from app.ai import (
+    AIClient,
+    InboundDispositionDecision,
+    inbound_disposition_message_params,
+)
 from app.auto_replies import AutomatedReplyType
 from app.db import (
     AgentRun,
@@ -36,6 +40,7 @@ from app.db import (
     SalesCase,
 )
 from app.deliverability import validate_address_format
+from app.domain import HandoffReason
 from app.imports import load_content
 from app.inbound_disposition import (
     InboundDisposition,
@@ -119,7 +124,7 @@ def decision_to_disposition(
     authored_casefold = rule.authored_text.casefold()
     sender = row.from_address.strip().casefold()
     replacement_emails: list[str] = []
-    for raw_address in decision.replacement_emails:
+    for raw_address in [*decision.replacement_emails, *rule.replacement_emails]:
         validation = validate_address_format(raw_address)
         address = validation.normalized if validation.valid else None
         if (
@@ -132,21 +137,80 @@ def decision_to_disposition(
     return_hint = (decision.return_hint or "").strip() or None
     if return_hint and return_hint.casefold() not in authored_casefold:
         return_hint = None
+    return_hint = return_hint or rule.return_hint
     evidence_source = f"{row.subject}\n{rule.authored_text}".casefold()
     evidence = tuple(
         snippet.strip()[:500]
         for snippet in decision.evidence
         if snippet.strip() and snippet.strip().casefold() in evidence_source
     )
+    reason = decision.reason.strip()[:500]
+    confidence = decision.confidence
+    non_target_reason: str | None = decision.non_target_reason
+    normalization_notes: list[str] = []
+
+    # These deterministic signals are deliberately narrow and operationally
+    # safer than sampling a second semantic label. They also define the primary
+    # category when one email contains both an absence and a referral.
+    guarded_rule_types = {
+        InboundDispositionType.DEPARTED,
+        InboundDispositionType.TEMPORARY_ABSENCE,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+        InboundDispositionType.CONTACT_IDENTITY_MISMATCH,
+        InboundDispositionType.NON_TARGET,
+    }
+    if rule.disposition_type in guarded_rule_types:
+        if disposition_type is not rule.disposition_type:
+            normalization_notes.append(
+                f"PRIMARY_CATEGORY_NORMALIZED:{disposition_type.value}"
+                f"->{rule.disposition_type.value}"
+            )
+        disposition_type = rule.disposition_type
+        reason = rule.reason
+        confidence = rule.confidence
+        non_target_reason = rule.non_target_reason or non_target_reason
+
+    # A referral without an address cannot create or contact a replacement.
+    # Keep it visible as uncertain instead of hiding it as ordinary business.
+    if (
+        disposition_type is InboundDispositionType.CONTACT_REFERRAL
+        and not replacement_emails
+    ):
+        disposition_type = InboundDispositionType.UNCERTAIN
+        reason = "AI proposed a contact referral without a valid replacement address"
+        normalization_notes.append("CONTACT_REFERRAL_WITHOUT_VALID_EMAIL")
+
+    # Customer-wide suppression is too destructive when only the model inferred
+    # a role. A strong authored-text rule must corroborate NON_TARGET.
+    if (
+        disposition_type is InboundDispositionType.NON_TARGET
+        and rule.disposition_type is not InboundDispositionType.NON_TARGET
+    ):
+        disposition_type = InboundDispositionType.UNCERTAIN
+        reason = "AI non-target classification lacks a corroborating explicit role signal"
+        non_target_reason = None
+        normalization_notes.append("NON_TARGET_NOT_RULE_CORROBORATED")
+
+    if (
+        disposition_type is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+        and rule.disposition_type
+        is not InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+    ):
+        disposition_type = InboundDispositionType.UNCERTAIN
+        reason = "AI identity-mismatch classification lacks an explicit authored-text signal"
+        normalization_notes.append("IDENTITY_MISMATCH_NOT_RULE_CORROBORATED")
+
     return InboundDisposition(
         disposition_type=disposition_type,
-        confidence=decision.confidence,
-        reason=decision.reason.strip()[:500],
+        confidence=confidence,
+        reason=reason,
         authored_text=rule.authored_text,
         replacement_emails=tuple(replacement_emails),
         return_hint=return_hint,
-        forwarded_to_replacement=decision.forwarded_to_replacement,
-        non_target_reason=decision.non_target_reason,
+        forwarded_to_replacement=(
+            decision.forwarded_to_replacement or rule.forwarded_to_replacement
+        ),
+        non_target_reason=non_target_reason,
         product_list_requested=(
             decision.product_list_requested or rule.product_list_requested
         ),
@@ -162,6 +226,7 @@ def decision_to_disposition(
             str(metadata.get("request_id") or "") or None
         ),
         evidence=evidence,
+        normalization_notes=tuple(normalization_notes),
     )
 
 
@@ -181,6 +246,9 @@ async def classify_email_disposition(
         return rule
     if not settings.inbound_disposition_ai_enabled:
         return rule
+    stored = _reusable_stored_ai_disposition(row, settings)
+    if stored is not None:
+        return stored
     try:
         client = ai_client or AIClient(settings)
         decision, metadata = await client.classify_inbound_disposition(
@@ -260,6 +328,7 @@ def disposition_from_payload(
         classifier_request_id=payload.get("classifier_request_id"),
         evidence=tuple(payload.get("evidence") or ()),
         classification_error=payload.get("classification_error"),
+        normalization_notes=tuple(payload.get("normalization_notes") or ()),
     )
 
 
@@ -276,6 +345,94 @@ def _stored_or_rule_disposition(row: EmailMessage) -> InboundDisposition:
             **(row.disposition_metadata or {}),
         },
     )
+
+
+def _reusable_stored_ai_disposition(
+    row: EmailMessage,
+    settings: Settings,
+) -> InboundDisposition | None:
+    metadata = row.disposition_metadata or {}
+    if (
+        metadata.get("classifier_source") != "anthropic"
+        or metadata.get("classification_error")
+        or metadata.get("classifier_model") != settings.anthropic_model
+    ):
+        return None
+    _, expected_hash = inbound_disposition_message_params(
+        settings=settings,
+        subject=row.subject,
+        body=row.body_text,
+        sender=row.from_address,
+        headers=_headers(row),
+    )
+    if metadata.get("classifier_request_hash") != expected_hash:
+        return None
+    return _stored_or_rule_disposition(row)
+
+
+async def _ensure_classification_review_handoff(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+) -> Handoff:
+    """Fail closed for a semantic result that cannot enter business automation."""
+
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id)
+    )
+    created = handoff is None
+    if handoff is None:
+        handoff = Handoff(
+            case_id=row.case_id,
+            source_email_id=row.id,
+            reason_code=HandoffReason.HUMAN_CONTROL.value,
+            summary=(
+                "Review contact identity mismatch before further correspondence"
+                if disposition.disposition_type
+                is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+                else "Review uncertain inbound disposition before further correspondence"
+            ),
+            extracted_facts={},
+        )
+        session.add(handoff)
+        await session.flush()
+    handoff.extracted_facts = {
+        **(handoff.extracted_facts or {}),
+        "inbound_disposition": {
+            "type": disposition.disposition_type.value,
+            "confidence": disposition.confidence,
+            **disposition.metadata(),
+        },
+    }
+    if handoff.status == "OPEN":
+        job_key = f"handoff-notify:{handoff.id}"
+        existing_job = await session.scalar(
+            select(Job.id).where(Job.idempotency_key == job_key)
+        )
+        if existing_job is None:
+            session.add(
+                Job(
+                    kind="notify_handoff",
+                    payload={"handoff_id": handoff.id},
+                    idempotency_key=job_key,
+                    status=JobStatus.PENDING,
+                )
+            )
+    if created:
+        session.add(
+            AuditEvent(
+                case_id=row.case_id,
+                actor="inbound_disposition",
+                event_type="inbound.classification_review_required",
+                data={
+                    "email_id": row.id,
+                    "disposition_type": disposition.disposition_type.value,
+                    **disposition.metadata(),
+                },
+            )
+        )
+    return handoff
 
 
 def _domain(address: str | None) -> str | None:
@@ -444,6 +601,8 @@ async def build_disposition_plan(
 
     if disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
         proposed_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
+        if disposition.replacement_emails:
+            proposed_actions.append("SAVE_REFERRALS")
         if contact is None:
             blockers.append("SENDER_CONTACT_NOT_UNIQUE")
         if return_until is None:
@@ -492,6 +651,15 @@ async def build_disposition_plan(
         proposed_actions.extend(["MARK_CUSTOMER_NON_TARGET", "STOP_REACTIVATION"])
         if customer is None:
             blockers.append("CUSTOMER_NOT_RESOLVED")
+    elif (
+        disposition.disposition_type
+        is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+    ):
+        proposed_actions.append("REVIEW_CONTACT_IDENTITY")
+        blockers.append("CONTACT_IDENTITY_REQUIRES_REVIEW")
+    elif disposition.disposition_type is InboundDispositionType.UNCERTAIN:
+        proposed_actions.append("REVIEW_CLASSIFICATION")
+        blockers.append("AI_CLASSIFICATION_UNCERTAIN")
     elif disposition.disposition_type in {
         InboundDispositionType.AUTOMATED_ACKNOWLEDGEMENT,
         InboundDispositionType.SYSTEM_NOTIFICATION,
@@ -585,6 +753,7 @@ async def build_disposition_plan(
         "classifier_request_id": disposition.classifier_request_id,
         "evidence": list(disposition.evidence),
         "classification_error": disposition.classification_error,
+        "normalization_notes": list(disposition.normalization_notes),
         "reason": disposition.reason,
         "return_hint": disposition.return_hint,
         "unavailable_until": return_until.isoformat() if return_until else None,
@@ -1200,6 +1369,19 @@ async def apply_email_disposition(
             if key.startswith("applied_") or key in DISPOSITION_PROVENANCE_KEYS
         },
     }
+    if disposition.disposition_type in {
+        InboundDispositionType.CONTACT_IDENTITY_MISMATCH,
+        InboundDispositionType.UNCERTAIN,
+    }:
+        row.disposition_type = disposition.disposition_type.value
+        row.disposition_confidence = Decimal(str(disposition.confidence))
+        row.disposition_metadata = classification_metadata
+        await _ensure_classification_review_handoff(
+            session,
+            row=row,
+            disposition=disposition,
+        )
+        return True
     if not settings.inbound_disposition_apply_enabled and not force_manual:
         row.disposition_type = disposition.disposition_type.value
         row.disposition_confidence = Decimal(str(disposition.confidence))

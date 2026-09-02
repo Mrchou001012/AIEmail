@@ -183,7 +183,7 @@ PGPASSWORD="$POSTGRES_PASSWORD" /usr/pgsql-15/bin/psql \
   -c "SELECT version_num FROM alembic_version;"
 ```
 
-The expected revision is `0022`. Start the background services only after API
+The expected revision is `0023`. Start the background services only after API
 health and migration checks pass:
 
 ```bash
@@ -217,22 +217,48 @@ read -r -p "Admin user: " AIEMAIL_ADMIN_USER
 read -r -s -p "Admin password: " AIEMAIL_ADMIN_PASSWORD
 echo
 
-AIEMAIL_DRY_RUN_FILE="/root/aiemail-backups/inbound-disposition-dry-run-$AIEMAIL_DEPLOY_TS.json"
+AIEMAIL_DRY_RUN_START_FILE="/root/aiemail-backups/inbound-disposition-dry-run-start-$AIEMAIL_DEPLOY_TS.json"
+AIEMAIL_DRY_RUN_FILE="/root/aiemail-backups/inbound-disposition-dry-run-final-$AIEMAIL_DEPLOY_TS.json"
 curl -fsS \
   -u "$AIEMAIL_ADMIN_USER:$AIEMAIL_ADMIN_PASSWORD" \
   -X POST \
   "http://127.0.0.1:8000/admin/inbound-dispositions/backfill?limit=1000&include_business=false&include_synced_history=false" \
-  -o "$AIEMAIL_DRY_RUN_FILE"
-chmod 600 "$AIEMAIL_DRY_RUN_FILE"
+  -o "$AIEMAIL_DRY_RUN_START_FILE"
+chmod 600 "$AIEMAIL_DRY_RUN_START_FILE"
+
+AIEMAIL_BATCH_ID=$(
+  /opt/aiemail-env/bin/python -c \
+  'import json,sys; print(int(json.load(open(sys.argv[1],encoding="utf-8"))["batch_id"]))' \
+  "$AIEMAIL_DRY_RUN_START_FILE"
+)
+
+for attempt in $(seq 1 90); do
+  curl -fsS \
+    -u "$AIEMAIL_ADMIN_USER:$AIEMAIL_ADMIN_PASSWORD" \
+    "http://127.0.0.1:8000/admin/inbound-dispositions/batches/$AIEMAIL_BATCH_ID" \
+    -o "$AIEMAIL_DRY_RUN_FILE"
+  chmod 600 "$AIEMAIL_DRY_RUN_FILE"
+  if /opt/aiemail-env/bin/python -c \
+    'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1],encoding="utf-8")).get("complete") else 1)' \
+    "$AIEMAIL_DRY_RUN_FILE"; then
+    break
+  fi
+  sleep 5
+done
 
 /opt/aiemail-env/bin/python -c \
-'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print({k:d[k] for k in ("mode","scanned_count","candidate_count","applied_count","counts")})' \
+'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print({k:d[k] for k in ("mode","batch_id","batch_status","complete","scanned_count","candidate_count","applied_count","counts","ai_summary")})' \
 "$AIEMAIL_DRY_RUN_FILE"
 
 unset AIEMAIL_ADMIN_PASSWORD
 ```
 
-The response must report `mode: dry-run` and `applied_count: 0`.
+The final response must report `mode: batch-dry-run`, `complete: true`, a
+terminal `batch_status`, and `applied_count: 0`. The first POST normally shows
+only deterministic rule results while the AI items are still pending; it is not
+the final audit result. The protected page lists the most recent 50 batches, so
+operators can switch batches without editing the URL. Historical batches are
+read-only in both the browser and the apply endpoint.
 
 Also prove that the dry-run created no referral mail:
 
@@ -261,11 +287,34 @@ the following:
 - a verified changed sender retires only the original historical endpoint;
 - out-of-office dates are correct, and uncertain dates show a blocker;
 - forwarded-to-colleague mail does not queue duplicate outreach;
-- logistics providers are marked only when they explicitly identify that role;
+- logistics providers and suppliers offering prices to Lanya are marked only
+  when newly authored text contains an explicit role or offer signal;
+- temporary-absence messages with a backup address remain
+  `TEMPORARY_ABSENCE` while preserving the referral;
+- a referral without a valid authored-body email becomes `UNCERTAIN` and cannot
+  modify CRM data;
+- an explicit "there is no [name] in our company" response becomes
+  `CONTACT_IDENTITY_MISMATCH`; it creates human review and never marks the whole
+  customer `NON_TARGET`;
 - signature and quoted-history addresses are not treated as replacements;
 - all multi-address, cross-domain, missing-customer, and ambiguous records show
   blockers;
 - one manually confirmed action can be safely rolled back from the page.
+
+For the observed boundary samples, require these results in two newly created
+batches before enabling mutation:
+
+- email `#2090`: `NON_TARGET` with reason `SUPPLIER_VENDOR`;
+- email `#2566`: `TEMPORARY_ABSENCE`, preserving `ps@vipullife.com`;
+- email `#2981`: `CONTACT_IDENTITY_MISMATCH`, never `CONTACT_REFERRAL` or
+  customer-level `NON_TARGET`;
+- email `#4014`: `TEMPORARY_ABSENCE`, preserving
+  `jmstraley@bouldersci.com`.
+
+AI confidence alone is not an acceptance criterion. Confirm the normalized
+category, extracted address, blockers, and proposed actions. Any exhausted AI
+item must remain visibly marked for attention and must not be treated as a
+successful semantic decision.
 
 The first release step, after that review, is CRM mutation only:
 
@@ -284,7 +333,7 @@ draft and recipient behavior.
 
 ## 8. Application rollback
 
-The `0022` migration is additive. For an emergency application rollback, keep
+The `0022` and `0023` migrations are additive. For an emergency application rollback, keep
 the database schema in place so audit and referral data are preserved:
 
 ```bash
@@ -302,5 +351,5 @@ systemctl is-active aiemail-api aiemail-worker aiemail-imap
 ```
 
 Do not run `alembic downgrade` during an application rollback unless a database
-restore has been explicitly chosen; downgrade `0022 -> 0021` deletes disposition
-audit and referral tables.
+restore has been explicitly chosen; downgrading `0023 -> 0022` deletes durable
+batch history, and `0022 -> 0021` deletes disposition audit and referral data.

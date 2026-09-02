@@ -142,6 +142,38 @@ def test_explicit_logistics_provider_is_non_target() -> None:
     assert result.non_target_reason == "LOGISTICS_SERVICE_PROVIDER"
 
 
+def test_supplier_price_offer_is_non_target_sales_contact() -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Iodotrimethylsilane/HMDS/HMD",
+        body=(
+            "Dear Priya,\nThe updated price of this week could be CIF Nhava "
+            "Sheva, India USD5.40/kg, may I ask is it workable for you?\n"
+            "Looking forward to hearing from you soon."
+        ),
+        sender="jeremy.li@norkem.cn",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_rejected_named_contact_is_not_customer_level_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="RE: Checking in from Lanya Chem",
+        body=(
+            "KINDLY NOTE THERE IS NO MICHEL IN OUR COMPANY, THERE ARE MANY "
+            "FAKE COMPANIES WHO ARE USING OUR NAME, BE AWARE"
+        ),
+        sender="excel@excelinternational.net",
+    )
+
+    assert (
+        result.disposition_type
+        is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+    )
+    assert result.non_target_reason is None
+
+
 def test_human_departure_and_product_request_continues_business_processing() -> None:
     result = classify_inbound_disposition(
         subject="Checking in from Lanya Chem",

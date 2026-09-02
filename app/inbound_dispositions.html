@@ -66,6 +66,9 @@
           <label><input id="include-history" type="checkbox"> 包含历史同步邮件</label>
           <button id="run" type="button">运行审计</button>
           <button id="retry" type="button" hidden>仅重试 AI 失败项</button>
+          <label>历史批次 <select id="batch-history"><option value="">正在加载…</option></select></label>
+          <button id="view-batch" class="secondary" type="button">查看批次</button>
+          <button id="refresh-batches" class="secondary" type="button">刷新批次</button>
         </div>
         <div class="sub" id="status">尚未运行</div>
       </div>
@@ -81,15 +84,20 @@
   <script>
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
-    const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",NON_TARGET:"非目标客户",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
+    const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",CONTACT_IDENTITY_MISMATCH:"联系人身份不匹配",NON_TARGET:"非目标客户",UNCERTAIN:"无法确定",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
     const batchStorageKey = "aiemail.inboundDispositionBatchId";
     let plansByEmail = new Map();
     let activeBatchId = null;
+    let latestBatchId = null;
+    let renderedData = null;
     let pollTimer = null;
     function rememberBatch(batchId) {
       const normalized = Number(batchId);
       if (!Number.isInteger(normalized) || normalized <= 0) return;
       activeBatchId = normalized;
+      if ([...$("#batch-history").options].some((option) => Number(option.value) === normalized)) {
+        $("#batch-history").value = String(normalized);
+      }
       try { window.localStorage.setItem(batchStorageKey, String(normalized)); } catch (_) { /* URL recovery remains available. */ }
       const url = new URL(window.location.href);
       url.searchParams.set("batch_id", String(normalized));
@@ -112,6 +120,35 @@
         $("#safety-notice").insertAdjacentHTML("beforeend", `<div class="muted">当前开关：AI语义判断 ${status.inbound_disposition_ai_enabled ? "已开启" : "已关闭"} · 自动写入 ${status.inbound_disposition_apply_enabled ? "已开启" : "已关闭"} · 新联系人自动联系 ${status.referral_auto_contact_enabled ? "已开启" : "已关闭"} · 总自动发送 ${status.auto_send_enabled ? "已开启" : "已关闭"}</div>`);
       } catch (_) { /* The audit remains safe when status display is unavailable. */ }
     }
+    function batchOptionLabel(batch) {
+      const created = batch.created_at ? new Date(batch.created_at).toLocaleString("zh-CN", {hour12:false}) : "时间未知";
+      return `#${batch.id} · ${batch.status} · ${batch.total_count} 封 · ${created}`;
+    }
+    async function loadBatchHistory(selectedBatchId = activeBatchId) {
+      const select = $("#batch-history");
+      const button = $("#refresh-batches");
+      button.disabled = true;
+      try {
+        const response = await fetch("/admin/inbound-dispositions/batches?limit=50");
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const batches = (await response.json()).batches || [];
+        latestBatchId = batches.length ? Number(batches[0].id) : null;
+        select.innerHTML = batches.length
+          ? batches.map((batch) => `<option value="${batch.id}">${esc(batchOptionLabel(batch))}</option>`).join("")
+          : '<option value="">暂无历史批次</option>';
+        select.disabled = batches.length === 0;
+        $("#view-batch").disabled = batches.length === 0;
+        if (selectedBatchId && batches.some((batch) => Number(batch.id) === Number(selectedBatchId))) {
+          select.value = String(selectedBatchId);
+        }
+        if (renderedData) render(renderedData);
+      } catch (error) {
+        select.innerHTML = '<option value="">批次列表加载失败</option>';
+        select.disabled = true;
+        $("#view-batch").disabled = true;
+        $("#status").textContent = `批次列表加载失败：${error.message}`;
+      }
+    }
     function pills(values, kind = "") { return (values || []).map((value) => `<span class="pill ${kind}">${esc(value)}</span>`).join(" "); }
     function operationCell(row) {
       const action = row.latest_action;
@@ -121,12 +158,16 @@
         return `<div class="action-stack"><span class="pill good">已应用 #${action.id}</span>${queueState}<div class="muted">${esc((action.applied_actions || []).join(", "))}<br>${esc(action.applied_by)}<br>${esc(action.applied_at)}</div><button class="danger rollback" data-action-id="${action.id}" type="button">撤销</button></div>`;
       }
       if (row.disposition_type === "BUSINESS") return '<span class="muted">继续原业务流程</span>';
+      if (["CONTACT_IDENTITY_MISMATCH", "UNCERTAIN"].includes(row.disposition_type)) return '<span class="pill warn">需要人工复核</span>';
+      if (row.batch_id && latestBatchId === null) return '<span class="muted">正在确认批次状态…</span>';
+      if (row.batch_id && Number(row.batch_id) !== latestBatchId) return '<span class="pill">历史批次只读</span>';
       const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);
       const outreach = canOfferOutreach ? `<label><input class="outreach" data-email-id="${row.email_id}" type="checkbox"> 同时加入新联系人自动发件队列（总开关开启时可能立即发送）</label>` : "";
       const history = action?.status === "ROLLED_BACK" ? `<span class="pill warn">曾撤销 #${action.id}</span>` : "";
       return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" data-batch-id="${row.batch_id || ""}" type="button">确认应用</button></div>`;
     }
     function render(data) {
+      renderedData = data;
       if (data.batch_id) rememberBatch(data.batch_id);
       const ai = data.ai_summary || {};
       const progress = data.batch_id ? ` · 批次 #${data.batch_id} ${data.batch_status} · AI成功 ${ai.succeeded || 0} / 失败 ${ai.failed || 0} / 待处理 ${ai.pending || 0}` : "";
@@ -143,7 +184,7 @@
         const customer = row.customer_id ? `客户 #${row.customer_id}` : "未识别客户";
         const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
         return `<tr>
-          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span>${row.ai_failed ? '<div><span class="pill bad">AI判断失败·规则兜底</span></div>' : ""}<div class="muted">${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? `<br>${esc(row.classifier_model)}` : ""}</div></td>
+          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span>${row.ai_failed ? '<div><span class="pill bad">AI判断失败·规则兜底</span></div>' : ""}${row.needs_attention ? '<div><span class="pill warn">重点复核</span></div>' : ""}<div class="muted">${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? `<br>${esc(row.classifier_model)}` : ""}${(row.normalization_notes || []).length ? `<br>归一化：${esc(row.normalization_notes.join(" ｜ "))}` : ""}</div></td>
           <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
           <td>${esc(customer)}<br>${esc(contact)}${senderContact}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
           <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div>${(row.evidence || []).length ? `<div class="muted">依据：${esc(row.evidence.join(" ｜ "))}</div>` : ""}</td>
@@ -154,7 +195,7 @@
       }).join("") : '<tr><td colspan="7" class="empty">没有匹配的处置候选</td></tr>';
     }
     async function runAudit() {
-      if (pollTimer) clearTimeout(pollTimer);
+      stopPolling();
       const button = $("#run"); button.disabled = true; $("#status").textContent = "正在分析…";
       const query = new URLSearchParams({
         limit:$("#limit").value,
@@ -166,25 +207,41 @@
         if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
         const data = await response.json();
         render(data);
+        await loadBatchHistory(data.batch_id);
         if (data.batch_id && !data.complete) schedulePoll(data.batch_id);
       } catch (error) {
         $("#status").textContent = `失败：${error.message}`;
       } finally { button.disabled = false; }
     }
     async function pollBatch(batchId) {
+      if (activeBatchId && Number(activeBatchId) !== Number(batchId)) return;
       try {
         const response = await fetch(`/admin/inbound-dispositions/batches/${batchId}`);
         if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
         const data = await response.json();
         render(data);
         if (!data.complete) schedulePoll(batchId);
+        else await loadBatchHistory(batchId);
       } catch (error) {
         $("#status").textContent = `批次状态查询失败：${error.message}`;
         schedulePoll(batchId);
       }
     }
     function schedulePoll(batchId) {
+      if (pollTimer) clearTimeout(pollTimer);
       pollTimer = setTimeout(() => pollBatch(batchId), 5000);
+    }
+    function stopPolling() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    async function viewSelectedBatch() {
+      const batchId = Number($("#batch-history").value);
+      if (!Number.isInteger(batchId) || batchId <= 0) return;
+      stopPolling();
+      rememberBatch(batchId);
+      $("#status").textContent = `正在加载批次 #${batchId}…`;
+      await pollBatch(batchId);
     }
     async function retryFailed() {
       if (!activeBatchId) return;
@@ -201,6 +258,9 @@
     }
     $("#run").addEventListener("click", runAudit);
     $("#retry").addEventListener("click", retryFailed);
+    $("#view-batch").addEventListener("click", viewSelectedBatch);
+    $("#batch-history").addEventListener("change", viewSelectedBatch);
+    $("#refresh-batches").addEventListener("click", () => loadBatchHistory(activeBatchId));
     $("#rows").addEventListener("click", async (event) => {
       const applyButton = event.target.closest("button.apply");
       const rollbackButton = event.target.closest("button.rollback");
@@ -248,6 +308,7 @@
     });
     loadSwitches();
     const recoveredBatchId = recoverBatchId();
+    loadBatchHistory(recoveredBatchId);
     if (recoveredBatchId) {
       rememberBatch(recoveredBatchId);
       $("#status").textContent = `正在恢复批次 #${recoveredBatchId}…`;

@@ -321,6 +321,17 @@ def test_inbound_dispositions_page_recovers_batch_after_refresh() -> None:
     assert "pollBatch(recoveredBatchId)" in html
 
 
+def test_inbound_dispositions_page_lists_and_switches_historical_batches() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert 'id="batch-history"' in html
+    assert 'id="view-batch"' in html
+    assert 'fetch("/admin/inbound-dispositions/batches?limit=50")' in html
+    assert 'const button = $("#refresh-batches");' in html
+    assert '$("#batch-history").addEventListener("change", viewSelectedBatch)' in html
+    assert "历史批次只读" in html
+
+
 def test_disposition_confirmation_rejects_stale_classification() -> None:
     error = _validate_inbound_disposition_confirmation(
         {

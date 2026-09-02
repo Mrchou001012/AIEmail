@@ -29,6 +29,12 @@ from app.settings import Settings, get_settings
 
 BATCH_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "PARTIAL_FAILED", "FAILED"})
 ITEM_TERMINAL_STATUSES = frozenset({"AI_SUCCEEDED", "RULE_ONLY", "FALLBACK"})
+ATTENTION_DISPOSITION_TYPES = frozenset(
+    {
+        InboundDispositionType.CONTACT_IDENTITY_MISMATCH,
+        InboundDispositionType.UNCERTAIN,
+    }
+)
 
 
 def _batch_delay(settings: Settings, retry_count: int = 0) -> timedelta:
@@ -504,7 +510,9 @@ async def process_disposition_batch(
                 )
                 item.classification_json = disposition_to_payload(disposition)
                 item.status = "AI_SUCCEEDED"
-                item.needs_attention = False
+                item.needs_attention = (
+                    disposition.disposition_type in ATTENTION_DISPOSITION_TYPES
+                )
                 item.error_type = None
                 item.error_message = None
                 item.input_tokens = int(usage.get("input_tokens") or 0)
@@ -599,6 +607,9 @@ async def disposition_batch_result(
         "mode": "batch-dry-run",
         "batch_id": batch.id,
         "batch_status": batch.status,
+        "batch_created_at": batch.created_at.isoformat(),
+        "batch_ended_at": batch.ended_at.isoformat() if batch.ended_at else None,
+        "batch_options": dict(batch.options_json or {}),
         "complete": batch.status in BATCH_TERMINAL_STATUSES,
         "scanned_count": batch.total_count,
         "candidate_count": len(plans),
@@ -616,6 +627,42 @@ async def disposition_batch_result(
             "retry_available": batch.failed_count > 0,
         },
     }
+
+
+async def list_disposition_batches(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    batches = list(
+        (
+            await session.execute(
+                select(InboundDispositionBatch)
+                .order_by(InboundDispositionBatch.id.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": batch.id,
+            "status": batch.status,
+            "total_count": batch.total_count,
+            "ai_requested_count": batch.ai_requested_count,
+            "rule_count": batch.rule_count,
+            "pending_count": batch.pending_count,
+            "succeeded_count": batch.succeeded_count,
+            "failed_count": batch.failed_count,
+            "retry_count": batch.retry_count,
+            "created_by": batch.created_by,
+            "created_at": batch.created_at.isoformat(),
+            "ended_at": batch.ended_at.isoformat() if batch.ended_at else None,
+            "options": dict(batch.options_json or {}),
+        }
+        for batch in batches
+    ]
 
 
 async def retry_failed_disposition_batch(
@@ -670,6 +717,16 @@ async def batch_item_disposition(
     batch_id: int,
     email_id: int,
 ) -> tuple[InboundDisposition, InboundDispositionBatchItem] | None:
+    latest_batch_id = await session.scalar(
+        select(InboundDispositionBatchItem.batch_id)
+        .where(InboundDispositionBatchItem.email_id == email_id)
+        .order_by(InboundDispositionBatchItem.batch_id.desc())
+        .limit(1)
+    )
+    if latest_batch_id is not None and latest_batch_id != batch_id:
+        raise ValueError(
+            "Historical disposition batches are read-only; review the latest batch"
+        )
     item = await session.scalar(
         select(InboundDispositionBatchItem).where(
             InboundDispositionBatchItem.batch_id == batch_id,
