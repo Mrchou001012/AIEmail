@@ -311,6 +311,16 @@ def test_inbound_dispositions_page_never_exposes_bulk_apply() -> None:
     assert "/rollback`" in html
 
 
+def test_inbound_dispositions_page_recovers_batch_after_refresh() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert 'const batchStorageKey = "aiemail.inboundDispositionBatchId"' in html
+    assert 'url.searchParams.set("batch_id", String(normalized))' in html
+    assert "window.localStorage.setItem(batchStorageKey" in html
+    assert "const recoveredBatchId = recoverBatchId()" in html
+    assert "pollBatch(recoveredBatchId)" in html
+
+
 def test_disposition_confirmation_rejects_stale_classification() -> None:
     error = _validate_inbound_disposition_confirmation(
         {

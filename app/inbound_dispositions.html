@@ -82,9 +82,28 @@
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",NON_TARGET:"非目标客户",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
+    const batchStorageKey = "aiemail.inboundDispositionBatchId";
     let plansByEmail = new Map();
     let activeBatchId = null;
     let pollTimer = null;
+    function rememberBatch(batchId) {
+      const normalized = Number(batchId);
+      if (!Number.isInteger(normalized) || normalized <= 0) return;
+      activeBatchId = normalized;
+      try { window.localStorage.setItem(batchStorageKey, String(normalized)); } catch (_) { /* URL recovery remains available. */ }
+      const url = new URL(window.location.href);
+      url.searchParams.set("batch_id", String(normalized));
+      window.history.replaceState({}, "", url);
+    }
+    function recoverBatchId() {
+      const fromUrl = Number(new URL(window.location.href).searchParams.get("batch_id"));
+      if (Number.isInteger(fromUrl) && fromUrl > 0) return fromUrl;
+      try {
+        const fromStorage = Number(window.localStorage.getItem(batchStorageKey));
+        if (Number.isInteger(fromStorage) && fromStorage > 0) return fromStorage;
+      } catch (_) { /* No persisted batch is available. */ }
+      return null;
+    }
     async function loadSwitches() {
       try {
         const response = await fetch("/admin/status");
@@ -108,7 +127,7 @@
       return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" data-batch-id="${row.batch_id || ""}" type="button">确认应用</button></div>`;
     }
     function render(data) {
-      activeBatchId = data.batch_id || activeBatchId;
+      if (data.batch_id) rememberBatch(data.batch_id);
       const ai = data.ai_summary || {};
       const progress = data.batch_id ? ` · 批次 #${data.batch_id} ${data.batch_status} · AI成功 ${ai.succeeded || 0} / 失败 ${ai.failed || 0} / 待处理 ${ai.pending || 0}` : "";
       $("#status").textContent = `扫描 ${data.scanned_count} 封，候选 ${data.candidate_count} 封 · ${data.mode}${progress}`;
@@ -228,6 +247,12 @@
       } finally { button.disabled = false; }
     });
     loadSwitches();
+    const recoveredBatchId = recoverBatchId();
+    if (recoveredBatchId) {
+      rememberBatch(recoveredBatchId);
+      $("#status").textContent = `正在恢复批次 #${recoveredBatchId}…`;
+      pollBatch(recoveredBatchId);
+    }
   </script>
 </body>
 </html>
