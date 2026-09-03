@@ -265,6 +265,8 @@ def decision_to_disposition(
         replacement_emails = []
         normalization_notes.append("NON_ACTIONABLE_REPLACEMENT_EMAILS_DROPPED")
 
+    replacement_emails.sort()
+
     return InboundDisposition(
         disposition_type=disposition_type,
         confidence=confidence,

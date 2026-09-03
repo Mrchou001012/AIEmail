@@ -1092,6 +1092,59 @@ async def test_copied_same_domain_recipient_is_audited_without_duplicate_outreac
     ) == 0
 
 
+async def test_multiple_referral_addresses_have_canonical_order(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Canonical Referrals",
+        name="Former Buyer",
+        email="former@lbbspecialties.com",
+    )
+    row = _email(
+        contact=contact,
+        subject="Automatic reply: Checking in from Lanya Chem",
+        body=(
+            "The person you are trying to reach is no longer employed. "
+            "Please send your order to orders@charkit.com. If you need assistance, "
+            "please send your email to rclinger@lbbspecialties.com or "
+            "pyannopoulos@lbbspecialties.com."
+        ),
+        token="s",
+        auto=True,
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="DEPARTED",
+                confidence=0.99,
+                reason="The original contact has departed.",
+                replacement_emails=[
+                    "rclinger@lbbspecialties.com",
+                    "orders@charkit.com",
+                    "pyannopoulos@lbbspecialties.com",
+                ],
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    assert disposition.replacement_emails == (
+        "orders@charkit.com",
+        "pyannopoulos@lbbspecialties.com",
+        "rclinger@lbbspecialties.com",
+    )
+
+
 async def test_automatic_apply_respects_blockers_but_manual_confirmation_can_override(
     db_session: AsyncSession,
 ) -> None:
