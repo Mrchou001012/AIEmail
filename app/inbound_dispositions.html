@@ -85,6 +85,8 @@
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",CONTACT_IDENTITY_MISMATCH:"联系人身份不匹配",NON_TARGET:"非目标客户",UNCERTAIN:"无法确定",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
+    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱"};
+    const blockerText = (values) => (values || []).map((value) => blockerLabels[value] || value).join("、");
     const batchStorageKey = "aiemail.inboundDispositionBatchId";
     let plansByEmail = new Map();
     let activeBatchId = null;
@@ -159,6 +161,7 @@
       }
       if (row.disposition_type === "BUSINESS") return '<span class="muted">继续原业务流程</span>';
       if (["CONTACT_IDENTITY_MISMATCH", "UNCERTAIN"].includes(row.disposition_type)) return '<span class="pill warn">需要人工复核</span>';
+      if (row.can_apply === false) return `<span class="pill bad">当前无法应用</span><div class="muted">请先解决：${esc(blockerText(row.application_blockers))}</div>`;
       if (row.batch_id && latestBatchId === null) return '<span class="muted">正在确认批次状态…</span>';
       if (row.batch_id && Number(row.batch_id) !== latestBatchId) return '<span class="pill">历史批次只读</span>';
       const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);

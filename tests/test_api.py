@@ -311,6 +311,14 @@ def test_inbound_dispositions_page_never_exposes_bulk_apply() -> None:
     assert "/rollback`" in html
 
 
+def test_inbound_dispositions_page_hides_apply_for_unresolved_data() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert "row.can_apply === false" in html
+    assert "当前无法应用" in html
+    assert "application_blockers" in html
+
+
 def test_inbound_dispositions_page_recovers_batch_after_refresh() -> None:
     html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
 
@@ -346,6 +354,26 @@ def test_disposition_confirmation_rejects_stale_classification() -> None:
     )
 
     assert error is not None and "changed since review" in error
+
+
+def test_disposition_confirmation_rejects_unresolvable_action() -> None:
+    error = _validate_inbound_disposition_confirmation(
+        {
+            "disposition_type": "NON_TARGET",
+            "blockers": ["CUSTOMER_NOT_RESOLVED"],
+            "application_blockers": ["CUSTOMER_NOT_RESOLVED"],
+            "latest_action": None,
+            "plan_token": "e" * 64,
+        },
+        expected_disposition_type="NON_TARGET",
+        expected_plan_token="e" * 64,
+        acknowledged_blockers=["CUSTOMER_NOT_RESOLVED"],
+    )
+
+    assert error == (
+        "Disposition cannot be applied until required data is resolved: "
+        "CUSTOMER_NOT_RESOLVED"
+    )
 
 
 def test_disposition_confirmation_requires_exact_blocker_acknowledgement() -> None:

@@ -355,6 +355,12 @@ def _validate_inbound_disposition_confirmation(
         return "Disposition changed since review; reload the plan before applying"
     if plan["disposition_type"] == "BUSINESS":
         return "Business mail must continue through the case workflow"
+    application_blockers = list(plan.get("application_blockers") or [])
+    if application_blockers:
+        return (
+            "Disposition cannot be applied until required data is resolved: "
+            + ", ".join(application_blockers)
+        )
     latest_action = plan.get("latest_action") or {}
     if latest_action.get("status") == "APPLIED":
         return "This disposition already has an active applied action"

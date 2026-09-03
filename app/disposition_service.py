@@ -784,6 +784,29 @@ async def build_disposition_plan(
     if len(disposition.replacement_emails) > 1:
         blockers.append("MULTIPLE_REFERRALS_REQUIRE_REVIEW")
 
+    application_blockers: list[str] = []
+    if disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
+        application_blockers.extend(
+            blocker
+            for blocker in ("SENDER_CONTACT_NOT_UNIQUE",)
+            if blocker in blockers
+        )
+    elif disposition.disposition_type is InboundDispositionType.DEPARTED:
+        if "ORIGINAL_CONTACT_NOT_VERIFIED" in blockers:
+            application_blockers.append("ORIGINAL_CONTACT_NOT_VERIFIED")
+    elif disposition.disposition_type in {
+        InboundDispositionType.CONTACT_REFERRAL,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+    }:
+        application_blockers.extend(
+            blocker
+            for blocker in ("CUSTOMER_NOT_RESOLVED", "NO_REPLACEMENT_CONTACT")
+            if blocker in blockers
+        )
+    elif disposition.disposition_type is InboundDispositionType.NON_TARGET:
+        if "CUSTOMER_NOT_RESOLVED" in blockers:
+            application_blockers.append("CUSTOMER_NOT_RESOLVED")
+
     latest_action = await session.scalar(
         select(InboundDispositionAction)
         .where(InboundDispositionAction.source_email_id == row.id)
@@ -857,6 +880,8 @@ async def build_disposition_plan(
         "continue_business_processing": disposition.continue_business_processing,
         "proposed_actions": proposed_actions,
         "blockers": list(dict.fromkeys(blockers)),
+        "can_apply": not application_blockers,
+        "application_blockers": list(dict.fromkeys(application_blockers)),
         "body_preview": re.sub(r"\s+", " ", disposition.authored_text)[:500],
         "latest_action": action_summary,
     }

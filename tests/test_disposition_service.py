@@ -698,6 +698,32 @@ async def test_low_confidence_ai_mutation_is_blocked(
     assert "AI_CONFIDENCE_BELOW_THRESHOLD" in plan["blockers"]
 
 
+async def test_unresolved_non_target_has_no_apply_action(
+    db_session: AsyncSession,
+) -> None:
+    row = EmailMessage(
+        direction="INBOUND",
+        from_address="marketing@unresolved-supplier.example",
+        to_addresses=["sales@lanyachem.com"],
+        subject="PRODUCT OFFER",
+        body_text="Presently we can offer this material at USD 3700/mt.",
+        attachment_metadata=[],
+        raw_sha256="j" * 64,
+        is_history=False,
+        is_automated_reply=False,
+        automated_reply_metadata={},
+        received_at=datetime(2026, 8, 4, 8, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    plan = await build_disposition_plan(db_session, row)
+
+    assert plan["disposition_type"] == "NON_TARGET"
+    assert plan["can_apply"] is False
+    assert plan["application_blockers"] == ["CUSTOMER_NOT_RESOLVED"]
+
+
 async def test_ai_failure_falls_back_with_mutation_blocker(
     db_session: AsyncSession,
 ) -> None:
@@ -1163,6 +1189,11 @@ async def test_automatic_apply_respects_blockers_but_manual_confirmation_can_ove
     )
     db_session.add(row)
     await db_session.commit()
+    plan = await build_disposition_plan(db_session, row)
+    assert "RETURN_DATE_NOT_RELIABLE" in plan["blockers"]
+    assert plan["can_apply"] is True
+    assert plan["application_blockers"] == []
+
     settings = get_settings()
     original = settings.inbound_disposition_apply_enabled
     settings.inbound_disposition_apply_enabled = True
@@ -1696,6 +1727,8 @@ async def test_admin_api_applies_reviewed_plan_and_rolls_it_back(
     db_session.add(row)
     await db_session.commit()
     plan = await build_disposition_plan(db_session, row)
+    assert plan["can_apply"] is True
+    assert plan["application_blockers"] == []
     settings = get_settings()
     original_apply = settings.inbound_disposition_apply_enabled
     settings.inbound_disposition_apply_enabled = False
