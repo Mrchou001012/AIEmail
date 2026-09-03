@@ -319,6 +319,13 @@ def test_inbound_dispositions_page_hides_apply_for_unresolved_data() -> None:
     assert "application_blockers" in html
 
 
+def test_inbound_dispositions_page_distinguishes_expired_absence() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert "row.absence_already_ended" in html
+    assert "结束，不会暂停联系人" in html
+
+
 def test_inbound_dispositions_page_recovers_batch_after_refresh() -> None:
     html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
 

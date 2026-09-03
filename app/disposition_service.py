@@ -654,6 +654,7 @@ async def build_disposition_plan(
     *,
     settings: Settings | None = None,
     disposition: InboundDisposition | None = None,
+    at: datetime | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     disposition = disposition or await classify_email_disposition(
@@ -666,6 +667,10 @@ async def build_disposition_plan(
     return_until = _parse_return_until(
         disposition.return_hint,
         received_at=row.received_at,
+    )
+    observed_at = at or datetime.now(UTC)
+    absence_already_ended = bool(
+        return_until is not None and return_until <= observed_at
     )
     proposed_actions: list[str] = []
     blockers: list[str] = []
@@ -692,10 +697,14 @@ async def build_disposition_plan(
             blockers.append("AI_EVIDENCE_MISSING")
 
     if disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
-        proposed_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
+        proposed_actions.extend(
+            ["IGNORE_AUTOREPLY", "RECORD_EXPIRED_ABSENCE"]
+            if absence_already_ended
+            else ["IGNORE_AUTOREPLY", "PAUSE_CONTACT"]
+        )
         if disposition.replacement_emails:
             proposed_actions.append("SAVE_REFERRALS")
-        if contact is None:
+        if contact is None and not absence_already_ended:
             blockers.append("SENDER_CONTACT_NOT_UNIQUE")
         if return_until is None:
             blockers.append("RETURN_DATE_NOT_RELIABLE")
@@ -872,6 +881,7 @@ async def build_disposition_plan(
         "reason": disposition.reason,
         "return_hint": disposition.return_hint,
         "unavailable_until": return_until.isoformat() if return_until else None,
+        "absence_already_ended": absence_already_ended,
         "replacement_emails": list(disposition.replacement_emails),
         "referral_candidates": referral_candidates,
         "forwarded_to_replacement": disposition.forwarded_to_replacement,
@@ -1474,10 +1484,12 @@ async def apply_email_disposition(
     actor: str = "inbound_disposition",
     force_manual: bool = False,
     disposition: InboundDisposition | None = None,
+    at: datetime | None = None,
 ) -> bool:
     """Record/apply one disposition; return True when no business work remains."""
 
     settings = settings or get_settings()
+    observed_at = at or datetime.now(UTC)
     if not settings.inbound_disposition_enabled or row.is_bounce:
         return False
     disposition = disposition or await classify_email_disposition(
@@ -1567,6 +1579,7 @@ async def apply_email_disposition(
             row,
             settings=settings,
             disposition=disposition,
+            at=observed_at,
         )
         if automatic_plan["blockers"]:
             row.disposition_type = disposition.disposition_type.value
@@ -1593,14 +1606,20 @@ async def apply_email_disposition(
         terminal = True
         applied_actions.append("IGNORE_AUTOREPLY")
     elif disposition.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE:
-        if contact is None:
-            return False
-        contact.lifecycle_status = "TEMPORARILY_UNAVAILABLE"
-        contact.unavailable_until = _parse_return_until(
+        return_until = _parse_return_until(
             disposition.return_hint,
             received_at=row.received_at,
         )
-        await _save_referrals(
+        absence_already_ended = bool(
+            return_until is not None and return_until <= observed_at
+        )
+        if contact is None and not absence_already_ended:
+            return False
+        if not absence_already_ended:
+            assert contact is not None
+            contact.lifecycle_status = "TEMPORARILY_UNAVAILABLE"
+            contact.unavailable_until = return_until
+        referrals = await _save_referrals(
             session,
             row=row,
             disposition=disposition,
@@ -1608,7 +1627,13 @@ async def apply_email_disposition(
             customer=customer,
         )
         terminal = True
-        applied_actions.extend(["IGNORE_AUTOREPLY", "PAUSE_CONTACT"])
+        applied_actions.extend(
+            ["IGNORE_AUTOREPLY", "RECORD_EXPIRED_ABSENCE"]
+            if absence_already_ended
+            else ["IGNORE_AUTOREPLY", "PAUSE_CONTACT"]
+        )
+        if referrals:
+            applied_actions.append("SAVE_REFERRALS")
     elif disposition.disposition_type is InboundDispositionType.DEPARTED:
         # A human reply may mention somebody else leaving.  Suppress the sender
         # only when the transport itself proves this is that endpoint's auto-reply.

@@ -191,7 +191,7 @@
           <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
           <td>${esc(customer)}<br>${esc(contact)}${senderContact}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
           <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div>${(row.evidence || []).length ? `<div class="muted">依据：${esc(row.evidence.join(" ｜ "))}</div>` : ""}</td>
-          <td>${blocked ? pills(row.blockers, "bad") : '<span class="pill good">可安全处理</span>'}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；人工复核时请重点核对原文，建议先重试。</div>` : ""}<div class="muted">${row.unavailable_until ? `暂停至 ${esc(row.unavailable_until)}` : ""}</div></td>
+          <td>${blocked ? pills(row.blockers, "bad") : '<span class="pill good">可安全处理</span>'}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；人工复核时请重点核对原文，建议先重试。</div>` : ""}<div class="muted">${row.unavailable_until ? (row.absence_already_ended ? `休假已于 ${esc(row.unavailable_until)} 结束，不会暂停联系人` : `暂停至 ${esc(row.unavailable_until)}`) : ""}</div></td>
           <td>${esc(row.body_preview)}</td>
           <td>${operationCell(row)}</td>
         </tr>`;

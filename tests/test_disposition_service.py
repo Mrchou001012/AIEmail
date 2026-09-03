@@ -973,7 +973,12 @@ async def test_apply_out_of_office_sets_resume_boundary(
     original = settings.inbound_disposition_apply_enabled
     settings.inbound_disposition_apply_enabled = True
     try:
-        assert await apply_email_disposition(db_session, row, settings=settings) is True
+        assert await apply_email_disposition(
+            db_session,
+            row,
+            settings=settings,
+            at=datetime(2026, 8, 10, tzinfo=UTC),
+        ) is True
         await db_session.commit()
     finally:
         settings.inbound_disposition_apply_enabled = original
@@ -986,6 +991,90 @@ async def test_apply_out_of_office_sets_resume_boundary(
     )
     assert observed_until == datetime(2026, 8, 22, tzinfo=UTC)
     assert await db_session.scalar(select(func.count()).select_from(ContactReferral)) == 0
+
+
+async def test_expired_absence_is_recorded_without_pausing_contact(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Expired Leave Test",
+        name="Buyer",
+        email="buyer@expired-leave.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Automatic reply: Checking in",
+        body=(
+            "Our offices are closed from 3rd to 21st August. For urgent matters, "
+            "please contact backup@expired-leave.example."
+        ),
+        token="d",
+        auto=True,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    observed_at = datetime(2026, 9, 3, tzinfo=UTC)
+
+    plan = await build_disposition_plan(db_session, row, at=observed_at)
+    assert plan["absence_already_ended"] is True
+    assert plan["proposed_actions"] == [
+        "IGNORE_AUTOREPLY",
+        "RECORD_EXPIRED_ABSENCE",
+        "SAVE_REFERRALS",
+    ]
+
+    settings = get_settings()
+    original = settings.inbound_disposition_apply_enabled
+    settings.inbound_disposition_apply_enabled = True
+    try:
+        assert await apply_email_disposition(
+            db_session,
+            row,
+            settings=settings,
+            at=observed_at,
+        ) is True
+        await db_session.commit()
+    finally:
+        settings.inbound_disposition_apply_enabled = original
+
+    await db_session.refresh(contact)
+    await db_session.refresh(row)
+    assert contact.lifecycle_status == "ACTIVE"
+    assert contact.unavailable_until is None
+    assert row.disposition_handled_at is not None
+    assert row.disposition_metadata["applied_actions"] == [
+        "IGNORE_AUTOREPLY",
+        "RECORD_EXPIRED_ABSENCE",
+        "SAVE_REFERRALS",
+    ]
+    referral = await db_session.scalar(
+        select(ContactReferral).where(ContactReferral.source_email_id == row.id)
+    )
+    assert referral is not None
+    assert referral.referred_email == "backup@expired-leave.example"
+
+    action = await db_session.scalar(
+        select(InboundDispositionAction).where(
+            InboundDispositionAction.source_email_id == row.id
+        )
+    )
+    assert action is not None
+    await rollback_email_disposition(
+        db_session,
+        action_id=action.id,
+        actor="admin:test",
+        reason="Expired absence rollback test",
+    )
+    await db_session.refresh(contact)
+    await db_session.refresh(row)
+    assert contact.lifecycle_status == "ACTIVE"
+    assert row.disposition_handled_at is None
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(ContactReferral)
+        .where(ContactReferral.source_email_id == row.id)
+    ) == 0
 
 
 async def test_forwarded_to_colleague_saves_contact_without_duplicate_outreach(
