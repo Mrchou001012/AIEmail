@@ -172,6 +172,22 @@ def test_supplier_registration_outreach_is_non_target() -> None:
     assert result.non_target_reason == "SUPPLIER_VENDOR"
 
 
+def test_supplier_registration_subject_inside_body_is_not_treated_as_history() -> None:
+    result = classify_inbound_disposition(
+        subject="INTRODUCTION OF TRICON STEEL & ALLOYS",
+        body=(
+            "Kind Attn: Purchase Manager.\n\n"
+            "Subject: Request for Supplier Registration: Stainless Steel Products.\n"
+            "We are leading exporters, manufacturer, and stockist of industrial "
+            "raw materials."
+        ),
+        sender="sales@triconsteels.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
 def test_explicit_manufacturer_sales_outreach_is_non_target() -> None:
     result = classify_inbound_disposition(
         subject="Introduction to Our Industrial Valve Solutions",

@@ -127,6 +127,11 @@ QUOTED_HISTORY_PATTERNS = (
     re.compile(r"^\s*_{5,}\s*$"),
 )
 
+OUTLOOK_HEADER_PATTERN = re.compile(
+    r"^\s*(from|sent|to|subject):\s+",
+    re.I,
+)
+
 REPLACEMENT_CONTEXT_PATTERNS = (
     re.compile(r"\bplease\s+(?:contact|email|reach(?:\s+out)?\s+to)\b", re.I),
     re.compile(r"\b(?:contact|email|reach(?:\s+out)?\s+to)\s+[\w .,'’()/-]{0,100}$", re.I),
@@ -191,13 +196,32 @@ def latest_authored_text(body: str) -> str:
 
     lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").splitlines()
     for index, line in enumerate(lines):
-        stripped = line.strip()
-        outlook_header = bool(re.match(r"^(?:from|sent|to|subject):\s+", stripped, re.I))
-        if index > 0 and (outlook_header or any(pattern.match(line) for pattern in QUOTED_HISTORY_PATTERNS)):
+        outlook_header = _starts_outlook_header_block(lines, index)
+        if index > 0 and (
+            outlook_header
+            or any(pattern.match(line) for pattern in QUOTED_HISTORY_PATTERNS)
+        ):
             authored = "\n".join(lines[:index]).strip()
             if authored:
                 return authored
     return (body or "").strip()
+
+
+def _starts_outlook_header_block(lines: list[str], index: int) -> bool:
+    """Require a real header block instead of truncating on an in-body Subject line."""
+
+    fields: set[str] = set()
+    for candidate in lines[index : index + 8]:
+        stripped = candidate.strip()
+        if not stripped:
+            if fields:
+                continue
+            return False
+        match = OUTLOOK_HEADER_PATTERN.match(stripped)
+        if not match:
+            break
+        fields.add(match.group(1).casefold())
+    return ("from" in fields and len(fields) >= 2) or len(fields) >= 3
 
 
 def _contextual_replacement_emails(body: str, sender: str | None) -> tuple[str, ...]:

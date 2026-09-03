@@ -8,8 +8,9 @@ from typing import Any, Literal
 
 import anthropic
 from anthropic.lib._parse._transform import transform_schema
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.auto_replies import latest_authored_text
 from app.domain import Intent
 from app.product_catalog import classify_category_interests
 from app.products import (
@@ -136,7 +137,7 @@ class InboundDispositionDecision(BaseModel):
         "SYSTEM_NOTIFICATION",
     ]
     confidence: float = Field(ge=0, le=1)
-    reason: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=300)
     evidence: list[str] = Field(default_factory=list, max_length=5)
     replacement_emails: list[str] = Field(default_factory=list)
     return_hint: str | None = None
@@ -148,6 +149,14 @@ class InboundDispositionDecision(BaseModel):
         "OTHER",
     ] | None = None
     product_list_requested: bool = False
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def compact_reason(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        compact = re.sub(r"\s+", " ", value).strip()
+        return compact if len(compact) <= 300 else f"{compact[:297].rstrip()}..."
 
 
 SYSTEM_PROMPT = """You analyze inbound B2B sales email for a bounded workflow.
@@ -594,20 +603,7 @@ COA_PRODUCT_PATTERNS = (
 def latest_reply_text(body: str) -> str:
     """Return the customer-authored top segment before common quoted history."""
 
-    lines = (body or "").splitlines()
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        is_outlook_header = bool(
-            re.match(r"^(?:from|sent|to|subject):\s+", stripped, re.IGNORECASE)
-        )
-        is_wrote_marker = bool(
-            re.match(r"^on\s+.+\bwrote:\s*$", stripped, re.IGNORECASE)
-        )
-        if index > 0 and (is_outlook_header or is_wrote_marker):
-            top = "\n".join(lines[:index]).strip()
-            if top:
-                return top
-    return (body or "").strip()
+    return latest_authored_text(body)
 
 
 def explicit_coa_requested(text: str) -> bool:

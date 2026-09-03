@@ -115,6 +115,27 @@ def test_latest_reply_text_excludes_outlook_quoted_history() -> None:
     assert result.quote_requested is False
 
 
+def test_latest_reply_text_keeps_in_body_subject_line() -> None:
+    body = (
+        "Kind Attn: Purchase Manager.\n\n"
+        "Subject: Request for Supplier Registration: Stainless Steel Products.\n"
+        "We are a leading manufacturer and stockist of industrial raw materials."
+    )
+
+    assert latest_reply_text(body) == body
+
+
+def test_inbound_disposition_reason_is_compact_and_bounded() -> None:
+    decision = InboundDispositionDecision(
+        disposition_type="BUSINESS",
+        confidence=0.8,
+        reason=("This is an unnecessarily long explanation. " * 30),
+    )
+
+    assert len(decision.reason) == 300
+    assert decision.reason.endswith("...")
+
+
 @pytest.mark.parametrize(
     "model",
     [
