@@ -249,6 +249,11 @@ UNCERTAIN. When more than one category applies, use this primary-category order:
 TEMPORARY_ABSENCE, FORWARDED_TO_COLLEAGUE, CONTACT_REFERRAL, CONTACT_IDENTITY_MISMATCH, NON_TARGET,
 BUSINESS, AUTOMATED_ACKNOWLEDGEMENT, UNCERTAIN. A temporary-absence message that supplies a backup
 contact is TEMPORARY_ABSENCE and still includes that address in replacement_emails.
+Do not mark a distributor, trader, marketing agent, or sourcing agent NON_TARGET merely because of
+that role when the same new message asks Lanya Chem for a product catalogue, quotation, availability,
+or another purchasing response; use BUSINESS unless the message clearly offers unrelated goods or
+services to Lanya Chem instead. A supplier-registration pitch, product sales introduction, or explicit
+professional certification/consulting service offer is NON_TARGET.
 return_hint must be the exact date/return phrase from the body, or null. Set product_list_requested
 true only when the new message actually asks Lanya Chem to provide a list/catalog; statements such
 as "we will contact you if we need products" are false. Evidence entries must be short verbatim

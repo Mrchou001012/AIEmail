@@ -157,6 +157,50 @@ def test_supplier_price_offer_is_non_target_sales_contact() -> None:
     assert result.non_target_reason == "SUPPLIER_VENDOR"
 
 
+def test_supplier_registration_outreach_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="INTRODUCTION OF TRICON STEEL & ALLOYS",
+        body=(
+            "Subject: Request for Supplier Registration: Stainless Steel Products. "
+            "We are leading exporters, manufacturer, and stockist of industrial "
+            "raw materials."
+        ),
+        sender="sales@triconsteels.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_explicit_manufacturer_sales_outreach_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="Introduction to Our Industrial Valve Solutions",
+        body=(
+            "We are a manufacturer of high-quality industrial valves. If you're "
+            "looking for reliable valve solutions, we would love to discuss how "
+            "we can support your needs."
+        ),
+        sender="sales@valves.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_explicit_professional_service_provider_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="ISO Certification and Surveillance Services",
+        body=(
+            "We are a professional service provider offering ISO certification, "
+            "compliance, consultancy, and management training services."
+        ),
+        sender="sales@certification.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SERVICE_PROVIDER"
+
+
 def test_rejected_named_contact_is_not_customer_level_non_target() -> None:
     result = classify_inbound_disposition(
         subject="RE: Checking in from Lanya Chem",
@@ -202,3 +246,19 @@ def test_human_forwarded_message_keeps_the_named_colleague_address() -> None:
     assert result.disposition_type is InboundDispositionType.FORWARDED_TO_COLLEAGUE
     assert result.forwarded_to_replacement is True
     assert result.replacement_emails == ("maya@customer.example",)
+
+
+def test_marked_copy_is_already_forwarded_even_without_body_email() -> None:
+    result = classify_inbound_disposition(
+        subject="RE: Checking in from Lanya Chem",
+        body=(
+            "Mr Girish Dalal has retired and Mr Manthan Parmar is now your contact "
+            "point. I have marked copy to Manthan in this communication. Please "
+            "get in touch with him."
+        ),
+        sender="rishi.shukla@astralltd.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.FORWARDED_TO_COLLEAGUE
+    assert result.forwarded_to_replacement is True
+    assert result.replacement_emails == ()

@@ -310,6 +310,14 @@ batches before enabling mutation:
   customer-level `NON_TARGET`;
 - email `#4014`: `TEMPORARY_ABSENCE`, preserving
   `jmstraley@bouldersci.com`.
+- email `#2663`: `FORWARDED_TO_COLLEAGUE` when the stored recipient headers
+  contain one same-domain copied colleague; preserve the header as the source
+  and do not queue duplicate outreach;
+- email `#2912`: `NON_TARGET` with reason `SUPPLIER_VENDOR`;
+- email `#3463`: `BUSINESS` with `product_list_requested=true`; an
+  uncorroborated AI non-target label must not block the catalogue workflow;
+- email `#5063`: `NON_TARGET` with reason `SERVICE_PROVIDER`;
+- email `#5406`: `NON_TARGET` with reason `SUPPLIER_VENDOR`.
 
 AI confidence alone is not an acceptance criterion. Confirm the normalized
 category, extracted address, blockers, and proposed actions. Any exhausted AI

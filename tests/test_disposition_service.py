@@ -436,6 +436,65 @@ async def test_explicit_supplier_offer_overrides_ai_business_label(
     )
 
 
+async def test_product_list_request_overrides_uncorroborated_ai_non_target(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Sourcing Agent With Inquiry",
+        name="Buyer",
+        email="ingredients@sourcing-agent.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Request for Product List",
+        body=(
+            "We are an international marketing and sourcing agent for raw materials. "
+            "Please share your complete product catalogue and let us know if you can "
+            "offer the products on our enquiry list.\n\n"
+            "Regards\nfloradye@sourcing-agent.example"
+        ),
+        token="q",
+    )
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="NON_TARGET",
+                confidence=0.92,
+                reason="The sender describes a sourcing-agent role.",
+                evidence=["international marketing and sourcing agent"],
+                replacement_emails=["floradye@sourcing-agent.example"],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason="OTHER",
+                product_list_requested=True,
+            )
+        ),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(db_session, row, disposition=disposition)
+
+    assert disposition.disposition_type is InboundDispositionType.BUSINESS
+    assert disposition.product_list_requested is True
+    assert disposition.continue_business_processing is True
+    assert disposition.non_target_reason is None
+    assert disposition.replacement_emails == ()
+    assert disposition.normalization_notes == (
+        "UNVERIFIED_NON_TARGET_WITH_PRODUCT_REQUEST->BUSINESS",
+        "NON_ACTIONABLE_REPLACEMENT_EMAILS_DROPPED",
+    )
+    assert plan["proposed_actions"] == ["CONTINUE_BUSINESS_PIPELINE"]
+    assert plan["blockers"] == []
+
+
 @pytest.mark.parametrize("ai_type", ["CONTACT_REFERRAL", "NON_TARGET"])
 async def test_identity_mismatch_stops_linked_case_and_creates_review(
     db_session: AsyncSession,
@@ -863,6 +922,89 @@ async def test_forwarded_to_colleague_saves_contact_without_duplicate_outreach(
     assert referral.referred_email == "maya@forwarded-colleague.example"
     assert referral.forwarded_already is True
     assert referral.status == "WAITING_FOR_FORWARDED_REPLY"
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Outbox)
+        .where(Outbox.message_kind == "REFERRAL_OUTREACH")
+    ) == 0
+
+
+async def test_copied_same_domain_recipient_is_audited_without_duplicate_outreach(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Copied Colleague",
+        name="Rishi",
+        email="rishi.shukla@astralltd.com",
+    )
+    row = _email(
+        contact=contact,
+        subject="RE: Checking in from Lanya Chem",
+        body=(
+            "Mr Girish Dalal has already retired and Mr Manthan Parmar is now "
+            "your contact point. I have marked copy to Manthan in this "
+            "communication. Please get in touch with him."
+        ),
+        token="p",
+    )
+    row.to_addresses = [
+        "sales@lanyachem.com",
+        "manthan.parmar@astralltd.com",
+    ]
+    db_session.add(row)
+    await db_session.commit()
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="CONTACT_REFERRAL",
+                confidence=0.96,
+                reason="The sender identifies Manthan as the new contact.",
+                evidence=["I have marked copy to Manthan in this communication"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+    plan = await build_disposition_plan(db_session, row, disposition=disposition)
+
+    assert disposition.disposition_type is InboundDispositionType.FORWARDED_TO_COLLEAGUE
+    assert disposition.forwarded_to_replacement is True
+    assert disposition.replacement_emails == ("manthan.parmar@astralltd.com",)
+    assert (
+        "REPLACEMENT_FROM_RECIPIENT_HEADER:manthan.parmar@astralltd.com"
+        in disposition.normalization_notes
+    )
+    assert plan["blockers"] == []
+    assert "WAIT_FOR_FORWARDED_REPLY" in plan["proposed_actions"]
+
+    assert await apply_email_disposition(
+        db_session,
+        row,
+        actor="admin:test",
+        force_manual=True,
+        allow_referral_outreach=True,
+        disposition=disposition,
+    ) is True
+    await db_session.commit()
+
+    referral = await db_session.scalar(
+        select(ContactReferral).where(ContactReferral.source_email_id == row.id)
+    )
+    assert referral is not None
+    assert referral.referred_email == "manthan.parmar@astralltd.com"
+    assert referral.forwarded_already is True
+    assert referral.metadata_json["source_location"] == "recipient_header"
     assert await db_session.scalar(
         select(func.count())
         .select_from(Outbox)

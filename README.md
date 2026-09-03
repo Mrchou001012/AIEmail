@@ -636,8 +636,14 @@ backup contact is also supplied, while the address is preserved as a referral.
 Contact referrals without a valid address become `UNCERTAIN`. Customer-wide
 `NON_TARGET` changes require explicit newly authored role/offer evidence, and a
 message rejecting the named contact becomes `CONTACT_IDENTITY_MISMATCH` rather
-than disqualifying the company. A stored AI decision is reused only when its
-model, prompt/schema, parameters, and email-content request hash still match.
+than disqualifying the company. Explicit catalogue requests continue as
+`BUSINESS` when the only conflicting signal is an uncorroborated AI non-target
+label. Supplier pitches and professional service offers require explicit
+authored-text evidence. When the new body says a colleague was copied and the
+stored recipient headers contain a same-domain address, that address is kept
+with header provenance and treated as already forwarded, preventing duplicate
+outreach. A stored AI decision is reused only when its model, prompt/schema,
+parameters, and email-content request hash still match.
 
 After review, the apply switch permits automatic lifecycle and qualification updates;
 explicit one-email reviewer confirmation remains available while that switch is off:

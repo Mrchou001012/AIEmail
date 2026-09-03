@@ -53,6 +53,32 @@ NON_TARGET_ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.I,
         ),
     ),
+    (
+        "SUPPLIER_VENDOR",
+        re.compile(
+            r"\brequest\s+for\s+(?:your\s+)?supplier\s+"
+            r"(?:registration|enlistment|approval)\b|"
+            r"\b(?:we|our\s+company)\s+(?:are|is)\s+(?:an?\s+)?"
+            r"(?:leading\s+)?(?:manufacturer|supplier|vendor|exporter|stockist)\b"
+            r"[\s\S]{0,1200}\b(?:support\s+your\s+(?:needs|requirements)|"
+            r"supply\s+(?:you|your\s+company)|contact\s+us\s+for\s+(?:your\s+)?"
+            r"(?:requirements|orders?|inquir(?:y|ies)|enquir(?:y|ies)))\b",
+            re.I,
+        ),
+    ),
+    (
+        "SERVICE_PROVIDER",
+        re.compile(
+            r"\b(?:professional\s+)?service\s+provider\s+"
+            r"(?:offering|providing)\b[\s\S]{0,500}\b"
+            r"(?:certification|consult(?:ancy|ing)|compliance|registration|"
+            r"training|audit)\b|"
+            r"\bwe\s+(?:provide|offer)\s+(?:professional\s+)?(?:support|services)\s+"
+            r"for\s+[\s\S]{0,300}\b(?:certification|consult(?:ancy|ing)|"
+            r"compliance|registration|training|audit)\b",
+            re.I,
+        ),
+    ),
 )
 
 CONTACT_IDENTITY_MISMATCH_PATTERNS = (
@@ -84,6 +110,17 @@ FORWARDED_TO_COLLEAGUE_PATTERNS = (
     re.compile(
         r"\b(?:your|this|the)\s+(?:email|message|inquiry|enquiry)\s+"
         r"(?:has|have)\s+been\s+forwarded\s+to\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:i|we)\s+(?:have\s+)?(?:marked|kept|put)\s+"
+        r"(?:a\s+)?(?:copy|cc)\s+to\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:i|we)\s+(?:have\s+)?(?:copied|cc(?:'d|ed)|included)\s+"
+        r"[\w .,'’()/-]{0,100}\s+(?:in|on)\s+(?:this|the)\s+"
+        r"(?:email|message|communication|thread)\b",
         re.I,
     ),
 )
@@ -164,6 +201,21 @@ def _non_target_reason(text: str) -> str | None:
     return None
 
 
+def _non_target_explanation(reason: str) -> str:
+    return {
+        "LOGISTICS_SERVICE_PROVIDER": (
+            "sender explicitly offers logistics services rather than buying "
+            "chemical products"
+        ),
+        "SUPPLIER_VENDOR": (
+            "sender explicitly offers goods or supplier registration to Lanya Chem"
+        ),
+        "SERVICE_PROVIDER": (
+            "sender explicitly offers unrelated professional services to Lanya Chem"
+        ),
+    }.get(reason, "sender explicitly identifies as a non-target business role")
+
+
 def classify_inbound_disposition(
     *,
     subject: str,
@@ -233,12 +285,12 @@ def classify_inbound_disposition(
             **common,
         )
 
-    non_target_reason = _non_target_reason(authored)
+    non_target_reason = _non_target_reason(f"{subject}\n{authored}")
     if non_target_reason:
         return InboundDisposition(
             InboundDispositionType.NON_TARGET,
             0.99,
-            "sender explicitly identifies as a non-customer service provider",
+            _non_target_explanation(non_target_reason),
             non_target_reason=non_target_reason,
             **common,
         )
@@ -247,11 +299,15 @@ def classify_inbound_disposition(
         pattern.search(authored) for pattern in FORWARDED_TO_COLLEAGUE_PATTERNS
     )
     if forwarded:
+        forwarded_common: _CommonDispositionArgs = {
+            **common,
+            "forwarded_to_replacement": True,
+        }
         return InboundDisposition(
             InboundDispositionType.FORWARDED_TO_COLLEAGUE,
             0.97,
             "message says the inquiry has already been forwarded",
-            **common,
+            **forwarded_common,
         )
     if automated.reply_type is AutomatedReplyType.CONTACT_CHANGE:
         return InboundDisposition(

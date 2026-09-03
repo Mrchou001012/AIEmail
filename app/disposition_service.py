@@ -84,6 +84,19 @@ DISPOSITION_PROVENANCE_KEYS = frozenset(
         "personnel_observation_recorded",
     }
 )
+RECIPIENT_HEADER_REFERRAL_CUES = (
+    re.compile(
+        r"\b(?:i|we)\s+(?:have\s+)?(?:marked|kept|put)\s+"
+        r"(?:a\s+)?(?:copy|cc)\s+to\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:i|we)\s+(?:have\s+)?(?:copied|cc(?:'d|ed)|included)\s+"
+        r"[\w .,'’()/-]{0,100}\s+(?:in|on)\s+(?:this|the)\s+"
+        r"(?:email|message|communication|thread)\b",
+        re.I,
+    ),
+)
 
 
 def _headers(row: EmailMessage) -> dict[str, str]:
@@ -123,14 +136,25 @@ def decision_to_disposition(
     disposition_type = InboundDispositionType(decision.disposition_type)
     authored_casefold = rule.authored_text.casefold()
     sender = row.from_address.strip().casefold()
+    header_replacements = _recipient_header_referral_candidates(
+        row,
+        authored_text=rule.authored_text,
+    )
     replacement_emails: list[str] = []
-    for raw_address in [*decision.replacement_emails, *rule.replacement_emails]:
+    for raw_address in [
+        *decision.replacement_emails,
+        *rule.replacement_emails,
+        *header_replacements,
+    ]:
         validation = validate_address_format(raw_address)
         address = validation.normalized if validation.valid else None
         if (
             address
             and address != sender
-            and address.casefold() in authored_casefold
+            and (
+                address.casefold() in authored_casefold
+                or address in header_replacements
+            )
             and address not in replacement_emails
         ):
             replacement_emails.append(address)
@@ -148,6 +172,14 @@ def decision_to_disposition(
     confidence = decision.confidence
     non_target_reason: str | None = decision.non_target_reason
     normalization_notes: list[str] = []
+    product_list_requested = bool(
+        decision.product_list_requested or rule.product_list_requested
+    )
+    normalization_notes.extend(
+        f"REPLACEMENT_FROM_RECIPIENT_HEADER:{address}"
+        for address in header_replacements
+        if address in replacement_emails
+    )
 
     # These deterministic signals are deliberately narrow and operationally
     # safer than sampling a second semantic label. They also define the primary
@@ -186,10 +218,23 @@ def decision_to_disposition(
         disposition_type is InboundDispositionType.NON_TARGET
         and rule.disposition_type is not InboundDispositionType.NON_TARGET
     ):
-        disposition_type = InboundDispositionType.UNCERTAIN
-        reason = "AI non-target classification lacks a corroborating explicit role signal"
+        if product_list_requested:
+            disposition_type = InboundDispositionType.BUSINESS
+            reason = (
+                "Explicit product-list request continues the business workflow; "
+                "the AI-only non-target label was not corroborated"
+            )
+            confidence = rule.confidence
+            normalization_notes.append(
+                "UNVERIFIED_NON_TARGET_WITH_PRODUCT_REQUEST->BUSINESS"
+            )
+        else:
+            disposition_type = InboundDispositionType.UNCERTAIN
+            reason = (
+                "AI non-target classification lacks a corroborating explicit role signal"
+            )
+            normalization_notes.append("NON_TARGET_NOT_RULE_CORROBORATED")
         non_target_reason = None
-        normalization_notes.append("NON_TARGET_NOT_RULE_CORROBORATED")
 
     if (
         disposition_type is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
@@ -199,6 +244,15 @@ def decision_to_disposition(
         disposition_type = InboundDispositionType.UNCERTAIN
         reason = "AI identity-mismatch classification lacks an explicit authored-text signal"
         normalization_notes.append("IDENTITY_MISMATCH_NOT_RULE_CORROBORATED")
+
+    if disposition_type not in {
+        InboundDispositionType.TEMPORARY_ABSENCE,
+        InboundDispositionType.DEPARTED,
+        InboundDispositionType.CONTACT_REFERRAL,
+        InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+    } and replacement_emails:
+        replacement_emails = []
+        normalization_notes.append("NON_ACTIONABLE_REPLACEMENT_EMAILS_DROPPED")
 
     return InboundDisposition(
         disposition_type=disposition_type,
@@ -211,9 +265,7 @@ def decision_to_disposition(
             decision.forwarded_to_replacement or rule.forwarded_to_replacement
         ),
         non_target_reason=non_target_reason,
-        product_list_requested=(
-            decision.product_list_requested or rule.product_list_requested
-        ),
+        product_list_requested=product_list_requested,
         automated_reply_type=_ai_reply_type(disposition_type),
         # Transport authenticity is never delegated to the model.
         automated_transport_signal=rule.automated_transport_signal,
@@ -451,6 +503,33 @@ def _same_company_domain(first: str | None, second: str | None) -> bool:
         and first_domain == second_domain
         and first_domain not in FREE_MAIL_DOMAINS
     )
+
+
+def _recipient_header_referral_candidates(
+    row: EmailMessage,
+    *,
+    authored_text: str,
+) -> tuple[str, ...]:
+    """Use a copied same-domain recipient only when the new body says it did so."""
+
+    if not any(
+        pattern.search(authored_text)
+        for pattern in RECIPIENT_HEADER_REFERRAL_CUES
+    ):
+        return ()
+    sender = row.from_address.strip().casefold()
+    candidates: list[str] = []
+    for raw_address in row.to_addresses or []:
+        validation = validate_address_format(raw_address)
+        address = validation.normalized if validation.valid else None
+        if (
+            address
+            and address != sender
+            and _same_company_domain(sender, address)
+            and address not in candidates
+        ):
+            candidates.append(address)
+    return tuple(candidates)
 
 
 def _parse_return_until(
@@ -792,6 +871,12 @@ async def _save_referrals(
 ) -> list[ContactReferral]:
     saved: list[ContactReferral] = []
     for address in disposition.replacement_emails:
+        source_location = (
+            "recipient_header"
+            if f"REPLACEMENT_FROM_RECIPIENT_HEADER:{address}"
+            in disposition.normalization_notes
+            else "authored_body"
+        )
         existing = await session.scalar(
             select(ContactReferral).where(
                 ContactReferral.source_email_id == row.id,
@@ -825,6 +910,7 @@ async def _save_referrals(
                         address,
                     ),
                     "source_disposition": disposition.disposition_type.value,
+                    "source_location": source_location,
                 },
             )
         session.add(referral)
