@@ -805,6 +805,21 @@ async def build_disposition_plan(
     contact = resources.contact
     customer = resources.customer
     parent = resources.parent
+    disposition_metadata = row.disposition_metadata or {}
+    reviewed_parent_source = str(
+        disposition_metadata.get("reviewed_parent_source") or ""
+    ) or None
+    parent_source = parent.source if parent is not None else reviewed_parent_source
+    parent_email_id = (
+        parent.parent_email_id
+        if parent is not None
+        else disposition_metadata.get("reviewed_parent_email_id")
+    )
+    parent_message_id = (
+        parent.parent_message_id
+        if parent is not None
+        else disposition_metadata.get("reviewed_parent_message_id")
+    )
     return_until = _parse_return_until(
         disposition.return_hint,
         received_at=row.received_at,
@@ -864,7 +879,7 @@ async def build_disposition_plan(
             contact is not None
             and (
                 disposition.automated_transport_signal
-                or parent is not None
+                or parent_source is not None
                 or (
                     sender_contact is not None
                     and contact.id != sender_contact.id
@@ -896,10 +911,11 @@ async def build_disposition_plan(
                 proposed_actions.append("CONTINUE_BUSINESS_PIPELINE")
         if not disposition.replacement_emails and not verified_reply_contact:
             blockers.append("NO_REPLACEMENT_CONTACT")
-        if parent is not None and parent.source == "QUOTED_OUTBOUND_PARENT":
-            blockers.append("QUOTED_PARENT_REQUIRES_REVIEW")
-        elif parent is not None:
-            blockers.append("PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW")
+        if row.disposition_handled_at is None:
+            if parent_source == "QUOTED_OUTBOUND_PARENT":
+                blockers.append("QUOTED_PARENT_REQUIRES_REVIEW")
+            elif parent_source is not None:
+                blockers.append("PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW")
         if parent is not None and sender_differs_from_contact and not same_domain_reply_candidate:
             blockers.append("CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION")
     elif disposition.disposition_type in {
@@ -1050,12 +1066,10 @@ async def build_disposition_plan(
             sender_contact.suppressed if sender_contact else None
         ),
         "contact_resolution_source": (
-            parent.source if parent is not None else "DIRECT_IDENTITY"
+            parent_source or "DIRECT_IDENTITY"
         ),
-        "reactivation_parent_message_id": (
-            parent.parent_message_id if parent is not None else None
-        ),
-        "parent_email_id": parent.parent_email_id if parent is not None else None,
+        "reactivation_parent_message_id": parent_message_id,
+        "parent_email_id": parent_email_id,
         "reply_contact_candidate_email": (
             row.from_address.strip().casefold()
             if same_domain_reply_candidate and sender_contact is None

@@ -1477,6 +1477,18 @@ async def test_quoted_parent_recovers_departed_contact_and_continues_product_lis
     ) == 0
     assert action is not None
 
+    applied_plan = await build_disposition_plan(
+        db_session,
+        inbound,
+        settings=settings,
+        disposition=disposition,
+    )
+    assert applied_plan["contact_resolution_source"] == "QUOTED_OUTBOUND_PARENT"
+    assert applied_plan["parent_email_id"] == outbound.id
+    assert applied_plan["sender_contact_id"] == reply_contact.id
+    assert applied_plan["blockers"] == []
+    assert applied_plan["application_blockers"] == []
+
     await rollback_email_disposition(
         db_session,
         action_id=action.id,
