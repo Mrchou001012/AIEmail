@@ -3,7 +3,7 @@ import html
 import json
 import re
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from email.utils import parseaddr, parsedate_to_datetime
@@ -16,6 +16,7 @@ from app.agent_runtime import finalize_handoff_agent_run
 from app.ai import (
     AIClient,
     InboundDispositionDecision,
+    explicit_product_list_requested,
     inbound_disposition_message_params,
 )
 from app.auto_replies import AutomatedReplyType
@@ -27,6 +28,8 @@ from app.db import (
     AssistanceRequest,
     AssistanceStatus,
     AuditEvent,
+    CaseStage,
+    CaseStatus,
     Contact,
     ContactReferral,
     Customer,
@@ -37,18 +40,21 @@ from app.db import (
     Job,
     JobStatus,
     Outbox,
+    Quote,
     ReactivationRecipient,
     SalesCase,
 )
 from app.deliverability import validate_address_format
 from app.domain import HandoffReason
+from app.email_identity import reply_contact_name
 from app.imports import load_content
 from app.inbound_disposition import (
     InboundDisposition,
     InboundDispositionType,
     classify_inbound_disposition,
 )
-from app.mail import build_message, parse_mime
+from app.mail import build_message, normalized_subject, parse_mime
+from app.quoted_reply_resolution import resolve_quoted_outbound_parent
 from app.settings import Settings, get_settings
 
 FREE_MAIL_DOMAINS = frozenset(
@@ -83,6 +89,10 @@ DISPOSITION_PROVENANCE_KEYS = frozenset(
         "reply_contact_id",
         "sender_changed",
         "personnel_observation_recorded",
+        "reviewed_parent_source",
+        "reviewed_parent_email_id",
+        "reviewed_parent_message_id",
+        "customer_id",
     }
 )
 RECIPIENT_HEADER_REFERRAL_CUES = (
@@ -623,8 +633,13 @@ async def _disposition_contact(
     metadata = row.disposition_metadata or {}
     if (
         disposition.disposition_type is not InboundDispositionType.DEPARTED
-        or not metadata.get("verified_reactivation_parent")
-        or not metadata.get("sender_changed")
+        or not (
+            (
+                metadata.get("verified_reactivation_parent")
+                and metadata.get("sender_changed")
+            )
+            or metadata.get("reviewed_parent_source")
+        )
     ):
         return sender_contact
     raw_original_contact_id = metadata.get("original_contact_id")
@@ -658,17 +673,34 @@ async def _resolved_customer(
     return await session.get(Customer, customer_id) if customer_id else None
 
 
+@dataclass(frozen=True)
+class _ParentResources:
+    contact: Contact
+    customer: Customer
+    source: str
+    parent_email_id: int | None = None
+    parent_message_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedDispositionResources:
+    sender_contact: Contact | None
+    contact: Contact | None
+    customer: Customer | None
+    parent: _ParentResources | None = None
+
+
 async def _exact_reactivation_parent_resources(
     session: AsyncSession,
     row: EmailMessage,
-) -> tuple[Contact, Customer] | None:
+) -> _ParentResources | None:
     """Resolve a unique sent reactivation parent without trusting sender identity."""
 
     if not row.in_reply_to:
         return None
     matches = (
         await session.execute(
-            select(Contact, Customer)
+            select(Outbox, Contact, Customer)
             .select_from(Outbox)
             .join(
                 ReactivationRecipient,
@@ -691,32 +723,68 @@ async def _exact_reactivation_parent_resources(
     ).all()
     if len(matches) != 1:
         return None
-    contact, customer = matches[0]
-    return contact, customer
+    outbox, contact, customer = matches[0]
+    return _ParentResources(
+        contact=contact,
+        customer=customer,
+        source="EXACT_REACTIVATION_PARENT",
+        parent_message_id=outbox.message_id,
+    )
+
+
+async def _quoted_outbound_parent_resources(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> _ParentResources | None:
+    quoted = await resolve_quoted_outbound_parent(
+        session,
+        row,
+        excluded_domains=FREE_MAIL_DOMAINS,
+    )
+    if quoted is None:
+        return None
+    contact = await session.get(Contact, quoted.contact_id)
+    customer = await session.get(Customer, quoted.customer_id)
+    if contact is None or customer is None or contact.customer_id != customer.id:
+        return None
+    return _ParentResources(
+        contact=contact,
+        customer=customer,
+        source="QUOTED_OUTBOUND_PARENT",
+        parent_email_id=quoted.email_id,
+        parent_message_id=quoted.message_id,
+    )
 
 
 async def _resolved_disposition_resources(
     session: AsyncSession,
     row: EmailMessage,
     disposition: InboundDisposition,
-) -> tuple[Contact | None, Contact | None, Customer | None, bool]:
+) -> _ResolvedDispositionResources:
     sender_contact = await _unique_sender_contact(session, row)
     contact = await _disposition_contact(session, row, disposition, sender_contact)
     customer = await _resolved_customer(session, row, contact)
-    used_reactivation_parent = False
+    parent: _ParentResources | None = None
     if (
         customer is None
         and disposition.disposition_type
         in {
+            InboundDispositionType.DEPARTED,
             InboundDispositionType.CONTACT_REFERRAL,
             InboundDispositionType.FORWARDED_TO_COLLEAGUE,
         }
     ):
         parent = await _exact_reactivation_parent_resources(session, row)
+        if parent is None:
+            parent = await _quoted_outbound_parent_resources(session, row)
         if parent is not None:
-            contact, customer = parent
-            used_reactivation_parent = True
-    return sender_contact, contact, customer, used_reactivation_parent
+            contact, customer = parent.contact, parent.customer
+    return _ResolvedDispositionResources(
+        sender_contact=sender_contact,
+        contact=contact,
+        customer=customer,
+        parent=parent,
+    )
 
 
 async def build_disposition_plan(
@@ -732,17 +800,25 @@ async def build_disposition_plan(
         row,
         settings=settings,
     )
-    (
-        sender_contact,
-        contact,
-        customer,
-        used_reactivation_parent,
-    ) = await _resolved_disposition_resources(session, row, disposition)
+    resources = await _resolved_disposition_resources(session, row, disposition)
+    sender_contact = resources.sender_contact
+    contact = resources.contact
+    customer = resources.customer
+    parent = resources.parent
     return_until = _parse_return_until(
         disposition.return_hint,
         received_at=row.received_at,
     )
     observed_at = at or datetime.now(UTC)
+    sender_differs_from_contact = bool(
+        contact is not None
+        and row.from_address.strip().casefold() != contact.email.strip().casefold()
+    )
+    same_domain_reply_candidate = bool(
+        parent is not None
+        and sender_differs_from_contact
+        and _same_company_domain(row.from_address, contact.email if contact else None)
+    )
     absence_already_ended = bool(
         return_until is not None and return_until <= observed_at
     )
@@ -788,6 +864,7 @@ async def build_disposition_plan(
             contact is not None
             and (
                 disposition.automated_transport_signal
+                or parent is not None
                 or (
                     sender_contact is not None
                     and contact.id != sender_contact.id
@@ -801,14 +878,30 @@ async def build_disposition_plan(
             blockers.append("ORIGINAL_CONTACT_NOT_VERIFIED")
         verified_reply_contact = bool(
             verified_original_contact
-            and sender_contact is not None
             and contact is not None
-            and sender_contact.id != contact.id
+            and (
+                (
+                    sender_contact is not None
+                    and sender_contact.id != contact.id
+                    and sender_contact.customer_id == contact.customer_id
+                )
+                or same_domain_reply_candidate
+            )
         )
         if verified_reply_contact:
             proposed_actions.append("KEEP_VERIFIED_REPLY_CONTACT")
+            if sender_contact is None:
+                proposed_actions.append("CREATE_REPLY_CONTACT")
+            if disposition.continue_business_processing:
+                proposed_actions.append("CONTINUE_BUSINESS_PIPELINE")
         if not disposition.replacement_emails and not verified_reply_contact:
             blockers.append("NO_REPLACEMENT_CONTACT")
+        if parent is not None and parent.source == "QUOTED_OUTBOUND_PARENT":
+            blockers.append("QUOTED_PARENT_REQUIRES_REVIEW")
+        elif parent is not None:
+            blockers.append("PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW")
+        if parent is not None and sender_differs_from_contact and not same_domain_reply_candidate:
+            blockers.append("CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION")
     elif disposition.disposition_type in {
         InboundDispositionType.CONTACT_REFERRAL,
         InboundDispositionType.FORWARDED_TO_COLLEAGUE,
@@ -823,7 +916,7 @@ async def build_disposition_plan(
         if not disposition.replacement_emails:
             blockers.append("NO_REPLACEMENT_CONTACT")
         if (
-            used_reactivation_parent
+            parent is not None
             and contact is not None
             and _domain(row.from_address) != _domain(contact.email)
         ):
@@ -881,8 +974,14 @@ async def build_disposition_plan(
             if blocker in blockers
         )
     elif disposition.disposition_type is InboundDispositionType.DEPARTED:
-        if "ORIGINAL_CONTACT_NOT_VERIFIED" in blockers:
-            application_blockers.append("ORIGINAL_CONTACT_NOT_VERIFIED")
+        application_blockers.extend(
+            blocker
+            for blocker in (
+                "ORIGINAL_CONTACT_NOT_VERIFIED",
+                "CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION",
+            )
+            if blocker in blockers
+        )
     elif disposition.disposition_type in {
         InboundDispositionType.CONTACT_REFERRAL,
         InboundDispositionType.FORWARDED_TO_COLLEAGUE,
@@ -951,12 +1050,21 @@ async def build_disposition_plan(
             sender_contact.suppressed if sender_contact else None
         ),
         "contact_resolution_source": (
-            "EXACT_REACTIVATION_PARENT"
-            if used_reactivation_parent
-            else "DIRECT_IDENTITY"
+            parent.source if parent is not None else "DIRECT_IDENTITY"
         ),
         "reactivation_parent_message_id": (
-            row.in_reply_to if used_reactivation_parent else None
+            parent.parent_message_id if parent is not None else None
+        ),
+        "parent_email_id": parent.parent_email_id if parent is not None else None,
+        "reply_contact_candidate_email": (
+            row.from_address.strip().casefold()
+            if same_domain_reply_candidate and sender_contact is None
+            else None
+        ),
+        "reply_contact_candidate_name": (
+            reply_contact_name(None, disposition.authored_text)
+            if same_domain_reply_candidate and sender_contact is None
+            else None
         ),
         "disposition_handled_at": _iso(row.disposition_handled_at),
         "disposition_type": disposition.disposition_type.value,
@@ -1109,6 +1217,137 @@ async def _save_verified_reply_contact_referral(
     session.add(referral)
     await session.flush()
     return referral
+
+
+async def _ensure_reviewed_reply_contact(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    customer: Customer,
+    original_contact: Contact,
+    existing_sender_contact: Contact | None,
+) -> tuple[Contact | None, bool]:
+    """Create a same-company reply endpoint only after human confirmation."""
+
+    sender = row.from_address.strip().casefold()
+    if not sender or not _same_company_domain(sender, original_contact.email):
+        return None, False
+    if existing_sender_contact is not None:
+        return (
+            (existing_sender_contact, False)
+            if existing_sender_contact.customer_id == customer.id
+            else (None, False)
+        )
+    matches = (
+        (
+            await session.execute(
+                select(Contact).where(func.lower(Contact.email) == sender).limit(2)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if matches:
+        return (
+            (matches[0], False)
+            if len(matches) == 1 and matches[0].customer_id == customer.id
+            else (None, False)
+        )
+    contact = Contact(
+        customer_id=customer.id,
+        name=reply_contact_name(None, disposition.authored_text),
+        email=sender,
+        language=original_contact.language,
+        metadata_json={
+            "source": "inbound_contact_referral",
+            "source_email_id": row.id,
+            "relationship": "verified_same_domain_reply",
+        },
+    )
+    session.add(contact)
+    await session.flush()
+    return contact, True
+
+
+async def _continue_reviewed_business_reply(
+    session: AsyncSession,
+    *,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+    customer: Customer,
+    reply_contact: Contact,
+) -> tuple[SalesCase | None, bool]:
+    """Attach a reviewed mixed-intent reply to an open, draft-only case."""
+
+    if not disposition.continue_business_processing:
+        return None, False
+    subject_key = normalized_subject(row.subject)[:255]
+    candidates = (
+        (
+            await session.execute(
+                select(SalesCase)
+                .where(
+                    SalesCase.contact_id == reply_contact.id,
+                    SalesCase.subject_key == subject_key,
+                    SalesCase.status.not_in(
+                        [CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]
+                    ),
+                )
+                .order_by(SalesCase.id.desc())
+                .limit(2)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(candidates) > 1:
+        return None, False
+    created = not candidates
+    sales_case = candidates[0] if candidates else SalesCase(
+        customer_id=customer.id,
+        contact_id=reply_contact.id,
+        product_id=None,
+        currency="USD",
+        stage=CaseStage.FOLLOW_UP,
+        status=CaseStatus.WAITING_HUMAN,
+        subject_key=subject_key,
+        last_activity_at=row.received_at,
+    )
+    if created:
+        session.add(sales_case)
+        await session.flush()
+    row.case_id = sales_case.id
+    row.customer_id = customer.id
+    row.contact_id = reply_contact.id
+    handoff = await session.scalar(
+        select(Handoff).where(Handoff.source_email_id == row.id)
+    )
+    if handoff is not None:
+        handoff.case_id = sales_case.id
+        if disposition.product_list_requested and explicit_product_list_requested(
+            f"{row.subject}\n{row.body_text}"
+        ):
+            handoff.reason_code = HandoffReason.PRODUCT_LIST_REVIEW.value
+            handoff.summary = (
+                "Product-list request recovered from a reviewed personnel reply"
+            )
+        handoff.extracted_facts = {
+            **(handoff.extracted_facts or {}),
+            "inbound_disposition_continuation": {
+                "source_email_id": row.id,
+                "customer_id": customer.id,
+                "contact_id": reply_contact.id,
+                "case_id": sales_case.id,
+                "product_list_requested": disposition.product_list_requested,
+            },
+        }
+        run = await session.scalar(
+            select(AgentRun).where(AgentRun.handoff_id == handoff.id)
+        )
+        if run is not None:
+            run.case_id = sales_case.id
+    return sales_case, created
 
 
 async def _stage_referral_outreach(
@@ -1361,11 +1600,9 @@ async def _disposition_state_snapshot(
     disposition: InboundDisposition | None = None,
 ) -> dict[str, Any]:
     disposition = disposition or _stored_or_rule_disposition(row)
-    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
-        session,
-        row,
-        disposition,
-    )
+    resources = await _resolved_disposition_resources(session, row, disposition)
+    contact = resources.contact
+    customer = resources.customer
     referrals = (
         (
             await session.execute(
@@ -1391,6 +1628,8 @@ async def _disposition_state_snapshot(
     handoff = await session.scalar(
         select(Handoff).where(Handoff.source_email_id == row.id)
     )
+    case_id = row.case_id or (handoff.case_id if handoff is not None else None)
+    sales_case = await session.get(SalesCase, case_id) if case_id is not None else None
     run = (
         await session.scalar(select(AgentRun).where(AgentRun.handoff_id == handoff.id))
         if handoff is not None
@@ -1459,6 +1698,9 @@ async def _disposition_state_snapshot(
     return {
         "email": {
             "id": row.id,
+            "case_id": row.case_id,
+            "customer_id": row.customer_id,
+            "contact_id": row.contact_id,
             "disposition_type": row.disposition_type,
             "disposition_confidence": (
                 _decimal_text(row.disposition_confidence)
@@ -1485,6 +1727,23 @@ async def _disposition_state_snapshot(
                 "qualified_at": _iso(customer.qualified_at),
             }
             if customer is not None
+            else None
+        ),
+        "case": (
+            {
+                "id": sales_case.id,
+                "customer_id": sales_case.customer_id,
+                "contact_id": sales_case.contact_id,
+                "product_id": sales_case.product_id,
+                "category_id": sales_case.category_id,
+                "currency": sales_case.currency,
+                "stage": sales_case.stage.value,
+                "status": sales_case.status.value,
+                "subject_key": sales_case.subject_key,
+                "negotiation_round": sales_case.negotiation_round,
+                "last_activity_at": _iso(sales_case.last_activity_at),
+            }
+            if sales_case is not None
             else None
         ),
         "referrals": [
@@ -1519,6 +1778,9 @@ async def _disposition_state_snapshot(
         "handoff": (
             {
                 "id": handoff.id,
+                "case_id": handoff.case_id,
+                "reason_code": handoff.reason_code,
+                "summary": handoff.summary,
                 "status": handoff.status,
                 "dingtalk_status": handoff.dingtalk_status,
                 "resolution_note": handoff.resolution_note,
@@ -1530,6 +1792,7 @@ async def _disposition_state_snapshot(
         "agent_run": (
             {
                 "id": run.id,
+                "case_id": run.case_id,
                 "status": run.status.value,
                 "current_step": run.current_step,
                 "last_error": run.last_error,
@@ -1644,11 +1907,10 @@ async def apply_email_disposition(
         action_email = active_action.after_json.get("email") or {}
         action_metadata = action_email.get("disposition_metadata") or {}
         return bool(action_metadata.get("applied_terminal"))
-    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
-        session,
-        row,
-        disposition,
-    )
+    resources = await _resolved_disposition_resources(session, row, disposition)
+    sender_contact = resources.sender_contact
+    contact = resources.contact
+    customer = resources.customer
     if customer is not None:
         await session.scalar(
             select(Customer).where(Customer.id == customer.id).with_for_update()
@@ -1664,11 +1926,11 @@ async def apply_email_disposition(
         await session.execute(
             select(Contact).where(Contact.id.in_(contact_ids)).with_for_update()
         )
-    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
-        session,
-        row,
-        disposition,
-    )
+    resources = await _resolved_disposition_resources(session, row, disposition)
+    sender_contact = resources.sender_contact
+    contact = resources.contact
+    customer = resources.customer
+    parent = resources.parent
     if not force_manual:
         automatic_plan = await build_disposition_plan(
             session,
@@ -1688,6 +1950,15 @@ async def apply_email_disposition(
         row,
         disposition=disposition,
     )
+    if parent is not None:
+        classification_metadata = {
+            **classification_metadata,
+            "reviewed_parent_source": parent.source,
+            "reviewed_parent_email_id": parent.parent_email_id,
+            "reviewed_parent_message_id": parent.parent_message_id,
+            "original_contact_id": contact.id if contact is not None else None,
+            "customer_id": customer.id if customer is not None else None,
+        }
     row.disposition_type = disposition.disposition_type.value
     row.disposition_confidence = Decimal(str(disposition.confidence))
     row.disposition_metadata = classification_metadata
@@ -1737,6 +2008,7 @@ async def apply_email_disposition(
             contact is not None
             and (
                 disposition.automated_transport_signal
+                or parent is not None
                 or (
                     sender_contact is not None
                     and contact.id != sender_contact.id
@@ -1749,6 +2021,26 @@ async def apply_email_disposition(
         if not verified_original_contact:
             return False
         assert contact is not None
+        reply_contact_created = False
+        if (
+            parent is not None
+            and row.from_address.strip().casefold()
+            != contact.email.strip().casefold()
+        ):
+            if customer is None:
+                return False
+            sender_contact, reply_contact_created = (
+                await _ensure_reviewed_reply_contact(
+                    session,
+                    row=row,
+                    disposition=disposition,
+                    customer=customer,
+                    original_contact=contact,
+                    existing_sender_contact=sender_contact,
+                )
+            )
+            if sender_contact is None:
+                return False
         contact.lifecycle_status = "DEPARTED"
         contact.suppressed = True
         contact.unavailable_until = None
@@ -1777,6 +2069,21 @@ async def apply_email_disposition(
             )
             referrals.append(verified_referral)
             applied_actions.append("KEEP_VERIFIED_REPLY_CONTACT")
+            if reply_contact_created:
+                applied_actions.append("CREATE_REPLY_CONTACT")
+            if disposition.continue_business_processing:
+                sales_case, case_created = await _continue_reviewed_business_reply(
+                    session,
+                    row=row,
+                    disposition=disposition,
+                    customer=customer,
+                    reply_contact=sender_contact,
+                )
+                if sales_case is None:
+                    return False
+                applied_actions.append("CONTINUE_BUSINESS_PIPELINE")
+                if case_created:
+                    applied_actions.append("CREATE_REVIEW_CASE")
         outreach = None
         if (
             customer is not None
@@ -1927,6 +2234,28 @@ async def rollback_email_disposition(
     before = action.before_json or {}
     after = action.after_json or {}
 
+    def snapshot_matches(current_value: Any, expected_value: Any) -> bool:
+        """Compare against the action schema while tolerating newer snapshot keys."""
+
+        if isinstance(expected_value, dict):
+            return isinstance(current_value, dict) and all(
+                key in current_value
+                and snapshot_matches(current_value[key], expected)
+                for key, expected in expected_value.items()
+            )
+        if isinstance(expected_value, list):
+            return isinstance(current_value, list) and len(current_value) == len(
+                expected_value
+            ) and all(
+                snapshot_matches(current_item, expected_item)
+                for current_item, expected_item in zip(
+                    current_value,
+                    expected_value,
+                    strict=True,
+                )
+            )
+        return current_value == expected_value
+
     def snapshot_ids(key: str) -> set[int]:
         ids: set[int] = set()
         for snapshot in (before.get(key), after.get(key)):
@@ -1944,6 +2273,7 @@ async def rollback_email_disposition(
 
     customer_ids = snapshot_ids("customer")
     contact_ids = snapshot_ids("contact") | snapshot_list_ids("target_contacts")
+    case_ids = snapshot_ids("case")
     referral_ids = snapshot_list_ids("referrals")
     outbox_ids = snapshot_list_ids("outboxes")
     handoff_ids = snapshot_ids("handoff")
@@ -1954,6 +2284,7 @@ async def rollback_email_disposition(
     for model, ids in (
         (Customer, customer_ids),
         (Contact, contact_ids),
+        (SalesCase, case_ids),
         (ContactReferral, referral_ids),
         (Outbox, outbox_ids),
         (Handoff, handoff_ids),
@@ -1973,17 +2304,22 @@ async def rollback_email_disposition(
         "email",
         "contact",
         "customer",
+        "case",
         "referrals",
         "target_contacts",
         "assistance_requests",
         "agent_steps",
     ):
-        if before.get(key) != after.get(key) and current.get(key) != after.get(key):
+        if before.get(key) != after.get(key) and not snapshot_matches(
+            current.get(key), after.get(key)
+        ):
             conflicts.append(f"{key.upper()}_CHANGED_AFTER_APPLY")
     for key in ("handoff", "agent_run", "notify_job"):
         # A new handoff may legitimately be created after a non-terminal apply;
         # restore only resources that this action itself changed.
-        if before.get(key) != after.get(key) and current.get(key) != after.get(key):
+        if before.get(key) != after.get(key) and not snapshot_matches(
+            current.get(key), after.get(key)
+        ):
             conflicts.append(f"{key.upper()}_CHANGED_AFTER_APPLY")
 
     before_outbox_ids = {item["id"] for item in before.get("outboxes") or []}
@@ -2010,6 +2346,15 @@ async def rollback_email_disposition(
     before_targets = {item["id"]: item for item in before.get("target_contacts") or []}
     after_targets = {item["id"]: item for item in after.get("target_contacts") or []}
     created_target_ids = sorted(set(after_targets) - set(before_targets))
+    action_metadata = ((after.get("email") or {}).get("disposition_metadata") or {})
+    before_case = before.get("case") or {}
+    before_case_id = before_case.get("id") if isinstance(before_case, dict) else None
+    before_case_ids = {before_case_id} if isinstance(before_case_id, int) else set()
+    created_case_ids = (
+        sorted(case_ids - before_case_ids)
+        if "CREATE_REVIEW_CASE" in (action_metadata.get("applied_actions") or [])
+        else []
+    )
     removed_contact_ids: list[int] = []
     for contact_id in created_target_ids:
         target = await session.get(Contact, contact_id)
@@ -2022,7 +2367,10 @@ async def rollback_email_disposition(
         )
         if not created_by_action:
             continue
-        later_email_filters = [EmailMessage.contact_id == contact_id]
+        later_email_filters = [
+            EmailMessage.contact_id == contact_id,
+            EmailMessage.id != row.id,
+        ]
         if created_outbox_message_ids:
             later_email_filters.append(
                 ~(
@@ -2035,13 +2383,36 @@ async def rollback_email_disposition(
             .select_from(EmailMessage)
             .where(*later_email_filters)
         )
+        case_conditions = [SalesCase.contact_id == contact_id]
+        if created_case_ids:
+            case_conditions.append(SalesCase.id.not_in(created_case_ids))
         case_count = await session.scalar(
-            select(func.count())
-            .select_from(SalesCase)
-            .where(SalesCase.contact_id == contact_id)
+            select(func.count()).select_from(SalesCase).where(*case_conditions)
         )
         if (later_email_count or 0) > 0 or (case_count or 0) > 0:
             conflicts.append(f"NEW_CONTACT_{contact_id}_HAS_LATER_ACTIVITY")
+
+    for case_id in created_case_ids:
+        related_email_count = await session.scalar(
+            select(func.count())
+            .select_from(EmailMessage)
+            .where(EmailMessage.case_id == case_id, EmailMessage.id != row.id)
+        )
+        related_outbox_count = await session.scalar(
+            select(func.count()).select_from(Outbox).where(Outbox.case_id == case_id)
+        )
+        related_quote_count = await session.scalar(
+            select(func.count()).select_from(Quote).where(Quote.case_id == case_id)
+        )
+        if any(
+            count or 0
+            for count in (
+                related_email_count,
+                related_outbox_count,
+                related_quote_count,
+            )
+        ):
+            conflicts.append(f"NEW_CASE_{case_id}_HAS_LATER_ACTIVITY")
 
     if conflicts:
         raise ValueError("rollback blocked: " + ", ".join(conflicts))
@@ -2095,6 +2466,33 @@ async def rollback_email_disposition(
         referral.metadata_json = snapshot["metadata_json"]
     await session.flush()
 
+    email_snapshot = before["email"]
+    if "case_id" in email_snapshot:
+        row.case_id = email_snapshot["case_id"]
+    if "customer_id" in email_snapshot:
+        row.customer_id = email_snapshot["customer_id"]
+    if "contact_id" in email_snapshot:
+        row.contact_id = email_snapshot["contact_id"]
+    handoff_snapshot = before.get("handoff")
+    if handoff_snapshot is not None and before.get("handoff") != after.get("handoff"):
+        handoff = await session.get(Handoff, handoff_snapshot["id"])
+        if handoff is not None:
+            if "case_id" in handoff_snapshot:
+                handoff.case_id = handoff_snapshot["case_id"]
+    run_snapshot = before.get("agent_run")
+    if run_snapshot is not None and before.get("agent_run") != after.get("agent_run"):
+        run = await session.get(AgentRun, run_snapshot["id"])
+        if run is not None:
+            if "case_id" in run_snapshot:
+                run.case_id = run_snapshot["case_id"]
+    await session.flush()
+
+    for case_id in created_case_ids:
+        sales_case = await session.get(SalesCase, case_id)
+        if sales_case is not None:
+            await session.delete(sales_case)
+    await session.flush()
+
     for contact_id in created_target_ids:
         target = await session.get(Contact, contact_id)
         if target is None:
@@ -2126,18 +2524,24 @@ async def rollback_email_disposition(
                 customer_snapshot["qualified_at"]
             )
 
-    handoff_snapshot = before.get("handoff")
     if handoff_snapshot is not None and before.get("handoff") != after.get("handoff"):
         handoff = await session.get(Handoff, handoff_snapshot["id"])
         if handoff is not None:
+            if "case_id" in handoff_snapshot:
+                handoff.case_id = handoff_snapshot["case_id"]
+            handoff.reason_code = handoff_snapshot.get(
+                "reason_code", handoff.reason_code
+            )
+            handoff.summary = handoff_snapshot.get("summary", handoff.summary)
             handoff.status = handoff_snapshot["status"]
             handoff.dingtalk_status = handoff_snapshot["dingtalk_status"]
             handoff.resolution_note = handoff_snapshot["resolution_note"]
             handoff.extracted_facts = handoff_snapshot["extracted_facts"]
-    run_snapshot = before.get("agent_run")
     if run_snapshot is not None and before.get("agent_run") != after.get("agent_run"):
         run = await session.get(AgentRun, run_snapshot["id"])
         if run is not None:
+            if "case_id" in run_snapshot:
+                run.case_id = run_snapshot["case_id"]
             run.status = AgentRunStatus(run_snapshot["status"])
             run.current_step = run_snapshot["current_step"]
             run.last_error = run_snapshot["last_error"]
@@ -2162,7 +2566,6 @@ async def rollback_email_disposition(
             job.locked_at = _parse_snapshot_datetime(job_snapshot["locked_at"])
             job.locked_by = job_snapshot["locked_by"]
 
-    email_snapshot = before["email"]
     row.disposition_type = email_snapshot["disposition_type"]
     row.disposition_confidence = (
         Decimal(email_snapshot["disposition_confidence"])

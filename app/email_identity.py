@@ -10,7 +10,8 @@ CONTACT_NAME_PLACEHOLDER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SIGNATURE_SIGNOFF_PATTERN = re.compile(
-    r"^(?:thanks?(?:\s+and)?\s+regards|best\s+regards|kind\s+regards|regards|"
+    r"^(?:thanks?(?:\s+and)?(?:\s+best)?\s+regards|best\s+regards|"
+    r"kind\s+regards|regards|"
     r"sincerely|yours\s+sincerely|yours\s+faithfully|thank\s+you)[,!.]*$",
     re.IGNORECASE,
 )

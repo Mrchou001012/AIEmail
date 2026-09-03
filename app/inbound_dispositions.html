@@ -85,7 +85,7 @@
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",CONTACT_IDENTITY_MISMATCH:"联系人身份不匹配",NON_TARGET:"非目标客户",UNCERTAIN:"无法确定",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
-    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱",CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW:"回复来自不同公司域名，必须核对父邮件和客户关系"};
+    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱",CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW:"回复来自不同公司域名，必须核对父邮件和客户关系",QUOTED_PARENT_REQUIRES_REVIEW:"邮件缺少线程头，已通过正文引用恢复父邮件，必须人工核对",PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW:"离职对象由父邮件恢复，必须人工核对",CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION:"离职回复与原联系人域名不同，不能自动确定客户关系"};
     const blockerText = (values) => (values || []).map((value) => blockerLabels[value] || value).join("、");
     const batchStorageKey = "aiemail.inboundDispositionBatchId";
     let plansByEmail = new Map();
@@ -185,12 +185,17 @@
         const contact = row.contact_id ? `处置联系人 #${row.contact_id}${row.contact_email ? ` · ${row.contact_email}` : ""}` : "未唯一识别联系人";
         const senderContact = row.sender_contact_id && row.sender_contact_id !== row.contact_id ? `<div class="muted">发件联系人 #${row.sender_contact_id}</div>` : "";
         const customer = row.customer_id ? `客户 #${row.customer_id}${row.customer_name ? ` · ${row.customer_name}` : ""}` : "未识别客户";
-        const parentResolution = row.contact_resolution_source === "EXACT_REACTIVATION_PARENT" ? `<div class="muted">关联依据：精确匹配唤醒父邮件 ${esc(row.reactivation_parent_message_id || "")}</div>` : "";
+        const parentResolution = row.contact_resolution_source === "EXACT_REACTIVATION_PARENT"
+          ? `<div class="muted">关联依据：精确匹配唤醒父邮件 ${esc(row.reactivation_parent_message_id || "")}</div>`
+          : row.contact_resolution_source === "QUOTED_OUTBOUND_PARENT"
+            ? `<div class="muted">关联依据：正文完整引用已发送邮件 #${esc(row.parent_email_id || "")}</div>`
+            : "";
+        const replyCandidate = row.reply_contact_candidate_email ? `<div class="muted">新发件联系人候选：${esc(row.reply_contact_candidate_name || "Customer")} · ${esc(row.reply_contact_candidate_email)}</div>` : "";
         const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
         return `<tr>
           <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span>${row.ai_failed ? '<div><span class="pill bad">AI判断失败·规则兜底</span></div>' : ""}${row.needs_attention ? '<div><span class="pill warn">重点复核</span></div>' : ""}<div class="muted">${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? `<br>${esc(row.classifier_model)}` : ""}${(row.normalization_notes || []).length ? `<br>归一化：${esc(row.normalization_notes.join(" ｜ "))}` : ""}</div></td>
           <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
-          <td>${esc(customer)}<br>${esc(contact)}${senderContact}${parentResolution}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
+          <td>${esc(customer)}<br>${esc(contact)}${senderContact}${parentResolution}${replyCandidate}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
           <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div>${(row.evidence || []).length ? `<div class="muted">依据：${esc(row.evidence.join(" ｜ "))}</div>` : ""}</td>
           <td>${blocked ? pills((row.blockers || []).map((value) => blockerLabels[value] || value), "bad") : '<span class="pill good">可安全处理</span>'}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；人工复核时请重点核对原文，建议先重试。</div>` : ""}<div class="muted">${row.unavailable_until ? (row.absence_already_ended ? `休假已于 ${esc(row.unavailable_until)} 结束，不会暂停联系人` : `暂停至 ${esc(row.unavailable_until)}`) : ""}</div></td>
           <td>${esc(row.body_preview)}</td>

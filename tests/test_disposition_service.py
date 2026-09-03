@@ -48,7 +48,7 @@ from app.disposition_service import (
     rollback_email_disposition,
 )
 from app.domain import HandoffReason
-from app.inbound_disposition import InboundDispositionType
+from app.inbound_disposition import InboundDisposition, InboundDispositionType
 from app.services import _handle_automated_reply
 from app.settings import Settings, get_settings
 
@@ -1313,6 +1313,203 @@ async def test_cross_domain_forward_resolves_exact_reactivation_parent_for_revie
     await db_session.refresh(original)
     assert original.lifecycle_status == "ACTIVE"
     assert original.suppressed is False
+
+
+async def test_quoted_parent_recovers_departed_contact_and_continues_product_list(
+    db_session: AsyncSession,
+) -> None:
+    customer, original = await _seed_contact(
+        db_session,
+        company="Shanghai Witofly Chemical Co.,Ltd",
+        name="Pooja Raut",
+        email="globalsourcing@witofly.com",
+    )
+    outbound_body = (
+        "Dear Pooja Raut,\n\n"
+        "I hope you are doing well. It has been some time since we last spoke. "
+        "I am writing to reconnect and ask whether you currently have any "
+        "requirements for our products. If useful, please send the product and "
+        "quantity you need. We can then confirm availability and price."
+    )
+    outbound = EmailMessage(
+        customer_id=customer.id,
+        contact_id=original.id,
+        direction="OUTBOUND",
+        message_id="<quoted-parent@lanyachem.com>",
+        from_address="shreyasaxena@lanyachemindia.com",
+        to_addresses=[original.email],
+        subject="Checking in from Lanya Chem",
+        body_text=outbound_body,
+        attachment_metadata=[],
+        raw_sha256="v" * 64,
+        is_history=False,
+        is_automated_reply=False,
+        automated_reply_metadata={},
+        received_at=datetime(2026, 8, 3, 9, tzinfo=UTC),
+    )
+    db_session.add(outbound)
+    await db_session.flush()
+    inbound = EmailMessage(
+        direction="INBOUND",
+        message_id="<reply-without-thread-headers@witofly.com>",
+        from_address="marketing001@witofly.com",
+        to_addresses=["shreyasaxena@lanyachemindia.com"],
+        subject="Checking in from Lanya Chem",
+        body_text=(
+            "Dear Shreya,\n\n"
+            "Ms. Pooja no longer works in our company. Please send us your "
+            "product list. It would be better to mark your gold products.\n\n"
+            "Thanks and Best regards\nJudy\nJudy Ao\n"
+            "Shanghai Witofly Chemical Co.,Ltd\n\n"
+            "From: shreyasaxena@lanyachemindia.com\n"
+            "Date: August 3, 2026\n"
+            "To: globalsourcing@witofly.com\n"
+            "Subject: Checking in from Lanya Chem\n\n"
+            f"{outbound_body}"
+        ),
+        attachment_metadata=[],
+        raw_sha256="w" * 64,
+        is_history=False,
+        is_automated_reply=False,
+        automated_reply_metadata={},
+        received_at=datetime(2026, 8, 4, 2, tzinfo=UTC),
+    )
+    db_session.add(inbound)
+    await db_session.flush()
+    handoff = Handoff(
+        source_email_id=inbound.id,
+        reason_code=HandoffReason.THREAD_AMBIGUOUS.value,
+        summary="Thread could not be linked",
+        extracted_facts={},
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+
+    disposition = InboundDisposition(
+        disposition_type=InboundDispositionType.DEPARTED,
+        confidence=0.99,
+        reason="sender or referenced employee is no longer with the company",
+        authored_text=(
+            "Ms. Pooja no longer works in our company. "
+            "Please send us your product list.\n\nThanks and Best regards\nJudy\nJudy Ao"
+        ),
+        product_list_requested=True,
+        classifier_source="anthropic",
+        classifier_model="claude-test",
+        evidence=("Ms. Pooja no longer works in our company",),
+    )
+    settings = Settings(
+        _env_file=None,
+        inbound_disposition_enabled=True,
+        inbound_disposition_apply_enabled=True,
+    )
+    plan = await build_disposition_plan(
+        db_session,
+        inbound,
+        settings=settings,
+        disposition=disposition,
+    )
+
+    assert plan["customer_id"] == customer.id
+    assert plan["contact_id"] == original.id
+    assert plan["contact_resolution_source"] == "QUOTED_OUTBOUND_PARENT"
+    assert plan["parent_email_id"] == outbound.id
+    assert plan["reply_contact_candidate_email"] == "marketing001@witofly.com"
+    assert plan["reply_contact_candidate_name"] == "Judy"
+    assert plan["application_blockers"] == []
+    assert "QUOTED_PARENT_REQUIRES_REVIEW" in plan["blockers"]
+    assert "CREATE_REPLY_CONTACT" in plan["proposed_actions"]
+    assert "CONTINUE_BUSINESS_PIPELINE" in plan["proposed_actions"]
+
+    # The recovered relationship is never applied without explicit review.
+    assert await apply_email_disposition(
+        db_session,
+        inbound,
+        settings=settings,
+        disposition=disposition,
+    ) is False
+    assert original.lifecycle_status == "ACTIVE"
+
+    assert await apply_email_disposition(
+        db_session,
+        inbound,
+        settings=settings,
+        actor="admin:test",
+        force_manual=True,
+        allow_referral_outreach=False,
+        disposition=disposition,
+    ) is False
+    await db_session.commit()
+
+    await db_session.refresh(original)
+    await db_session.refresh(inbound)
+    await db_session.refresh(handoff)
+    reply_contact = await db_session.scalar(
+        select(Contact).where(Contact.email == "marketing001@witofly.com")
+    )
+    sales_case = await db_session.get(SalesCase, inbound.case_id)
+    referral = await db_session.scalar(
+        select(ContactReferral).where(ContactReferral.source_email_id == inbound.id)
+    )
+    action = await db_session.scalar(
+        select(InboundDispositionAction).where(
+            InboundDispositionAction.source_email_id == inbound.id
+        )
+    )
+    assert original.lifecycle_status == "DEPARTED"
+    assert original.suppressed is True
+    assert reply_contact is not None
+    assert reply_contact.name == "Judy"
+    assert reply_contact.customer_id == customer.id
+    assert inbound.customer_id == customer.id
+    assert inbound.contact_id == reply_contact.id
+    assert sales_case is not None
+    assert sales_case.contact_id == reply_contact.id
+    assert sales_case.status.value == "WAITING_HUMAN"
+    assert referral is not None
+    assert referral.new_contact_id == reply_contact.id
+    assert referral.status == "ACTIVE_CONTACT"
+    assert handoff.case_id == sales_case.id
+    assert handoff.reason_code == HandoffReason.PRODUCT_LIST_REVIEW.value
+    assert handoff.status == "OPEN"
+    assert await db_session.scalar(
+        select(func.count()).select_from(Outbox)
+    ) == 0
+    assert action is not None
+
+    await rollback_email_disposition(
+        db_session,
+        action_id=action.id,
+        actor="admin:test",
+        reason="Quoted-parent mixed reply rollback test",
+    )
+    await db_session.commit()
+
+    await db_session.refresh(original)
+    await db_session.refresh(inbound)
+    await db_session.refresh(handoff)
+    assert original.lifecycle_status == "ACTIVE"
+    assert original.suppressed is False
+    assert inbound.customer_id is None
+    assert inbound.contact_id is None
+    assert inbound.case_id is None
+    assert handoff.case_id is None
+    assert handoff.reason_code == HandoffReason.THREAD_AMBIGUOUS.value
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Contact)
+        .where(Contact.email == "marketing001@witofly.com")
+    ) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(ContactReferral)
+        .where(ContactReferral.source_email_id == inbound.id)
+    ) == 0
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(SalesCase)
+        .where(SalesCase.customer_id == customer.id)
+    ) == 0
 
 
 async def test_copied_same_domain_recipient_is_audited_without_duplicate_outreach(

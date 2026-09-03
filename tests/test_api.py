@@ -128,6 +128,12 @@ def test_reply_contact_name_preserves_verified_contact_name() -> None:
     assert _reply_contact_name("Alice Buyer", body) == "Alice Buyer"
 
 
+def test_reply_contact_name_accepts_thanks_and_best_regards() -> None:
+    body = "Please send us your product list.\n\nThanks and Best regards\nJudy\nJudy Ao"
+
+    assert _reply_contact_name("Customer", body) == "Judy"
+
+
 def test_reply_contact_name_rejects_job_title_or_company_as_name() -> None:
     assert _reply_contact_name("Customer", "Best regards,\nMarketing & Sales\nSEEMA BIOTECH") == "Customer"
     assert _reply_contact_name("Customer", "Best regards,\nSEEMA BIOTECH\nMumbai") == "Customer"
