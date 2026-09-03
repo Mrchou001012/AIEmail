@@ -326,6 +326,15 @@ def test_inbound_dispositions_page_distinguishes_expired_absence() -> None:
     assert "结束，不会暂停联系人" in html
 
 
+def test_inbound_dispositions_page_explains_cross_domain_parent_review() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert "CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW" in html
+    assert "回复来自不同公司域名，必须核对父邮件和客户关系" in html
+    assert "关联依据：精确匹配唤醒父邮件" in html
+    assert "row.customer_name" in html
+
+
 def test_inbound_dispositions_page_recovers_batch_after_refresh() -> None:
     html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
 

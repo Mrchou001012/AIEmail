@@ -35,6 +35,8 @@ from app.db import (
     Job,
     JobStatus,
     Outbox,
+    ReactivationCampaign,
+    ReactivationRecipient,
     SalesCase,
 )
 from app.disposition_service import (
@@ -1141,6 +1143,176 @@ async def test_forwarded_to_colleague_saves_contact_without_duplicate_outreach(
         .select_from(Outbox)
         .where(Outbox.message_kind == "REFERRAL_OUTREACH")
     ) == 0
+
+
+async def test_cross_domain_forward_resolves_exact_reactivation_parent_for_review(
+    db_session: AsyncSession,
+) -> None:
+    customer, original = await _seed_contact(
+        db_session,
+        company="Resinova (Now Astral Adhesives)",
+        name="Original Buyer",
+        email="purchase@resinova.example",
+    )
+    campaign = ReactivationCampaign(
+        name="Cross-domain parent test",
+        status="RUNNING",
+        subject_template="Checking in",
+        body_template="Hello",
+        created_by="test",
+    )
+    db_session.add(campaign)
+    await db_session.flush()
+    sent_at = datetime(2026, 7, 30, 6, tzinfo=UTC)
+    parent = Outbox(
+        message_kind="REACTIVATION",
+        business_key="reactivation:cross-domain-test",
+        message_id="<cross-domain-parent@lanyachem.example>",
+        recipient=original.email,
+        raw_message="parent",
+        status=DeliveryStatus.SENT,
+        sent_at=sent_at,
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    db_session.add(
+        ReactivationRecipient(
+            campaign_id=campaign.id,
+            customer_id=customer.id,
+            contact_id=original.id,
+            outbox_id=parent.id,
+            status="SENT",
+            eligible=True,
+            selected=True,
+            sent_at=sent_at,
+        )
+    )
+    row = EmailMessage(
+        direction="INBOUND",
+        message_id="<cross-domain-reply@astral.example>",
+        in_reply_to=parent.message_id,
+        references_json=[parent.message_id],
+        from_address="rishi@astral.example",
+        to_addresses=["sales@lanyachem.com", "manthan@astral.example"],
+        subject="RE: Checking in",
+        body_text=(
+            "I have marked copy to Manthan in this communication. "
+            "He will revert to you."
+        ),
+        attachment_metadata=[],
+        raw_sha256="6" * 64,
+        is_history=False,
+        is_automated_reply=False,
+        automated_reply_metadata={},
+        received_at=datetime(2026, 7, 31, 4, tzinfo=UTC),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    settings = Settings(
+        _env_file=None,
+        ai_provider="anthropic",
+        anthropic_api_key="test-only",
+        inbound_disposition_ai_enabled=True,
+        inbound_disposition_apply_enabled=True,
+    )
+    disposition = await classify_email_disposition(
+        row,
+        settings=settings,
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="CONTACT_REFERRAL",
+                confidence=0.97,
+                reason="The sender copied a colleague who will handle the inquiry.",
+                evidence=["I have marked copy to Manthan"],
+                replacement_emails=[],
+                return_hint=None,
+                forwarded_to_replacement=False,
+                non_target_reason=None,
+                product_list_requested=False,
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    plan = await build_disposition_plan(
+        db_session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+    assert plan["disposition_type"] == "FORWARDED_TO_COLLEAGUE"
+    assert plan["customer_id"] == customer.id
+    assert plan["customer_name"] == "Resinova (Now Astral Adhesives)"
+    assert plan["contact_id"] == original.id
+    assert plan["contact_email"] == "purchase@resinova.example"
+    assert plan["sender_contact_id"] is None
+    assert plan["contact_resolution_source"] == "EXACT_REACTIVATION_PARENT"
+    assert plan["reactivation_parent_message_id"] == parent.message_id
+    assert plan["replacement_emails"] == ["manthan@astral.example"]
+    assert plan["referral_candidates"][0]["same_company_domain"] is True
+    assert plan["blockers"] == [
+        "CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW"
+    ]
+    assert plan["can_apply"] is True
+
+    assert await apply_email_disposition(
+        db_session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    ) is False
+    assert row.disposition_handled_at is None
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(ContactReferral)
+        .where(ContactReferral.source_email_id == row.id)
+    ) == 0
+
+    assert await apply_email_disposition(
+        db_session,
+        row,
+        settings=settings,
+        actor="admin:test",
+        force_manual=True,
+        allow_referral_outreach=False,
+        disposition=disposition,
+    ) is True
+    await db_session.commit()
+
+    referral = await db_session.scalar(
+        select(ContactReferral).where(ContactReferral.source_email_id == row.id)
+    )
+    assert referral is not None
+    assert referral.customer_id == customer.id
+    assert referral.original_contact_id == original.id
+    assert referral.referred_email == "manthan@astral.example"
+    assert referral.forwarded_already is True
+    assert referral.status == "WAITING_FOR_FORWARDED_REPLY"
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Outbox)
+        .where(Outbox.message_kind == "REFERRAL_OUTREACH")
+    ) == 0
+
+    action = await db_session.scalar(
+        select(InboundDispositionAction).where(
+            InboundDispositionAction.source_email_id == row.id
+        )
+    )
+    assert action is not None
+    await rollback_email_disposition(
+        db_session,
+        action_id=action.id,
+        actor="admin:test",
+        reason="Cross-domain referral rollback test",
+    )
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(ContactReferral)
+        .where(ContactReferral.source_email_id == row.id)
+    ) == 0
+    await db_session.refresh(original)
+    assert original.lifecycle_status == "ACTIVE"
+    assert original.suppressed is False
 
 
 async def test_copied_same_domain_recipient_is_audited_without_duplicate_outreach(

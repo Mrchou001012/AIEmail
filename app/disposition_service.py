@@ -37,6 +37,7 @@ from app.db import (
     Job,
     JobStatus,
     Outbox,
+    ReactivationRecipient,
     SalesCase,
 )
 from app.deliverability import validate_address_format
@@ -657,6 +658,67 @@ async def _resolved_customer(
     return await session.get(Customer, customer_id) if customer_id else None
 
 
+async def _exact_reactivation_parent_resources(
+    session: AsyncSession,
+    row: EmailMessage,
+) -> tuple[Contact, Customer] | None:
+    """Resolve a unique sent reactivation parent without trusting sender identity."""
+
+    if not row.in_reply_to:
+        return None
+    matches = (
+        await session.execute(
+            select(Contact, Customer)
+            .select_from(Outbox)
+            .join(
+                ReactivationRecipient,
+                ReactivationRecipient.outbox_id == Outbox.id,
+            )
+            .join(Contact, Contact.id == ReactivationRecipient.contact_id)
+            .join(Customer, Customer.id == ReactivationRecipient.customer_id)
+            .where(
+                Outbox.message_id == row.in_reply_to,
+                Outbox.message_kind == "REACTIVATION",
+                Outbox.status == DeliveryStatus.SENT,
+                Outbox.sent_at.is_not(None),
+                Outbox.sent_at <= row.received_at,
+                ReactivationRecipient.status.in_(["QUEUED", "SENT", "REPLIED"]),
+                ReactivationRecipient.customer_id == Contact.customer_id,
+                func.lower(Outbox.recipient) == func.lower(Contact.email),
+            )
+            .limit(2)
+        )
+    ).all()
+    if len(matches) != 1:
+        return None
+    contact, customer = matches[0]
+    return contact, customer
+
+
+async def _resolved_disposition_resources(
+    session: AsyncSession,
+    row: EmailMessage,
+    disposition: InboundDisposition,
+) -> tuple[Contact | None, Contact | None, Customer | None, bool]:
+    sender_contact = await _unique_sender_contact(session, row)
+    contact = await _disposition_contact(session, row, disposition, sender_contact)
+    customer = await _resolved_customer(session, row, contact)
+    used_reactivation_parent = False
+    if (
+        customer is None
+        and disposition.disposition_type
+        in {
+            InboundDispositionType.CONTACT_REFERRAL,
+            InboundDispositionType.FORWARDED_TO_COLLEAGUE,
+        }
+    ):
+        parent = await _exact_reactivation_parent_resources(session, row)
+        if parent is not None:
+            contact, customer = parent
+            used_reactivation_parent = True
+    return sender_contact, contact, customer, used_reactivation_parent
+
+
 async def build_disposition_plan(
     session: AsyncSession,
     row: EmailMessage,
@@ -670,9 +732,12 @@ async def build_disposition_plan(
         row,
         settings=settings,
     )
-    sender_contact = await _unique_sender_contact(session, row)
-    contact = await _disposition_contact(session, row, disposition, sender_contact)
-    customer = await _resolved_customer(session, row, contact)
+    (
+        sender_contact,
+        contact,
+        customer,
+        used_reactivation_parent,
+    ) = await _resolved_disposition_resources(session, row, disposition)
     return_until = _parse_return_until(
         disposition.return_hint,
         received_at=row.received_at,
@@ -757,6 +822,12 @@ async def build_disposition_plan(
             blockers.append("CUSTOMER_NOT_RESOLVED")
         if not disposition.replacement_emails:
             blockers.append("NO_REPLACEMENT_CONTACT")
+        if (
+            used_reactivation_parent
+            and contact is not None
+            and _domain(row.from_address) != _domain(contact.email)
+        ):
+            blockers.append("CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW")
     elif disposition.disposition_type is InboundDispositionType.NON_TARGET:
         proposed_actions.extend(["MARK_CUSTOMER_NON_TARGET", "STOP_REACTIVATION"])
         if customer is None:
@@ -781,7 +852,7 @@ async def build_disposition_plan(
     referral_candidates = []
     for address in disposition.replacement_emails:
         same_domain = _same_company_domain(
-            contact.email if contact else row.from_address,
+            row.from_address,
             address,
         )
         referral_candidates.append(
@@ -862,10 +933,12 @@ async def build_disposition_plan(
         "subject": row.subject,
         "case_id": row.case_id,
         "customer_id": customer.id if customer else None,
+        "customer_name": customer.company_name if customer else None,
         "customer_qualification_status": (
             customer.qualification_status if customer else None
         ),
         "contact_id": contact.id if contact else None,
+        "contact_name": contact.name if contact else None,
         "contact_email": contact.email if contact else None,
         "contact_lifecycle_status": contact.lifecycle_status if contact else None,
         "contact_suppressed": contact.suppressed if contact else None,
@@ -876,6 +949,14 @@ async def build_disposition_plan(
         ),
         "sender_contact_suppressed": (
             sender_contact.suppressed if sender_contact else None
+        ),
+        "contact_resolution_source": (
+            "EXACT_REACTIVATION_PARENT"
+            if used_reactivation_parent
+            else "DIRECT_IDENTITY"
+        ),
+        "reactivation_parent_message_id": (
+            row.in_reply_to if used_reactivation_parent else None
         ),
         "disposition_handled_at": _iso(row.disposition_handled_at),
         "disposition_type": disposition.disposition_type.value,
@@ -963,7 +1044,7 @@ async def _save_referrals(
                 confidence=Decimal(str(disposition.confidence)),
                 metadata_json={
                     "same_company_domain": _same_company_domain(
-                        contact.email if contact else row.from_address,
+                        row.from_address,
                         address,
                     ),
                     "source_disposition": disposition.disposition_type.value,
@@ -1280,9 +1361,11 @@ async def _disposition_state_snapshot(
     disposition: InboundDisposition | None = None,
 ) -> dict[str, Any]:
     disposition = disposition or _stored_or_rule_disposition(row)
-    sender_contact = await _unique_sender_contact(session, row)
-    contact = await _disposition_contact(session, row, disposition, sender_contact)
-    customer = await _resolved_customer(session, row, contact)
+    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
+        session,
+        row,
+        disposition,
+    )
     referrals = (
         (
             await session.execute(
@@ -1561,9 +1644,11 @@ async def apply_email_disposition(
         action_email = active_action.after_json.get("email") or {}
         action_metadata = action_email.get("disposition_metadata") or {}
         return bool(action_metadata.get("applied_terminal"))
-    sender_contact = await _unique_sender_contact(session, row)
-    contact = await _disposition_contact(session, row, disposition, sender_contact)
-    customer = await _resolved_customer(session, row, contact)
+    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
+        session,
+        row,
+        disposition,
+    )
     if customer is not None:
         await session.scalar(
             select(Customer).where(Customer.id == customer.id).with_for_update()
@@ -1579,9 +1664,11 @@ async def apply_email_disposition(
         await session.execute(
             select(Contact).where(Contact.id.in_(contact_ids)).with_for_update()
         )
-    sender_contact = await _unique_sender_contact(session, row)
-    contact = await _disposition_contact(session, row, disposition, sender_contact)
-    customer = await _resolved_customer(session, row, contact)
+    sender_contact, contact, customer, _ = await _resolved_disposition_resources(
+        session,
+        row,
+        disposition,
+    )
     if not force_manual:
         automatic_plan = await build_disposition_plan(
             session,
