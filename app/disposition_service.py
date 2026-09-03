@@ -106,12 +106,18 @@ def _headers(row: EmailMessage) -> dict[str, str]:
     return {str(key): str(value) for key, value in raw.items()}
 
 
-def rule_classify_email_disposition(row: EmailMessage) -> InboundDisposition:
+def rule_classify_email_disposition(
+    row: EmailMessage,
+    *,
+    settings: Settings | None = None,
+) -> InboundDisposition:
+    settings = settings or get_settings()
     return classify_inbound_disposition(
         subject=row.subject,
         body=row.body_text,
         headers=_headers(row),
         sender=row.from_address,
+        internal_domains=settings.inbound_disposition_internal_domains,
     )
 
 
@@ -171,7 +177,7 @@ def decision_to_disposition(
     reason = decision.reason.strip()[:500]
     confidence = decision.confidence
     non_target_reason: str | None = decision.non_target_reason
-    normalization_notes: list[str] = []
+    normalization_notes: list[str] = list(rule.normalization_notes)
     product_list_requested = bool(
         decision.product_list_requested or rule.product_list_requested
     )
@@ -191,7 +197,12 @@ def decision_to_disposition(
         InboundDispositionType.CONTACT_IDENTITY_MISMATCH,
         InboundDispositionType.NON_TARGET,
     }
-    if rule.disposition_type in guarded_rule_types:
+    authoritative_rule = (
+        rule.disposition_type in guarded_rule_types
+        or "INTERNAL_SENDER_REQUIRES_REVIEW" in rule.normalization_notes
+        or "EXPLICIT_BUSINESS_REQUEST" in rule.normalization_notes
+    )
+    if authoritative_rule:
         if disposition_type is not rule.disposition_type:
             normalization_notes.append(
                 f"PRIMARY_CATEGORY_NORMALIZED:{disposition_type.value}"
@@ -200,7 +211,7 @@ def decision_to_disposition(
         disposition_type = rule.disposition_type
         reason = rule.reason
         confidence = rule.confidence
-        non_target_reason = rule.non_target_reason or non_target_reason
+        non_target_reason = rule.non_target_reason
 
     # A referral without an address cannot create or contact a replacement.
     # Keep it visible as uncertain instead of hiding it as ordinary business.
@@ -291,7 +302,7 @@ async def classify_email_disposition(
     """Use AI for semantics while retaining deterministic safety signals."""
 
     settings = settings or get_settings()
-    rule = rule_classify_email_disposition(row)
+    rule = rule_classify_email_disposition(row, settings=settings)
     # Trusted machine-notification rules are deterministic and do not justify
     # the cost or latency of a model call. Bounces are excluded by the caller.
     if rule.disposition_type is InboundDispositionType.SYSTEM_NOTIFICATION:

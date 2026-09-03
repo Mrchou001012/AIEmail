@@ -32,3 +32,29 @@ def test_customer_reply_workflows_default_to_review_only() -> None:
     assert settings.coa_auto_send_enabled is False
     assert settings.product_list_auto_send_enabled is False
     assert settings.quote_auto_send_enabled is False
+
+
+def test_inbound_internal_domains_have_lanya_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.inbound_disposition_internal_domains == [
+        "lanyachem.com",
+        "lanyachemindia.com",
+        "lanyachem.de",
+    ]
+
+
+def test_inbound_internal_domains_accept_comma_separated_environment_value(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "INBOUND_DISPOSITION_INTERNAL_DOMAINS",
+        " LANYACHEM.COM, lanyachem.de, lanyachem.com ",
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.inbound_disposition_internal_domains == [
+        "lanyachem.com",
+        "lanyachem.de",
+    ]

@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     inbound_disposition_ai_max_batch: int = Field(default=250, ge=1, le=1000)
     inbound_disposition_ai_batch_poll_seconds: int = Field(default=20, ge=5, le=300)
     inbound_disposition_ai_batch_max_attempts: int = Field(default=3, ge=1, le=10)
+    inbound_disposition_internal_domains: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "lanyachem.com",
+            "lanyachemindia.com",
+            "lanyachem.de",
+        ]
+    )
     inbound_disposition_apply_enabled: bool = False
     referral_auto_contact_enabled: bool = False
 
@@ -169,6 +176,31 @@ class Settings(BaseSettings):
                 raise ValueError(f"allowlist entry must be a valid email address: {address}")
             if result.normalized not in normalized:
                 normalized.append(result.normalized)
+        return normalized
+
+    @field_validator("inbound_disposition_internal_domains", mode="before")
+    @classmethod
+    def split_internal_domains(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
+    @field_validator("inbound_disposition_internal_domains")
+    @classmethod
+    def normalize_internal_domains(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw_domain in value:
+            domain = raw_domain.strip().casefold().strip(".")
+            result = validate_address_format(f"internal-check@{domain}")
+            if not domain or "@" in domain or not result.valid:
+                raise ValueError(
+                    "INBOUND_DISPOSITION_INTERNAL_DOMAINS entries must be domains"
+                )
+            normalized_domain = result.normalized.rpartition("@")[2]
+            if normalized_domain not in normalized:
+                normalized.append(normalized_domain)
+        if not normalized:
+            raise ValueError("INBOUND_DISPOSITION_INTERNAL_DOMAINS cannot be empty")
         return normalized
 
     @field_validator("gmail_app_password", mode="before")

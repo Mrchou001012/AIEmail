@@ -4310,6 +4310,7 @@ async def ingest_raw_email(
             body=parsed.body_text,
             headers=parsed.header_metadata,
             sender=parsed.from_address,
+            internal_domains=get_settings().inbound_disposition_internal_domains,
         )
         if direction == "INBOUND" and not (bounce and bounce.is_bounce)
         else None

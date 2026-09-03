@@ -1,3 +1,5 @@
+import pytest
+
 from app.auto_replies import AutomatedReplyType, classify_automated_reply
 from app.inbound_disposition import (
     InboundDispositionType,
@@ -201,6 +203,75 @@ def test_explicit_manufacturer_sales_outreach_is_non_target() -> None:
 
     assert result.disposition_type is InboundDispositionType.NON_TARGET
     assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_explicit_supplier_price_offer_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="ACETYL ACETONE---OFFER",
+        body=(
+            "Presently we can offer, subject to confirmation: USD 3700/mt. "
+            "Terms CIF Nhava Sheva and shipment in three weeks."
+        ),
+        sender="marketing@supplier.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["lanyachem.com", "lanyachemindia.com", "lanyachem.de"],
+)
+def test_internal_sender_is_always_flagged_for_review(domain: str) -> None:
+    result = classify_inbound_disposition(
+        subject="Inquiry for YAC-TEOS40",
+        body="Please quote 1000 kg YAC-TEOS40 instead.",
+        sender=f"internal-test@{domain}",
+        internal_domains={"lanyachem.com", "lanyachemindia.com", "lanyachem.de"},
+    )
+
+    assert result.disposition_type is InboundDispositionType.UNCERTAIN
+    assert "INTERNAL_SENDER_REQUIRES_REVIEW" in result.normalization_notes
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Give me current best rate.",
+        "Dear Madam, May you confirm the items names? Regards, Amit",
+    ],
+)
+def test_explicit_business_request_is_stable(body: str) -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Checking in from Lanya Chem",
+        body=body,
+        sender="buyer@customer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.BUSINESS
+    assert "EXPLICIT_BUSINESS_REQUEST" in result.normalization_notes
+
+
+def test_departed_message_collects_order_and_assistance_contacts() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Lanya Chem",
+        body=(
+            "The person you are trying to reach is no longer employed. "
+            "To place an order, please send your order to orders@charkit.com. "
+            "If you need assistance, please send your email to Bob Clinger "
+            "rclinger@lbbspecialties.com or Panos Yannopoulos "
+            "pyannopoulos@lbbspecialties.com."
+        ),
+        sender="former@lbbspecialties.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.DEPARTED
+    assert result.replacement_emails == (
+        "orders@charkit.com",
+        "rclinger@lbbspecialties.com",
+        "pyannopoulos@lbbspecialties.com",
+    )
 
 
 def test_explicit_professional_service_provider_is_non_target() -> None:

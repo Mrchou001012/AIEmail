@@ -62,9 +62,10 @@ def _fallback_disposition(
     row: EmailMessage,
     *,
     error_type: str,
+    settings: Settings,
 ) -> InboundDisposition:
     return replace(
-        rule_classify_email_disposition(row),
+        rule_classify_email_disposition(row, settings=settings),
         classifier_source="deterministic_fallback",
         classification_error=error_type[:128],
     )
@@ -181,7 +182,7 @@ async def create_disposition_batch(
     items: list[InboundDispositionBatchItem] = []
     for row in rows:
         _, input_hash = _request_for_row(row, settings)
-        rule = rule_classify_email_disposition(row)
+        rule = rule_classify_email_disposition(row, settings=settings)
         rule_only = (
             rule.disposition_type is InboundDispositionType.SYSTEM_NOTIFICATION
         )
@@ -252,7 +253,11 @@ async def _mark_submission_failure(
         row = await session.get(EmailMessage, item.email_id)
         if row is not None:
             item.classification_json = disposition_to_payload(
-                _fallback_disposition(row, error_type=error_type)
+                _fallback_disposition(
+                    row,
+                    error_type=error_type,
+                    settings=settings,
+                )
             )
         item.status = "FALLBACK"
         item.needs_attention = True
@@ -297,7 +302,11 @@ async def _mark_provider_attempt_failure(
         row = await session.get(EmailMessage, item.email_id)
         if row is not None:
             item.classification_json = disposition_to_payload(
-                _fallback_disposition(row, error_type=error_type)
+                _fallback_disposition(
+                    row,
+                    error_type=error_type,
+                    settings=settings,
+                )
             )
         item.status = "FALLBACK"
         item.needs_attention = True
@@ -388,6 +397,7 @@ async def process_disposition_batch(
                     _fallback_disposition(
                         row,
                         error_type="EMAIL_CONTENT_CHANGED",
+                        settings=settings,
                     )
                 )
                 continue
@@ -500,7 +510,7 @@ async def process_disposition_batch(
                 usage = message.get("usage") or {}
                 disposition = decision_to_disposition(
                     row,
-                    rule=rule_classify_email_disposition(row),
+                    rule=rule_classify_email_disposition(row, settings=settings),
                     decision=decision,
                     metadata={
                         "model": message.get("model"),
@@ -547,7 +557,11 @@ async def process_disposition_batch(
             item.needs_attention = True
             if row is not None:
                 item.classification_json = disposition_to_payload(
-                    _fallback_disposition(row, error_type=error_type)
+                    _fallback_disposition(
+                        row,
+                        error_type=error_type,
+                        settings=settings,
+                    )
                 )
     batch.provider_batch_id = None
     _refresh_counts(batch, items)

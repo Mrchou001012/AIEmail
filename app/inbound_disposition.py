@@ -1,4 +1,5 @@
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypedDict
@@ -49,7 +50,9 @@ NON_TARGET_ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?:offer|quotation|quote)\b|"
             r"\b(?:our|the)\s+(?:updated\s+|best\s+|current\s+)?price\s+"
             r"(?:of\s+this\s+week\s+)?"
-            r"(?:is|would\s+be|could\s+be)\b",
+            r"(?:is|would\s+be|could\s+be)\b|"
+            r"\b(?:presently|currently|now)?\s*we\s+can\s+offer\b"
+            r"[\s\S]{0,500}\b(?:usd|eur|inr)\s*\d",
             re.I,
         ),
     ),
@@ -78,6 +81,19 @@ NON_TARGET_ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"compliance|registration|training|audit)\b",
             re.I,
         ),
+    ),
+)
+
+EXPLICIT_BUSINESS_REQUEST_PATTERNS = (
+    re.compile(
+        r"\b(?:please\s+)?(?:give|send|share)\s+(?:me|us)\s+"
+        r"(?:your\s+)?(?:current\s+)?best\s+(?:rate|price|quotation)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:may|can|could|would)\s+you\s+confirm\s+"
+        r"(?:the\s+)?items?\s+names?\b",
+        re.I,
     ),
 )
 
@@ -222,6 +238,7 @@ def classify_inbound_disposition(
     body: str,
     headers: dict[str, str] | None = None,
     sender: str | None = None,
+    internal_domains: Collection[str] = (),
 ) -> InboundDisposition:
     """Classify an inbound message into a bounded operational disposition.
 
@@ -285,6 +302,21 @@ def classify_inbound_disposition(
             **common,
         )
 
+    sender_domain = (sender or "").strip().casefold().partition("@")[2]
+    normalized_internal_domains = {
+        domain.strip().casefold().strip(".")
+        for domain in internal_domains
+        if domain.strip()
+    }
+    if sender_domain in normalized_internal_domains:
+        return InboundDisposition(
+            InboundDispositionType.UNCERTAIN,
+            1.0,
+            "internal company sender requires explicit human review",
+            normalization_notes=("INTERNAL_SENDER_REQUIRES_REVIEW",),
+            **common,
+        )
+
     non_target_reason = _non_target_reason(f"{subject}\n{authored}")
     if non_target_reason:
         return InboundDisposition(
@@ -308,6 +340,17 @@ def classify_inbound_disposition(
             0.97,
             "message says the inquiry has already been forwarded",
             **forwarded_common,
+        )
+    if any(
+        pattern.search(authored)
+        for pattern in EXPLICIT_BUSINESS_REQUEST_PATTERNS
+    ):
+        return InboundDisposition(
+            InboundDispositionType.BUSINESS,
+            0.99,
+            "sender makes an explicit product or pricing request",
+            normalization_notes=("EXPLICIT_BUSINESS_REQUEST",),
+            **common,
         )
     if automated.reply_type is AutomatedReplyType.CONTACT_CHANGE:
         return InboundDisposition(

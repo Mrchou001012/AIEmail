@@ -436,6 +436,86 @@ async def test_explicit_supplier_offer_overrides_ai_business_label(
     )
 
 
+async def test_internal_sender_overrides_ai_business_label(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Internal Sender",
+        name="Internal Test",
+        email="zhoulei@lanyachem.com",
+    )
+    row = _email(
+        contact=contact,
+        subject="Inquiry for YAC-TEOS40",
+        body="Please quote 1000 kg YAC-TEOS40 instead.",
+        token="q",
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="BUSINESS",
+                confidence=0.95,
+                reason="This is a quote request.",
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.UNCERTAIN
+    assert "INTERNAL_SENDER_REQUIRES_REVIEW" in disposition.normalization_notes
+
+
+async def test_explicit_business_request_overrides_ai_non_target_label(
+    db_session: AsyncSession,
+) -> None:
+    _, contact = await _seed_contact(
+        db_session,
+        company="Explicit Buyer",
+        name="Buyer",
+        email="buyer@explicit-buyer.example",
+    )
+    row = _email(
+        contact=contact,
+        subject="Re: Checking in from Lanya Chem",
+        body="Give me current best rate.",
+        token="r",
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    disposition = await classify_email_disposition(
+        row,
+        settings=Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            anthropic_api_key="test-only",
+            inbound_disposition_ai_enabled=True,
+        ),
+        ai_client=_DispositionAI(
+            InboundDispositionDecision(
+                disposition_type="NON_TARGET",
+                confidence=0.92,
+                reason="The sender may be offering services.",
+                non_target_reason="SUPPLIER_VENDOR",
+            )
+        ),  # type: ignore[arg-type]
+    )
+
+    assert disposition.disposition_type is InboundDispositionType.BUSINESS
+    assert disposition.non_target_reason is None
+    assert "EXPLICIT_BUSINESS_REQUEST" in disposition.normalization_notes
+
+
 async def test_product_list_request_overrides_uncorroborated_ai_non_target(
     db_session: AsyncSession,
 ) -> None:

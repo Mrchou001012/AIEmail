@@ -134,6 +134,11 @@ OUTLOOK_HEADER_PATTERN = re.compile(
 
 REPLACEMENT_CONTEXT_PATTERNS = (
     re.compile(r"\bplease\s+(?:contact|email|reach(?:\s+out)?\s+to)\b", re.I),
+    re.compile(
+        r"\bplease\s+send\s+(?:your\s+)?"
+        r"(?:order|email|message|inquiry|enquiry|correspondence)\s+to\b",
+        re.I,
+    ),
     re.compile(r"\b(?:contact|email|reach(?:\s+out)?\s+to)\s+[\w .,'’()/-]{0,100}$", re.I),
     re.compile(r"\bdirect\s+(?:any\s+|all\s+|future\s+|your\s+|the\s+)*correspondence\s+to\b", re.I),
     re.compile(r"\b(?:new|alternative|alternate|replacement|backup)\s+(?:point\s+of\s+)?contact\b", re.I),
