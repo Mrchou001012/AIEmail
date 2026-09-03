@@ -38,6 +38,7 @@ from app.db import (
     SalesCase,
 )
 from app.disposition_service import (
+    _parse_return_until,
     apply_email_disposition,
     backfill_inbound_dispositions,
     build_disposition_plan,
@@ -166,6 +167,24 @@ def _email(
         ),
         received_at=datetime(2026, 8, 4, 8, tzinfo=UTC),
     )
+
+
+@pytest.mark.parametrize(
+    ("return_hint", "expected"),
+    [
+        ("July 30th, 2026", datetime(2026, 7, 31, tzinfo=UTC)),
+        ("3rd to 21st August", datetime(2026, 8, 22, tzinfo=UTC)),
+        ("6th of August", datetime(2026, 8, 7, tzinfo=UTC)),
+    ],
+)
+def test_parse_return_until_accepts_real_autoreply_date_formats(
+    return_hint: str,
+    expected: datetime,
+) -> None:
+    assert _parse_return_until(
+        return_hint,
+        received_at=datetime(2026, 7, 30, tzinfo=UTC),
+    ) == expected
 
 
 async def test_ai_semantic_disposition_supplies_confidence_and_evidence(

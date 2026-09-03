@@ -553,6 +553,15 @@ def _parse_return_until(
     if not return_hint:
         return None
     cleaned = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", return_hint, flags=re.I)
+    cleaned = re.sub(r"\bof\b", " ", cleaned, flags=re.I)
+    range_parts = re.split(
+        r"\s+(?:to|until|till|through)\s+|\s+[\-–—]\s+",
+        cleaned,
+        flags=re.I,
+    )
+    if len(range_parts) > 1:
+        cleaned = range_parts[-1]
+    cleaned = cleaned.replace(",", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
     parsed: datetime | None = None
     try:
