@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import coa_requests
 from app.agent_runtime import (
     COA_LOOKUP_REQUEST_TYPE,
     ensure_handoff_agent_run,
@@ -45,12 +46,15 @@ from app.bounces import (
     classify_smtp_failure,
     has_permanent_failure_evidence,
 )
-from app.coa_catalog import COACatalog, COAFindStatus
+from app.coa_catalog import COACatalog
 from app.coa_delivery import (
-    coa_reply_draft as _coa_reply_draft,
+    COAResponseError,
 )
 from app.coa_delivery import (
     prepare_coa_attachments as _prepare_coa_attachments,
+)
+from app.coa_delivery import (
+    prepare_coa_response as _prepare_coa_response,
 )
 from app.coa_delivery import (
     read_prepared_coa_attachments as _read_prepared_coa_attachments,
@@ -1454,6 +1458,7 @@ async def create_handoff(
     facts: dict[str, Any] | None = None,
     source_email_id: int | None = None,
     update_existing: bool = False,
+    pause_case: bool = True,
 ) -> Handoff:
     created = False
     try:
@@ -1491,7 +1496,7 @@ async def create_handoff(
         await ensure_handoff_agent_run(session, handoff=handoff)
 
     if created:
-        if case and case.status == CaseStatus.ACTIVE:
+        if pause_case and case and case.status == CaseStatus.ACTIVE:
             case.status = CaseStatus.WAITING_HUMAN
         await audit(
             session,
@@ -6339,22 +6344,17 @@ async def _maybe_handle_coa_request(
     analysis: InboundAnalysis,
     analysis_facts: dict[str, Any],
 ) -> bool:
-    """Resolve a COA request against the approved catalog or pause for review."""
-
-    if analysis.intent != Intent.COA_REQUEST:
+    """Send every explicit COA deliverable independently from its primary intent."""
+    if analysis.intent != Intent.COA_REQUEST and not analysis.coa_requested:
         return False
     settings = get_settings()
-    explicit_query = (analysis.requested_product_name or analysis.product_code or "").strip()
-    query = explicit_query
-    if not query and case.product is not None:
-        query = (case.product.code or case.product.name).strip()
-    cas_number = (analysis.requested_cas_number or "").strip() or None
-    lookup_facts: dict[str, Any] = {
-        **analysis_facts,
-        "coa_query": query,
-        "coa_cas_number": cas_number,
-        "coa_catalog_path": str(settings.coa_catalog_path),
-    }
+    plan = coa_requests.plan_coa_request(
+        analysis=analysis,
+        analysis_facts=analysis_facts,
+        case_product_code=case.product.code if case.product is not None else "",
+        case_product_name=case.product.name if case.product is not None else "",
+    )
+    lookup_facts = plan.lookup_facts(analysis_facts=analysis_facts, catalog_path=settings.coa_catalog_path)
     if not settings.coa_catalog_enabled:
         await create_handoff(
             session,
@@ -6363,105 +6363,67 @@ async def _maybe_handle_coa_request(
             summary="COA request is waiting because the approved COA catalog is disabled",
             facts=lookup_facts,
             source_email_id=email_row.id,
+            pause_case=plan.primary_request,
         )
-        return True
-    if not query and not cas_number:
+        return plan.primary_request
+    try:
+        response = _prepare_coa_response(
+            settings=settings,
+            contact_name=_reply_contact_name(
+                case.contact.name,
+                getattr(email_row, "body_text", ""),
+            ),
+            original_subject=email_row.subject,
+            product_queries=list(plan.product_queries),
+            cas_number=plan.cas_number,
+        )
+    except COAResponseError as exc:
+        error_facts = {**lookup_facts, **exc.facts, "coa_help_needed": exc.help_needed}
+        if plan.followup and plan.prior_missing_queries:
+            error_facts["missing_coa_queries"] = list(plan.prior_missing_queries)
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.COA_REVIEW,
-            summary="Customer requested a COA but the product or CAS number is missing",
-            facts={**lookup_facts, "coa_help_needed": "product name, product code, or CAS number"},
+            summary=exc.summary,
+            facts=error_facts,
             source_email_id=email_row.id,
+            pause_case=plan.primary_request,
         )
-        return True
-    try:
-        catalog = COACatalog(settings.coa_catalog_path)
-        result = catalog.find(query, cas_number=cas_number)
+        return plan.primary_request
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.COA_REVIEW,
-            summary="Approved COA catalog is unavailable and must be rebuilt",
+            summary="Approved COA catalog or attachment is unavailable",
             facts={**lookup_facts, "coa_catalog_error": type(exc).__name__},
             source_email_id=email_row.id,
+            pause_case=plan.primary_request,
         )
-        return True
-
-    result_facts = {**lookup_facts, "coa_lookup": result.as_dict()}
-    if (
-        result.status is not COAFindStatus.FOUND
-        or len(result.matches) != 1
-        or not result.auto_send_eligible
-    ):
-        reason = (
-            "COA match is ambiguous and requires human selection"
-            if result.status is COAFindStatus.AMBIGUOUS
-            else "No unique approved standard English COA was found"
-        )
-        await create_handoff(
-            session,
-            case=case,
-            reason=HandoffReason.COA_REVIEW,
-            summary=reason,
-            facts={
-                **result_facts,
-                "coa_help_needed": (
-                    "confirm the correct suffix-free standard English COA"
-                    if result.status is COAFindStatus.AMBIGUOUS
-                    else "provide or identify a suffix-free standard English COA"
-                ),
-            },
-            source_email_id=email_row.id,
-        )
-        return True
-
-    entry = dict(result.matches[0])
-    product_name = str(entry.get("product_code") or entry.get("product_name") or query)
-    subject, draft_body = _coa_reply_draft(
-        contact_name=_reply_contact_name(
-            case.contact.name,
-            getattr(email_row, "body_text", ""),
-        ),
-        original_subject=email_row.subject,
-        product_name=product_name,
+        return plan.primary_request
+    prepared_facts = coa_requests.prepared_coa_facts(
+        lookup_facts=lookup_facts, response=response, generated_at=datetime.now(UTC).isoformat()
     )
-    relative_path = str(entry["path"])
-    prepared = {
-        "path": relative_path,
-        "filename": relative_path.replace("\\", "/").rsplit("/", 1)[-1],
-        "sha256": str(entry["sha256"]),
-        "size": int(entry["size"]),
-        "product_name": product_name,
-        "match_basis": result.match_basis,
-        "catalog_schema": catalog.schema_version,
-    }
-    draft_preview = {
-        "subject": subject,
-        "body_text": draft_body,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "provider": "deterministic-coa",
-        "model": catalog.schema_version,
-        "rag_matches": [],
-    }
-    prepared_facts = {
-        **result_facts,
-        "prepared_coa": prepared,
-        "ai_draft_preview": draft_preview,
-    }
-
+    outstanding_queries = coa_requests.outstanding_coa_queries(response_missing=response.missing_queries, plan=plan)
+    if plan.followup:
+        prepared_facts["missing_coa_queries"] = outstanding_queries
+        prepared_facts["coa_partial"] = bool(outstanding_queries)
     if not settings.coa_auto_send_enabled:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.COA_REVIEW,
-            summary=f"COA draft prepared for {product_name}; human approval is required",
+            summary=(
+                f"COA draft prepared for {' and '.join(response.product_names)}; "
+                "human approval is required"
+            ),
             facts=prepared_facts,
             source_email_id=email_row.id,
             update_existing=True,
+            pause_case=plan.primary_request,
         )
-        return True
+        return plan.primary_request
 
     send_decision = evaluate_send_policy(
         SendContext(
@@ -6489,28 +6451,16 @@ async def _maybe_handle_coa_request(
             summary="COA was found, but current send policy requires human approval",
             facts=prepared_facts,
             source_email_id=email_row.id,
+            pause_case=plan.primary_request,
         )
-        return True
-
-    try:
-        payload = catalog.read_verified_attachment(entry)
-    except (OSError, ValueError) as exc:
-        await create_handoff(
-            session,
-            case=case,
-            reason=HandoffReason.COA_REVIEW,
-            summary="Selected COA changed or became unavailable; rescan and review are required",
-            facts={**prepared_facts, "coa_attachment_error": type(exc).__name__},
-            source_email_id=email_row.id,
-        )
-        return True
+        return plan.primary_request
 
     bundle = load_content(settings.content_dir)
-    signed_text = "\n".join([draft_body, "", bundle.signature_text.strip()])
-    signed_html = "".join(
-        f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
-        for line in draft_body.splitlines()
-    ) + bundle.signature_html
+    signed_text, signed_html = coa_requests.signed_coa_body(
+        response_body=response.body_text,
+        signature_text=bundle.signature_text,
+        signature_html=bundle.signature_html,
+    )
     source = _reply_source(email_row)
     signed_text, signed_html = append_quoted_reply(
         signed_text,
@@ -6520,42 +6470,58 @@ async def _maybe_handle_coa_request(
         source_html=source.body_html,
         occurred_at=email_row.received_at,
     )
+    coa_business_key = coa_requests.coa_outbox_business_key(
+        email_id=email_row.id, product_queries=plan.product_queries, followup=plan.followup
+    )
     outbox = await stage_outbox(
         session,
         case=case,
         message_kind="COA",
-        subject=subject,
+        subject=response.subject,
         text_body=signed_text,
         html_body=signed_html,
-        business_key=f"inbound-coa:{email_row.id}",
+        business_key=coa_business_key,
         in_reply_to=email_row.message_id,
         references=_reply_references(email_row),
         inline_images=source.inline_images,
-        attachments=(
-            OutboundAttachment(
-                filename=prepared["filename"],
-                content_type="application/pdf",
-                payload=payload,
-            ),
-        ),
+        attachments=response.attachments,
     )
     if outbox is None:
         await session.rollback()
-        return True
+        return plan.primary_request
     await audit(
         session,
         "inbound.coa_queued",
         case_id=case.id,
         actor="system",
-        data={
-            "email_id": email_row.id,
-            "outbox_id": outbox.id,
-            "coa_path": relative_path,
-            "coa_sha256": prepared["sha256"],
-            "match_basis": result.match_basis,
-        },
+        data=coa_requests.coa_delivery_audit_data(
+            email_id=email_row.id,
+            outbox_id=outbox.id,
+            business_key=coa_business_key,
+            response=response,
+            secondary_request=not plan.primary_request,
+            outstanding_queries=outstanding_queries,
+        ),
     )
-    return True
+    if outstanding_queries:
+        partial_facts = coa_requests.partial_coa_handoff_facts(
+            prepared_facts=prepared_facts,
+            outbox_id=outbox.id,
+            prepared_coas=response.prepared_coas,
+            outstanding_queries=outstanding_queries,
+        )
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.COA_REVIEW,
+            summary=f"Sent {len(response.prepared_coas)} available COA(s); "
+            f"{len(outstanding_queries)} requested COA(s) require human handling",
+            facts=partial_facts,
+            source_email_id=email_row.id,
+            update_existing=True,
+            pause_case=plan.primary_request,
+        )
+    return plan.primary_request
 
 
 async def _referral_outreach_eligibility_error(
@@ -8252,6 +8218,9 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         await audit(session, "contact.unsubscribed", case_id=case.id, actor="customer")
         await session.commit()
         return
+    secondary_coa_request = (
+        analysis.intent != Intent.COA_REQUEST and analysis.coa_requested
+    )
     if await _maybe_handle_coa_request(
         session,
         case=case,
@@ -8260,6 +8229,10 @@ async def process_inbound(session: AsyncSession, email_id: int) -> None:
         analysis_facts=analysis_facts,
     ):
         return
+    if secondary_coa_request:
+        # The verified COA has its own durable outbox row. Keep the remaining
+        # quote/product-list workflow independent and avoid attaching it twice.
+        analysis = analysis.model_copy(update={"coa_requested": False})
     multi_product_request = (
         len(
             [
@@ -8911,8 +8884,10 @@ async def resume_agent_run(
         corrected_cas = str(request.answer_json.get("cas_number") or "").strip() or None
         corrected_analysis = analysis.model_copy(
             update={
+                "product_code": None,
                 "requested_product_name": corrected_query,
                 "requested_cas_number": corrected_cas,
+                "product_requests": [],
                 "missing_fields": [
                     field
                     for field in analysis.missing_fields
@@ -8924,6 +8899,12 @@ async def resume_agent_run(
         run.current_step = "recheck-coa-catalog"
         run.last_error = None
         case.status = CaseStatus.ACTIVE
+        pending_before_retry = [
+            str(item).strip()
+            for item in ((handoff.extracted_facts or {}).get("missing_coa_queries") or [])
+            if str(item).strip()
+        ]
+        retry_original_query = pending_before_retry[0] if pending_before_retry else corrected_query
         resume_facts = {
             **(handoff.extracted_facts or {}),
             **corrected_analysis.model_dump(mode="json"),
@@ -8933,8 +8914,14 @@ async def resume_agent_run(
                 "assistance_request_id": request.id,
                 "answered_by": request.answered_by,
             },
+            "coa_retry_original_query": retry_original_query,
         }
         handoff.extracted_facts = resume_facts
+        expected_outbox_key = coa_requests.coa_outbox_business_key(
+            email_id=email_row.id,
+            product_queries=[corrected_query],
+            followup=bool(resume_facts.get("partial_coa_outbox_id")),
+        )
         await _maybe_handle_coa_request(
             session,
             case=case,
@@ -8945,10 +8932,15 @@ async def resume_agent_run(
         prepared = (handoff.extracted_facts or {}).get("prepared_coa")
         outbox = await session.scalar(
             select(Outbox).where(
-                Outbox.business_key == f"inbound-coa:{email_row.id}",
+                Outbox.business_key == expected_outbox_key,
                 Outbox.status != DeliveryStatus.CANCELLED,
             )
         )
+        remaining_missing = [
+            str(item).strip()
+            for item in ((handoff.extracted_facts or {}).get("missing_coa_queries") or [])
+            if str(item).strip()
+        ]
         completed_at = datetime.now(UTC)
         if isinstance(prepared, dict):
             request.status = AssistanceStatus.APPLIED
@@ -8983,6 +8975,21 @@ async def resume_agent_run(
                     "coa_sha256": prepared.get("sha256"),
                 },
             )
+            await session.commit()
+            return
+        if outbox is not None and remaining_missing:
+            request.status = AssistanceStatus.APPLIED
+            request.applied_at = completed_at
+            step.status = AgentStepStatus.COMPLETED
+            step.output_json = {
+                "outbox_id": outbox.id,
+                "remaining_missing_coa_queries": remaining_missing,
+                "next_step": "human-coa-assistance",
+            }
+            step.completed_at = completed_at
+            run.status = AgentRunStatus.WAITING_HUMAN
+            run.current_step = "human_review"
+            await ensure_handoff_agent_run(session, handoff=handoff)
             await session.commit()
             return
         if outbox is not None:

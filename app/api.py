@@ -216,6 +216,7 @@ class HandoffCaseProductRequest(BaseModel):
 
 class AssistanceAnswer(BaseModel):
     category_id: int | None = Field(default=None, gt=0)
+    coa_resolution: Literal["RETRY_LOOKUP", "NO_COA_AVAILABLE"] | None = None
     product_query: str | None = Field(default=None, min_length=1, max_length=255)
     cas_number: str | None = Field(default=None, max_length=32)
     note: str = Field(default="", max_length=2_000)
@@ -2945,7 +2946,8 @@ def _suggested_handoff_reply(
     source_email: EmailMessage | None,
     case: SalesCase | None,
 ) -> dict[str, str]:
-    stored_preview = (handoff.extracted_facts or {}).get("ai_draft_preview")
+    facts = handoff.extracted_facts or {}
+    stored_preview = facts.get("ai_draft_preview")
     if isinstance(stored_preview, dict):
         stored_subject = str(stored_preview.get("subject") or "").strip()
         stored_body = str(stored_preview.get("body_text") or "").strip()
@@ -2958,6 +2960,34 @@ def _suggested_handoff_reply(
     if not subject.casefold().startswith("re:"):
         subject = f"Re: {subject}"
     contact_name = case.contact.name.strip() if case and case.contact.name.strip() else "Customer"
+    coa_resolution = facts.get("coa_resolution")
+    if (
+        handoff.reason_code == "COA_REVIEW"
+        and isinstance(coa_resolution, dict)
+        and coa_resolution.get("action") == "NO_COA_AVAILABLE"
+    ):
+        missing = [
+            str(item).strip()
+            for item in (facts.get("missing_coa_queries") or [])
+            if str(item).strip()
+        ]
+        product_label = ", ".join(missing) or str(
+            coa_resolution.get("product_query") or "the requested product"
+        )
+        prior_delivery = bool(facts.get("partial_coa_outbox_id"))
+        opening = (
+            "The available COA documents were sent separately. "
+            if prior_delivery
+            else ""
+        )
+        return {
+            "subject": subject[:998],
+            "body_text": (
+                f"Dear {contact_name},\n\n{opening}"
+                f"At present, we are unable to provide a COA for {product_label}. "
+                "We will be glad to update you if it becomes available."
+            )[:50_000],
+        }
     opening_by_reason = {
         "PRICE_NEGOTIATION": (
             "Thank you for your feedback on our quotation. We are reviewing your pricing request "
@@ -3685,7 +3715,7 @@ async def answer_assistance_request(
                 actor=admin,
                 note=answer.note,
             )
-        elif answer.product_query is not None:
+        elif answer.coa_resolution is not None or answer.product_query is not None:
             result = await answer_coa_lookup_assistance(
                 session,
                 request_id=request_id,
@@ -3693,9 +3723,10 @@ async def answer_assistance_request(
                 cas_number=answer.cas_number,
                 actor=admin,
                 note=answer.note,
+                coa_resolution=answer.coa_resolution or "RETRY_LOOKUP",
             )
         else:
-            raise ValueError("answer requires category_id or product_query")
+            raise ValueError("answer requires category_id or a COA resolution")
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {

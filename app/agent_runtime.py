@@ -30,6 +30,8 @@ PRODUCT_CATEGORY_REQUEST_TYPE = "PRODUCT_CATEGORY_SELECTION"
 PRODUCT_CATEGORY_REQUEST_KEY = "select-product-category"
 COA_LOOKUP_REQUEST_TYPE = "COA_LOOKUP_CORRECTION"
 COA_LOOKUP_REQUEST_KEY = "correct-coa-lookup"
+COA_RETRY_LOOKUP_ACTION = "RETRY_LOOKUP"
+COA_NO_AVAILABLE_ACTION = "NO_COA_AVAILABLE"
 CAS_NUMBER_PATTERN = re.compile(r"^\d{2,7}-\d{2}-\d$")
 
 
@@ -162,47 +164,82 @@ async def ensure_handoff_agent_run(
         run.status = AgentRunStatus.WAITING_HUMAN
         facts["assistance_request_id"] = request.id
 
+    missing_coas = facts.get("missing_coa_queries")
+    has_missing_coas = isinstance(missing_coas, list) and bool(missing_coas)
+    prepared_coas = facts.get("prepared_coas")
+    has_prepared_coas = isinstance(facts.get("prepared_coa"), dict) or (
+        isinstance(prepared_coas, list) and bool(prepared_coas)
+    )
     if (
         handoff.reason_code == "COA_REVIEW"
-        and facts.get("intent") == "coa_request"
-        and not isinstance(facts.get("prepared_coa"), dict)
+        and (facts.get("intent") == "coa_request" or facts.get("coa_requested") is True)
+        and (has_missing_coas or not has_prepared_coas)
     ):
         request = await session.scalar(
-            select(AssistanceRequest).where(
+            select(AssistanceRequest)
+            .where(
                 AssistanceRequest.run_id == run.id,
-                AssistanceRequest.request_key == COA_LOOKUP_REQUEST_KEY,
+                AssistanceRequest.request_type == COA_LOOKUP_REQUEST_TYPE,
+                AssistanceRequest.status.in_(
+                    [AssistanceStatus.OPEN, AssistanceStatus.ANSWERED]
+                ),
             )
+            .order_by(AssistanceRequest.id.desc())
+            .limit(1)
         )
         if request is None:
-            lookup = facts.get("coa_lookup")
-            matches = lookup.get("matches") if isinstance(lookup, dict) else []
+            prior_request_count = int(
+                await session.scalar(
+                    select(func.count(AssistanceRequest.id)).where(
+                        AssistanceRequest.run_id == run.id,
+                        AssistanceRequest.request_type == COA_LOOKUP_REQUEST_TYPE,
+                    )
+                )
+                or 0
+            )
+            request_key = (
+                COA_LOOKUP_REQUEST_KEY
+                if prior_request_count == 0
+                else f"{COA_LOOKUP_REQUEST_KEY}-{prior_request_count + 1}"
+            )
+            lookup_rows = facts.get("coa_lookups")
+            if not isinstance(lookup_rows, list):
+                lookup_rows = [{"result": facts.get("coa_lookup") or {}}]
             options: list[dict[str, Any]] = []
-            for match in matches if isinstance(matches, list) else []:
-                if not isinstance(match, dict):
-                    continue
-                for candidate in match.get("candidates") or []:
-                    if isinstance(candidate, dict):
-                        options.append(
-                            {
-                                "path": str(candidate.get("path") or ""),
-                                "accepted_name": bool(candidate.get("accepted_name")),
-                                "reason": str(candidate.get("reason") or ""),
-                            }
-                        )
+            for lookup_row in lookup_rows:
+                result = lookup_row.get("result") if isinstance(lookup_row, dict) else {}
+                matches = result.get("matches") if isinstance(result, dict) else []
+                for match in matches if isinstance(matches, list) else []:
+                    if not isinstance(match, dict):
+                        continue
+                    for candidate in match.get("candidates") or []:
+                        if isinstance(candidate, dict):
+                            options.append(
+                                {
+                                    "query": str(lookup_row.get("query") or ""),
+                                    "path": str(candidate.get("path") or ""),
+                                    "accepted_name": bool(candidate.get("accepted_name")),
+                                    "reason": str(candidate.get("reason") or ""),
+                                }
+                            )
             request = AssistanceRequest(
                 run_id=run.id,
                 handoff_id=handoff.id,
-                request_key=COA_LOOKUP_REQUEST_KEY,
+                request_key=request_key,
                 request_type=COA_LOOKUP_REQUEST_TYPE,
                 question=(
-                    "请先在 NAS 中补充或重命名为无中文、无日期/客户/专用后缀的标准英文 COA，"
-                    "等待目录同步后，再填写可唯一匹配的产品名、产品代码或 CAS。Agent 会从断点"
-                    "重新检索；仍不唯一时不会发送。"
+                    "请选择处理方式：若已有正确文件，请在 NAS/目录中补充或更正标准英文 COA 后"
+                    "重新检索；若该产品目前确实没有 COA，请标记为暂无 COA，并在下方人工回复区"
+                    "向客户说明。已找到的其他产品 COA 不受影响。"
                 ),
                 response_schema={
                     "type": "object",
-                    "required": ["product_query"],
+                    "required": ["coa_resolution"],
                     "properties": {
+                        "coa_resolution": {
+                            "type": "string",
+                            "enum": [COA_RETRY_LOOKUP_ACTION, COA_NO_AVAILABLE_ACTION],
+                        },
                         "product_query": {"type": "string", "minLength": 1, "maxLength": 255},
                         "cas_number": {"type": "string", "maxLength": 32},
                         "note": {"type": "string", "maxLength": 2000},
@@ -380,17 +417,25 @@ async def answer_coa_lookup_assistance(
     session: AsyncSession,
     *,
     request_id: int,
-    product_query: str,
+    product_query: str | None,
     cas_number: str | None,
     actor: str,
     note: str = "",
+    coa_resolution: str = COA_RETRY_LOOKUP_ACTION,
 ) -> AssistanceAnswerResult:
-    """Record a corrected COA lookup key and queue one versioned continuation."""
+    """Retry a corrected lookup or record that the COA is unavailable."""
 
-    clean_query = product_query.strip()
+    clean_resolution = coa_resolution.strip().upper()
+    if clean_resolution not in {COA_RETRY_LOOKUP_ACTION, COA_NO_AVAILABLE_ACTION}:
+        raise ValueError("invalid COA resolution action")
+    clean_query = (product_query or "").strip()
     clean_cas = (cas_number or "").strip()
-    if not clean_query or len(clean_query) > 255:
+    if clean_resolution == COA_RETRY_LOOKUP_ACTION and (
+        not clean_query or len(clean_query) > 255
+    ):
         raise ValueError("product_query must contain 1 to 255 characters")
+    if len(clean_query) > 255:
+        raise ValueError("product_query must contain at most 255 characters")
     if clean_cas and not CAS_NUMBER_PATTERN.fullmatch(clean_cas):
         raise ValueError("cas_number must use the standard digits-digits-digit format")
     request = await session.scalar(
@@ -409,6 +454,7 @@ async def answer_coa_lookup_assistance(
     if run is None or handoff is None:
         raise ValueError("assistance request has no active Agent run or handoff")
     answer = {
+        "coa_resolution": clean_resolution,
         "product_query": clean_query,
         "cas_number": clean_cas or None,
         "note": note.strip(),
@@ -446,9 +492,73 @@ async def answer_coa_lookup_assistance(
 
     now = datetime.now(UTC)
     request.answer_json = answer
-    request.status = AssistanceStatus.ANSWERED
     request.answered_by = actor[:128]
     request.answered_at = now
+    if clean_resolution == COA_NO_AVAILABLE_ACTION:
+        request.status = AssistanceStatus.APPLIED
+        request.applied_at = now
+        run.status = AgentRunStatus.WAITING_HUMAN
+        run.current_step = "manual-coa-reply"
+        run.last_error = None
+        run.context_json = {
+            **(run.context_json or {}),
+            "coa_resolution": clean_resolution,
+            "answered_by": actor[:128],
+        }
+        handoff.extracted_facts = {
+            **(handoff.extracted_facts or {}),
+            "coa_resolution": {
+                "action": clean_resolution,
+                "product_query": clean_query or None,
+                "cas_number": clean_cas or None,
+                "note": note.strip(),
+                "answered_by": actor[:128],
+            },
+        }
+        unavailable = clean_query or ", ".join(
+            str(item)
+            for item in (handoff.extracted_facts.get("missing_coa_queries") or [])
+            if str(item).strip()
+        )
+        handoff.summary = (
+            f"COA currently unavailable for {unavailable}; manual customer reply required"
+            if unavailable
+            else "COA currently unavailable; manual customer reply required"
+        )
+        sequence = await _next_step_sequence(session, run.id)
+        session.add(
+            AgentStep(
+                run_id=run.id,
+                sequence=sequence,
+                kind="HUMAN_INPUT",
+                idempotency_key=f"assistance-answer:{request.id}",
+                status=AgentStepStatus.COMPLETED,
+                input_json={
+                    "assistance_request_id": request.id,
+                    "request_type": request.request_type,
+                },
+                output_json=answer,
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        session.add(
+            AuditEvent(
+                case_id=run.case_id,
+                actor=actor[:128],
+                event_type="agent.coa_unavailable_confirmed",
+                data={
+                    "agent_run_id": run.id,
+                    "assistance_request_id": request.id,
+                    "product_query": clean_query or None,
+                    "cas_number": clean_cas or None,
+                },
+            )
+        )
+        await session.commit()
+        return AssistanceAnswerResult(request, run, None, True)
+
+    request.status = AssistanceStatus.ANSWERED
     run.version += 1
     run.status = AgentRunStatus.RESUME_QUEUED
     run.current_step = "resume-coa-lookup"

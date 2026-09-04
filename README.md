@@ -847,13 +847,20 @@ attachments are regenerated or re-read at approval. A quote approval rechecks
 the active price-policy source hash, commercial price/inventory cycle, quote
 history, expiry, quantity, standard terms, and calculated price. Ambiguous COA
 matches and missing standard files remain open as `COA_REVIEW` handoffs rather
-than guessing.
+than guessing. For a multi-product request, every uniquely matched and
+hash-verified COA may be sent while unresolved products remain in the handoff;
+the customer-facing reply explicitly lists the documents that are not included.
+The assistance form lets a reviewer retry after the catalog is updated or mark
+the remaining product as currently having no COA and continue with an editable
+manual reply. A one-off file can also be attached through the manual reply form
+without granting the application write access to the NAS.
 
 Every handoff created from an inbound email also has a durable `AgentRun` and
 step trace. The run remains `WAITING_HUMAN` until the reviewer resolves or
 approves it. Product-category selection and a missing/ambiguous COA have typed
-assistance forms: the answer queues one versioned resume job, re-runs current
-catalog/safety checks, and continues from the original email. Other high-risk
+assistance forms: a corrected lookup queues one versioned resume job and re-runs
+current catalog/safety checks; a confirmed unavailable COA stays open for a
+manual customer reply. Other high-risk
 handoffs remain normal human-controlled tasks; resolving, replying, or taking
 over the case finalizes the related run instead of silently abandoning it.
 

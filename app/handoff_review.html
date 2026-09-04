@@ -167,10 +167,18 @@
             <select id="assistance-category"></select>
           </div>
           <div class="hidden" id="assistance-coa-fields">
-            <label for="assistance-coa-query">修正后的产品名或产品代码</label>
-            <input id="assistance-coa-query" maxlength="255" placeholder="例如：LANOPAP-DF 4234">
-            <label for="assistance-coa-cas">CAS（可选）</label>
-            <input id="assistance-coa-cas" maxlength="32" placeholder="例如：919-30-2">
+            <label for="assistance-coa-action">处理方式</label>
+            <select id="assistance-coa-action">
+              <option value="RETRY_LOOKUP">已补充或更正 COA，重新检索</option>
+              <option value="NO_COA_AVAILABLE">该产品目前没有 COA，转人工回复</option>
+            </select>
+            <div id="assistance-coa-retry-fields">
+              <label for="assistance-coa-query">修正后的产品名或产品代码</label>
+              <input id="assistance-coa-query" maxlength="255" placeholder="例如：LANOPAP-DF 4234">
+              <label for="assistance-coa-cas">CAS（可选）</label>
+              <input id="assistance-coa-cas" maxlength="32" placeholder="例如：919-30-2">
+            </div>
+            <div class="file-help">也可以直接使用下方“人工回复”的附件入口发送一次性文件；NAS 映射仍保持只读。</div>
           </div>
           <label for="assistance-note">选择依据（可选）</label>
           <input id="assistance-note" maxlength="2000" placeholder="例如：根据客户主营业务确认发送该系列">
@@ -465,8 +473,12 @@
         $("#assistance-category").value = String(request.answer.category_id);
       }
       if (coaLookup) {
+        $("#assistance-coa-action").value = request.answer?.coa_resolution || "RETRY_LOOKUP";
         if (!$("#assistance-coa-query").value) {
-          $("#assistance-coa-query").value = request.answer?.product_query || data.facts?.coa_query || "";
+          $("#assistance-coa-query").value = request.answer?.product_query
+            || (data.facts?.missing_coa_queries || [])[0]
+            || data.facts?.coa_query
+            || "";
         }
         if (!$("#assistance-coa-cas").value) {
           $("#assistance-coa-cas").value = request.answer?.cas_number || data.facts?.coa_cas_number || "";
@@ -474,12 +486,20 @@
       }
       const retryable = request.status === "ANSWERED" && run?.status === "BLOCKED";
       const open = (request.status === "OPEN" || retryable) && data.status === "OPEN";
+      const coaAction = $("#assistance-coa-action").value;
+      const retryLookup = coaAction === "RETRY_LOOKUP";
       $("#assistance-category").disabled = !open || retryable;
-      $("#assistance-coa-query").disabled = !open || retryable;
-      $("#assistance-coa-cas").disabled = !open || retryable;
+      $("#assistance-coa-action").disabled = !open || retryable;
+      $("#assistance-coa-retry-fields").classList.toggle("hidden", coaLookup && !retryLookup);
+      $("#assistance-coa-query").disabled = !open || retryable || !retryLookup;
+      $("#assistance-coa-cas").disabled = !open || retryable || !retryLookup;
       $("#assistance-note").disabled = !open;
-      $("#answer-assistance").disabled = !open || (coaLookup ? !$("#assistance-coa-query").value.trim() : choices.length === 0);
-      $("#answer-assistance").textContent = retryable ? "重新尝试继续处理" : "提交并让 Agent 继续";
+      $("#answer-assistance").disabled = !open || (coaLookup ? (retryLookup && !$("#assistance-coa-query").value.trim()) : choices.length === 0);
+      $("#answer-assistance").textContent = retryable
+        ? "重新尝试继续处理"
+        : coaLookup && !retryLookup
+          ? "确认暂无 COA，转人工回复"
+          : "提交并让 Agent 继续";
       $("#assistance-state").textContent = request.status === "OPEN"
         ? "提交后会创建幂等恢复任务；发送前仍会重新检查授权、附件和收件安全。"
         : request.status === "ANSWERED"
@@ -925,10 +945,23 @@
       $("#remote-image-help").textContent = `已加载 ${loaded} 张；${linked ? `${linked} 张非 HTTPS 图片仅提供新窗口链接。` : "远程图片不会保存到本服务器。"}`;
     });
     $("#reply-attachments").addEventListener("change", renderAttachments);
+    $("#assistance-coa-action").addEventListener("change", () => {
+      const retryLookup = $("#assistance-coa-action").value === "RETRY_LOOKUP";
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN");
+      const open = Boolean(request) && state?.status === "OPEN";
+      $("#assistance-coa-retry-fields").classList.toggle("hidden", !retryLookup);
+      $("#assistance-coa-query").disabled = !open || !retryLookup;
+      $("#assistance-coa-cas").disabled = !open || !retryLookup;
+      $("#answer-assistance").disabled = !open || (retryLookup && !$("#assistance-coa-query").value.trim());
+      $("#answer-assistance").textContent = retryLookup
+        ? "提交并让 Agent 继续"
+        : "确认暂无 COA，转人工回复";
+    });
     $("#assistance-coa-query").addEventListener("input", () => {
       const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN");
       if (request?.request_type === "COA_LOOKUP_CORRECTION" && state?.status === "OPEN") {
-        $("#answer-assistance").disabled = !$("#assistance-coa-query").value.trim();
+        $("#answer-assistance").disabled = $("#assistance-coa-action").value === "RETRY_LOOKUP"
+          && !$("#assistance-coa-query").value.trim();
       }
     });
     $("#answer-assistance").addEventListener("click", async () => {
@@ -938,26 +971,38 @@
           : null);
       const categoryId = Number($("#assistance-category").value);
       const coaLookup = request?.request_type === "COA_LOOKUP_CORRECTION";
+      const coaResolution = $("#assistance-coa-action").value;
+      const retryLookup = coaResolution === "RETRY_LOOKUP";
       const productQuery = $("#assistance-coa-query").value.trim();
-      if (!request || (coaLookup ? !productQuery : !categoryId)) {
+      if (!request || (coaLookup ? (retryLookup && !productQuery) : !categoryId)) {
         notice(coaLookup ? "请填写重新检索使用的产品名或代码。" : "请选择需要发送的产品系列。", "error");
         return;
       }
-      if (!confirm(coaLookup ? "确认已补充标准英文 COA，并用该产品信息重新检索？" : "确认该产品系列？Agent 将保存答案并从中断位置继续处理邮件。")) return;
+      const coaConfirm = retryLookup
+        ? "确认已补充或更正标准英文 COA，并用该产品信息重新检索？"
+        : "确认该产品目前没有可提供的 COA，并转到人工回复？系统不会虚构或自动发送缺失附件。";
+      if (!confirm(coaLookup ? coaConfirm : "确认该产品系列？Agent 将保存答案并从中断位置继续处理邮件。")) return;
       $("#answer-assistance").disabled = true;
       try {
         const result = await api(`/admin/assistance-requests/${request.id}/answer`, {
           method:"POST",
           body:JSON.stringify(coaLookup ? {
-            product_query:productQuery,
-            cas_number:$("#assistance-coa-cas").value.trim() || null,
+            coa_resolution:coaResolution,
+            product_query:productQuery || null,
+            cas_number:retryLookup ? ($("#assistance-coa-cas").value.trim() || null) : null,
             note:$("#assistance-note").value.trim(),
           } : {
             category_id:categoryId,
             note:$("#assistance-note").value.trim(),
           }),
         });
-        notice(`答案已保存，恢复任务 #${result.resume_job_id || "已存在"} 已排队。`);
+        notice(result.resume_job_id
+          ? `答案已保存，恢复任务 #${result.resume_job_id} 已排队。`
+          : "已记录暂无 COA，请在下方核对并发送人工回复。", "ok");
+        if (coaLookup && !retryLookup) {
+          $("#reply-subject").value = "";
+          $("#reply-body").value = "";
+        }
         await load();
       } catch (error) {
         notice(error.message, "error");

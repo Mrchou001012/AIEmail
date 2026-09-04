@@ -182,3 +182,103 @@ async def test_coa_human_correction_resumes_to_verified_review_draft(
     await db_session.refresh(run)
     assert handoff.status == "RESOLVED"
     assert run.status == AgentRunStatus.COMPLETED
+
+
+async def test_mixed_request_can_mark_missing_coa_for_manual_reply(
+    db_session: AsyncSession,
+) -> None:
+    customer = Customer(
+        company_name="Missing COA Test Customer",
+        language="en",
+        auto_send_allowed=True,
+        consent_basis="test",
+        metadata_json={},
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    contact = Contact(
+        customer_id=customer.id,
+        name="Buyer",
+        email="missing-coa@example.com",
+        language="en",
+        metadata_json={},
+    )
+    db_session.add(contact)
+    await db_session.flush()
+    sales_case = SalesCase(
+        customer_id=customer.id,
+        contact_id=contact.id,
+        product_id=None,
+        category_id=None,
+        currency="USD",
+        stage=CaseStage.QUOTING,
+        status=CaseStatus.ACTIVE,
+        subject_key="mixed-missing-coa",
+    )
+    db_session.add(sales_case)
+    await db_session.flush()
+    email = EmailMessage(
+        case_id=sales_case.id,
+        customer_id=customer.id,
+        contact_id=contact.id,
+        direction="INBOUND",
+        message_id="<missing-coa@example.com>",
+        references_json=[],
+        from_address=contact.email,
+        to_addresses=["sales@example.com"],
+        subject="Quote and COAs",
+        body_text="Please quote and send the COAs for HMDS and TMCS.",
+        attachment_metadata=[],
+        raw_sha256="2" * 64,
+    )
+    db_session.add(email)
+    await db_session.flush()
+    analysis = InboundAnalysis(
+        intent=Intent.QUOTE_REQUEST,
+        intent_confidence=0.99,
+        coa_requested=True,
+        requested_product_name="YAC-HMDS",
+        product_confidence=0.99,
+        numeric_confidence=1.0,
+    )
+    handoff = await create_handoff(
+        db_session,
+        case=sales_case,
+        reason=HandoffReason.COA_REVIEW,
+        summary="Sent one available COA; one requires human handling",
+        facts={
+            **analysis.model_dump(mode="json"),
+            "missing_coa_queries": ["YAC-TMCS"],
+            "prepared_coas": [{"product_name": "YAC-HMDS"}],
+            "partial_coa_outbox_id": 123,
+        },
+        source_email_id=email.id,
+    )
+    run = await db_session.scalar(select(AgentRun).where(AgentRun.handoff_id == handoff.id))
+    assert run is not None
+    request = await db_session.scalar(
+        select(AssistanceRequest).where(AssistanceRequest.run_id == run.id)
+    )
+    assert request is not None
+    assert request.status == AssistanceStatus.OPEN
+
+    result = await answer_coa_lookup_assistance(
+        db_session,
+        request_id=request.id,
+        product_query="YAC-TMCS",
+        cas_number=None,
+        actor="reviewer",
+        note="No standard COA currently exists",
+        coa_resolution="NO_COA_AVAILABLE",
+    )
+
+    assert result.job is None
+    await db_session.refresh(request)
+    await db_session.refresh(run)
+    await db_session.refresh(handoff)
+    assert request.status == AssistanceStatus.APPLIED
+    assert run.status == AgentRunStatus.WAITING_HUMAN
+    assert run.current_step == "manual-coa-reply"
+    assert handoff.status == "OPEN"
+    assert handoff.extracted_facts["coa_resolution"]["action"] == "NO_COA_AVAILABLE"
+    assert "manual customer reply required" in handoff.summary

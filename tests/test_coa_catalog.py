@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app.coa_catalog import COACatalog, COACatalogScanner, COAFindStatus
+from app.coa_delivery import prepare_coa_response
 
 
 def _pdf(path: Path, payload: bytes = b"fake pdf") -> None:
@@ -124,3 +126,63 @@ def test_verified_attachment_rejects_file_changed_after_scan(
 
     with pytest.raises(ValueError, match="changed after catalog selection"):
         catalog.read_verified_attachment(result.matches[0])
+
+
+def test_prepare_coa_response_verifies_every_product_in_mixed_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "PRODUCT DOCS"
+    _pdf(root / "SILANES" / "YAC-HMDS" / "COA-YAC-HMDS.pdf", b"hmds")
+    _pdf(root / "SILANES" / "YAC-TMCS" / "COA-YAC-TMCS.pdf", b"tmcs")
+    output = tmp_path / "coa.json"
+    monkeypatch.setattr(
+        "app.coa_catalog.extract_document_bounded",
+        lambda path, timeout_seconds: "",
+    )
+    COACatalogScanner(root=root, output_path=output).scan()
+    settings = SimpleNamespace(coa_catalog_enabled=True, coa_catalog_path=output)
+
+    response = prepare_coa_response(
+        settings=settings,
+        contact_name="Buyer",
+        original_subject="Please quote HMDS and TMCS",
+        product_queries=["YAC-HMDS", "YAC-TMCS"],
+    )
+
+    assert response.product_names == ("YAC-HMDS", "YAC-TMCS")
+    assert [item.filename for item in response.attachments] == [
+        "COA-YAC-HMDS.pdf",
+        "COA-YAC-TMCS.pdf",
+    ]
+    assert [item.payload for item in response.attachments] == [b"hmds", b"tmcs"]
+
+
+def test_prepare_coa_response_returns_verified_available_files_and_missing_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "PRODUCT DOCS"
+    _pdf(root / "SILANES" / "YAC-HMDS" / "COA-YAC-HMDS.pdf", b"hmds")
+    output = tmp_path / "coa.json"
+    monkeypatch.setattr(
+        "app.coa_catalog.extract_document_bounded",
+        lambda path, timeout_seconds: "",
+    )
+    COACatalogScanner(root=root, output_path=output).scan()
+
+    response = prepare_coa_response(
+        settings=SimpleNamespace(coa_catalog_enabled=True, coa_catalog_path=output),
+        contact_name="Buyer",
+        original_subject="Please send HMDS and TMCS COAs",
+        product_queries=["YAC-HMDS", "YAC-TMCS"],
+    )
+
+    assert response.product_names == ("YAC-HMDS",)
+    assert response.missing_queries == ("YAC-TMCS",)
+    assert [item.payload for item in response.attachments] == [b"hmds"]
+    assert "YAC-TMCS is not included" in response.body_text
+    facts = response.as_facts()
+    assert facts["coa_partial"] is True
+    assert facts["missing_coa_queries"] == ["YAC-TMCS"]
+    assert "prepared_coa" not in facts

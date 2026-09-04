@@ -131,6 +131,14 @@ With `COA_AUTO_SEND_ENABLED=false`, an exact verified match creates an editable
 exact NAS file, checks that its SHA-256 still matches the catalog, embeds it as
 a PDF attachment, and only then queues the customer email.
 
+For a multi-product request in autonomous mode, available uniquely matched COAs
+are sent without waiting for unavailable ones. The reply names any omitted
+products, and the remaining products stay in a `COA_REVIEW` task. The reviewer
+can retry after refreshing the approved catalog, mark the product as currently
+having no COA and edit a manual explanation, or use the manual reply attachment
+field for a controlled one-off response. None of these paths writes to the
+read-only NAS mount.
+
 Use the authenticated administration endpoints to verify the live state:
 
 - `GET /admin/coa/status` — scan completion, counts, warnings, root and poll
