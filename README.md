@@ -826,6 +826,13 @@ reuse their extraction record; changed and deleted files update the catalog.
 Before an approved draft is queued, the application reads the NAS file again
 and requires the SHA-256 hash to match the selected catalog entry.
 
+The direct Linux/systemd production service can use the Synology share through
+its server-side read-only mapping. Configure `COA_CATALOG_ROOT` with the local
+POSIX mount path (not the Windows UNC path), and use absolute `/opt/aiemail`
+paths for the catalog and approved product metadata. The production inventory,
+safe activation, verification, and rollback procedure is in
+[`docs/coa-production-rollout.md`](docs/coa-production-rollout.md).
+
 During observation/testing, keep all three workflow switches false:
 
 ```dotenv

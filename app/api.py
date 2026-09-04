@@ -1626,6 +1626,7 @@ async def coa_catalog_status(
     )
     return {
         "enabled": settings.coa_catalog_enabled,
+        "scan_enabled": settings.coa_catalog_scan_enabled,
         "auto_send_enabled": settings.coa_auto_send_enabled,
         "poll_seconds": settings.coa_catalog_poll_seconds,
         "root": str(settings.coa_catalog_root),

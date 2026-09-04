@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     )
     coa_catalog_path: Path = Path("runtime/coa_catalog/catalog.json")
     coa_product_catalog_path: Path = Path("config/product_catalog.yaml")
+    # Catalog lookup and background NAS traversal are separate controls so a
+    # prebuilt catalog can be used safely across a high-latency network path.
+    coa_catalog_scan_enabled: bool = True
     coa_catalog_poll_seconds: int = 300
     coa_catalog_max_file_mb: int = 50
     coa_catalog_file_timeout_seconds: int = 15

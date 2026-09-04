@@ -88,7 +88,11 @@ async def main() -> None:
         if settings.nas_knowledge_enabled and loop_time >= next_nas_knowledge_scan:
             did_work = await _run_local_step("nas-knowledge", _nas_scanner(settings).scan) or did_work
             next_nas_knowledge_scan = loop_time + settings.nas_knowledge_poll_seconds
-        if settings.coa_catalog_enabled and loop_time >= next_coa_catalog_scan:
+        if (
+            settings.coa_catalog_enabled
+            and settings.coa_catalog_scan_enabled
+            and loop_time >= next_coa_catalog_scan
+        ):
             did_work = await _run_local_step("coa-catalog", _coa_scanner(settings).scan) or did_work
             next_coa_catalog_scan = loop_time + settings.coa_catalog_poll_seconds
         did_work = await _run_step("reconcile", reconcile_unknown_outbox) or did_work
