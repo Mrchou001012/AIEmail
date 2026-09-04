@@ -1660,7 +1660,7 @@ async def test_multiple_referral_addresses_have_canonical_order(
     )
 
 
-async def test_automatic_apply_respects_blockers_but_manual_confirmation_can_override(
+async def test_undated_absence_cannot_be_applied_even_with_manual_confirmation(
     db_session: AsyncSession,
 ) -> None:
     _, contact = await _seed_contact(
@@ -1680,8 +1680,10 @@ async def test_automatic_apply_respects_blockers_but_manual_confirmation_can_ove
     await db_session.commit()
     plan = await build_disposition_plan(db_session, row)
     assert "RETURN_DATE_NOT_RELIABLE" in plan["blockers"]
-    assert plan["can_apply"] is True
-    assert plan["application_blockers"] == []
+    assert plan["can_apply"] is False
+    assert plan["application_blockers"] == ["RETURN_DATE_NOT_RELIABLE"]
+    assert "REVIEW_RETURN_DATE" in plan["proposed_actions"]
+    assert "PAUSE_CONTACT" not in plan["proposed_actions"]
 
     settings = get_settings()
     original = settings.inbound_disposition_apply_enabled
@@ -1693,22 +1695,19 @@ async def test_automatic_apply_respects_blockers_but_manual_confirmation_can_ove
         await db_session.refresh(contact)
         assert contact.lifecycle_status == "ACTIVE"
 
-        assert (
-            await apply_email_disposition(
-                db_session,
-                row,
-                settings=settings,
-                actor="admin:test",
-                force_manual=True,
-            )
-            is True
-        )
+        assert await apply_email_disposition(
+            db_session,
+            row,
+            settings=settings,
+            actor="admin:test",
+            force_manual=True,
+        ) is False
         await db_session.commit()
     finally:
         settings.inbound_disposition_apply_enabled = original
 
     await db_session.refresh(contact)
-    assert contact.lifecycle_status == "TEMPORARILY_UNAVAILABLE"
+    assert contact.lifecycle_status == "ACTIVE"
     assert contact.unavailable_until is None
 
 

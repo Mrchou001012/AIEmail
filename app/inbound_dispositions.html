@@ -24,28 +24,39 @@
     button:disabled { opacity:.5; cursor:wait; }
     button.secondary { background:#eef4ff; color:#1849a9; }
     button.danger { background:#fff1f0; color:var(--red); }
-    .action-stack { display:grid; gap:8px; align-items:start; }
+    .action-stack { display:flex; gap:8px; align-items:center; justify-content:flex-end; flex-wrap:wrap; }
     .action-stack label { display:flex; gap:6px; align-items:flex-start; font-size:12px; color:var(--muted); }
     .summary { justify-content:flex-start; padding:12px 16px; border-bottom:1px solid var(--line); }
     .pill { display:inline-flex; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:#eef4ff; color:#1849a9; white-space:nowrap; }
     .pill.good { background:#ecfdf3; color:var(--green); }
     .pill.warn { background:#fffaeb; color:var(--amber); }
     .pill.bad { background:#fff1f0; color:var(--red); }
-    .table-wrap { overflow:auto; max-height:72vh; }
-    table { width:100%; min-width:1320px; border-collapse:collapse; table-layout:fixed; }
-    th,td { padding:10px 11px; text-align:left; border-bottom:1px solid #eef1f5; vertical-align:top; overflow-wrap:anywhere; }
-    th { position:sticky; top:0; z-index:1; background:#f8fafc; color:var(--muted); font-size:12px; }
-    th:nth-child(1),td:nth-child(1) { width:11%; }
-    th:nth-child(2),td:nth-child(2) { width:18%; }
-    th:nth-child(3),td:nth-child(3) { width:15%; }
-    th:nth-child(4),td:nth-child(4) { width:16%; }
-    th:nth-child(5),td:nth-child(5) { width:14%; }
-    th:nth-child(6),td:nth-child(6) { width:16%; }
-    th:nth-child(7),td:nth-child(7) { width:10%; }
+    .result-list { overflow:auto; max-height:72vh; }
+    .result-card { padding:16px; border-bottom:1px solid #e7ebf1; }
+    .result-card:last-child { border-bottom:0; }
+    .result-card:hover { background:#fbfcfe; }
+    .result-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+    .result-head > .action-stack { flex:0 1 420px; max-width:42%; }
+    .result-title { min-width:0; }
+    .result-title-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .result-title strong { font-size:16px; }
+    .result-meta { color:var(--muted); margin-top:4px; overflow-wrap:anywhere; }
+    .result-grid { display:grid; grid-template-columns:minmax(220px,1fr) minmax(240px,1.15fr) minmax(240px,1.15fr); gap:12px; margin-top:14px; }
+    .result-panel { min-width:0; padding:12px; border:1px solid #e7ebf1; border-radius:10px; background:#fff; overflow-wrap:anywhere; }
+    .result-panel h3 { margin:0 0 8px; color:#475467; font-size:12px; letter-spacing:.04em; }
+    .pill-list { display:flex; gap:6px; flex-wrap:wrap; }
+    .pill-list .pill { white-space:normal; overflow-wrap:anywhere; }
+    .record-details { margin-top:10px; }
+    .record-details summary { cursor:pointer; color:var(--blue); font-weight:700; }
+    .record-details[open] summary { margin-bottom:8px; }
+    .message-preview { padding:10px; border-radius:8px; background:#f8fafc; white-space:pre-wrap; overflow-wrap:anywhere; color:#344054; }
+    .action-details { width:100%; text-align:right; }
+    .action-details summary { cursor:pointer; color:var(--muted); font-size:12px; }
     .muted { color:var(--muted); font-size:12px; margin-top:3px; }
     .empty { padding:32px; text-align:center; color:var(--muted); }
     code { font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
-    @media (max-width:900px) { .shell { padding:14px; } .table-wrap { max-height:none; } }
+    @media (max-width:1100px) { .result-grid { grid-template-columns:1fr 1fr; } }
+    @media (max-width:720px) { .shell { padding:12px; } .result-list { max-height:none; } .result-head { display:block; } .result-head > .action-stack { max-width:none; } .action-stack { justify-content:flex-start; margin-top:12px; } .result-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -73,19 +84,15 @@
         <div class="sub" id="status">尚未运行</div>
       </div>
       <div class="summary" id="summary"></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>处置</th><th>邮件</th><th>联系人解析</th><th>建议动作</th><th>安全边界</th><th>新正文</th><th>人工操作</th></tr></thead>
-          <tbody id="rows"><tr><td colspan="7" class="empty">点击“运行审计”查看结果</td></tr></tbody>
-        </table>
-      </div>
+      <div class="result-list" id="rows"><div class="empty">点击“运行审计”查看结果</div></div>
     </section>
   </main>
   <script>
     const $ = (selector) => document.querySelector(selector);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
     const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",CONTACT_IDENTITY_MISMATCH:"联系人身份不匹配",NON_TARGET:"非目标客户",UNCERTAIN:"无法确定",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
-    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱",CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW:"回复来自不同公司域名，必须核对父邮件和客户关系",QUOTED_PARENT_REQUIRES_REVIEW:"邮件缺少线程头，已通过正文引用恢复父邮件，必须人工核对",PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW:"离职对象由父邮件恢复，必须人工核对",CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION:"离职回复与原联系人域名不同，不能自动确定客户关系"};
+    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",RETURN_DATE_NOT_RELIABLE:"缺少可靠返岗日期，不能安全暂停联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱",CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW:"回复来自不同公司域名，必须核对父邮件和客户关系",QUOTED_PARENT_REQUIRES_REVIEW:"邮件缺少线程头，已通过正文引用恢复父邮件，必须人工核对",PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW:"离职对象由父邮件恢复，必须人工核对",CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION:"离职回复与原联系人域名不同，不能自动确定客户关系"};
+    const actionLabels = {IGNORE_AUTOREPLY:"忽略自动回复",PAUSE_CONTACT:"暂停联系人",RECORD_EXPIRED_ABSENCE:"记录已结束休假",REVIEW_RETURN_DATE:"复核返岗日期",SUPPRESS_DEPARTED_CONTACT:"停用离职联系人",SAVE_REFERRALS:"保存推荐联系人",KEEP_VERIFIED_REPLY_CONTACT:"保留已验证回复人",CREATE_REPLY_CONTACT:"创建回复联系人",CONTINUE_BUSINESS_PIPELINE:"继续业务流程",CREATE_REVIEW_CASE:"创建待审核案例",WAIT_FOR_FORWARDED_REPLY:"等待被转发人回复",REVIEW_NEW_CONTACT_OUTREACH:"复核新联系人触达",QUEUE_REFERRAL_OUTREACH:"加入新联系人发件队列",MARK_CUSTOMER_NON_TARGET:"标记非目标客户",STOP_REACTIVATION:"停止后续唤醒",REVIEW_CONTACT_IDENTITY:"复核联系人身份",REVIEW_CLASSIFICATION:"复核分类"};
     const blockerText = (values) => (values || []).map((value) => blockerLabels[value] || value).join("、");
     const batchStorageKey = "aiemail.inboundDispositionBatchId";
     let plansByEmail = new Map();
@@ -152,18 +159,20 @@
       }
     }
     function pills(values, kind = "") { return (values || []).map((value) => `<span class="pill ${kind}">${esc(value)}</span>`).join(" "); }
+    function actionPills(values) { return pills((values || []).map((value) => actionLabels[value] || value), "good"); }
     function operationCell(row) {
       const action = row.latest_action;
       if (action?.status === "APPLIED") {
         const queued = (action.applied_actions || []).includes("QUEUE_REFERRAL_OUTREACH");
         const queueState = queued ? '<span class="pill warn">已加入新联系人发件队列</span>' : "";
-        return `<div class="action-stack"><span class="pill good">已应用 #${action.id}</span>${queueState}<div class="muted">${esc((action.applied_actions || []).join(", "))}<br>${esc(action.applied_by)}<br>${esc(action.applied_at)}</div><button class="danger rollback" data-action-id="${action.id}" type="button">撤销</button></div>`;
+        const details = `<details class="action-details"><summary>查看执行记录</summary><div class="pill-list">${actionPills(action.applied_actions)}</div><div class="muted">${esc(action.applied_by)} · ${esc(action.applied_at)}</div></details>`;
+        return `<div class="action-stack"><span class="pill good">已应用 #${action.id}</span>${queueState}<button class="danger rollback" data-action-id="${action.id}" type="button">撤销</button>${details}</div>`;
       }
-      if (row.disposition_type === "BUSINESS") return '<span class="muted">继续原业务流程</span>';
-      if (["CONTACT_IDENTITY_MISMATCH", "UNCERTAIN"].includes(row.disposition_type)) return '<span class="pill warn">需要人工复核</span>';
-      if (row.can_apply === false) return `<span class="pill bad">当前无法应用</span><div class="muted">请先解决：${esc(blockerText(row.application_blockers))}</div>`;
-      if (row.batch_id && latestBatchId === null) return '<span class="muted">正在确认批次状态…</span>';
-      if (row.batch_id && Number(row.batch_id) !== latestBatchId) return '<span class="pill">历史批次只读</span>';
+      if (row.disposition_type === "BUSINESS") return '<div class="action-stack"><span class="muted">继续原业务流程</span></div>';
+      if (["CONTACT_IDENTITY_MISMATCH", "UNCERTAIN"].includes(row.disposition_type)) return '<div class="action-stack"><span class="pill warn">需要人工复核</span></div>';
+      if (row.can_apply === false) return `<div class="action-stack"><span class="pill bad">当前无法应用</span><div class="muted">请先解决：${esc(blockerText(row.application_blockers))}</div></div>`;
+      if (row.batch_id && latestBatchId === null) return '<div class="action-stack"><span class="muted">正在确认批次状态…</span></div>';
+      if (row.batch_id && Number(row.batch_id) !== latestBatchId) return '<div class="action-stack"><span class="pill">历史批次只读</span></div>';
       const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);
       const outreach = canOfferOutreach ? `<label><input class="outreach" data-email-id="${row.email_id}" type="checkbox"> 同时加入新联系人自动发件队列（总开关开启时可能立即发送）</label>` : "";
       const history = action?.status === "ROLLED_BACK" ? `<span class="pill warn">曾撤销 #${action.id}</span>` : "";
@@ -182,9 +191,9 @@
       plansByEmail = new Map(plans.map((row) => [Number(row.email_id), row]));
       $("#rows").innerHTML = plans.length ? plans.map((row) => {
         const blocked = (row.blockers || []).length > 0;
-        const contact = row.contact_id ? `处置联系人 #${row.contact_id}${row.contact_email ? ` · ${row.contact_email}` : ""}` : "未唯一识别联系人";
+        const contact = row.contact_id ? `#${row.contact_id}${row.contact_email ? ` · ${row.contact_email}` : ""}` : "未唯一识别联系人";
         const senderContact = row.sender_contact_id && row.sender_contact_id !== row.contact_id ? `<div class="muted">发件联系人 #${row.sender_contact_id}</div>` : "";
-        const customer = row.customer_id ? `客户 #${row.customer_id}${row.customer_name ? ` · ${row.customer_name}` : ""}` : "未识别客户";
+        const customer = row.customer_id ? `#${row.customer_id}${row.customer_name ? ` · ${row.customer_name}` : ""}` : "未识别客户";
         const parentResolution = row.contact_resolution_source === "EXACT_REACTIVATION_PARENT"
           ? `<div class="muted">关联依据：精确匹配唤醒父邮件 ${esc(row.reactivation_parent_message_id || "")}</div>`
           : row.contact_resolution_source === "QUOTED_OUTBOUND_PARENT"
@@ -192,16 +201,28 @@
             : "";
         const replyCandidate = row.reply_contact_candidate_email ? `<div class="muted">新发件联系人候选：${esc(row.reply_contact_candidate_name || "Customer")} · ${esc(row.reply_contact_candidate_email)}</div>` : "";
         const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
-        return `<tr>
-          <td><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span>${row.ai_failed ? '<div><span class="pill bad">AI判断失败·规则兜底</span></div>' : ""}${row.needs_attention ? '<div><span class="pill warn">重点复核</span></div>' : ""}<div class="muted">${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? `<br>${esc(row.classifier_model)}` : ""}${(row.normalization_notes || []).length ? `<br>归一化：${esc(row.normalization_notes.join(" ｜ "))}` : ""}</div></td>
-          <td><strong>#${row.email_id} · ${esc(row.subject)}</strong><div class="muted">${esc(row.from_address)} · ${esc(row.received_at)}</div></td>
-          <td>${esc(customer)}<br>${esc(contact)}${senderContact}${parentResolution}${replyCandidate}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></td>
-          <td>${pills(row.proposed_actions, "good")}<div class="muted">${esc(row.reason)}</div>${(row.evidence || []).length ? `<div class="muted">依据：${esc(row.evidence.join(" ｜ "))}</div>` : ""}</td>
-          <td>${blocked ? pills((row.blockers || []).map((value) => blockerLabels[value] || value), "bad") : '<span class="pill good">可安全处理</span>'}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；人工复核时请重点核对原文，建议先重试。</div>` : ""}<div class="muted">${row.unavailable_until ? (row.absence_already_ended ? `休假已于 ${esc(row.unavailable_until)} 结束，不会暂停联系人` : `暂停至 ${esc(row.unavailable_until)}`) : ""}</div></td>
-          <td>${esc(row.body_preview)}</td>
-          <td>${operationCell(row)}</td>
-        </tr>`;
-      }).join("") : '<tr><td colspan="7" class="empty">没有匹配的处置候选</td></tr>';
+        const safety = blocked
+          ? `<div class="pill-list">${pills((row.blockers || []).map((value) => blockerLabels[value] || value), "bad")}</div>`
+          : '<span class="pill good">可安全处理</span>';
+        const modelMeta = `${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? ` · ${esc(row.classifier_model)}` : ""}`;
+        const evidence = (row.evidence || []).length ? `<div class="muted">判断依据：${esc(row.evidence.join(" ｜ "))}</div>` : "";
+        return `<article class="result-card">
+          <div class="result-head">
+            <div class="result-title">
+              <div class="result-title-line"><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span><strong>#${row.email_id} · ${esc(row.subject)}</strong>${row.ai_failed ? '<span class="pill bad">AI失败·规则兜底</span>' : ""}${row.needs_attention ? '<span class="pill warn">重点复核</span>' : ""}</div>
+              <div class="result-meta">${esc(row.from_address)} · ${esc(row.received_at)}</div>
+              <div class="muted">${modelMeta}${(row.normalization_notes || []).length ? ` · 归一化：${esc(row.normalization_notes.join(" ｜ "))}` : ""}</div>
+            </div>
+            ${operationCell(row)}
+          </div>
+          <div class="result-grid">
+            <section class="result-panel"><h3>客户与联系人</h3><div>客户 ${esc(customer)}</div><div>处置联系人 ${esc(contact)}</div>${senderContact}${parentResolution}${replyCandidate}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></section>
+            <section class="result-panel"><h3>准备执行</h3><div class="pill-list">${actionPills(row.proposed_actions)}</div><div class="muted">${esc(row.reason)}</div></section>
+            <section class="result-panel"><h3>安全检查</h3>${safety}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；建议先重试并重点核对原文。</div>` : ""}<div class="muted">${row.unavailable_until ? (row.absence_already_ended ? `休假已于 ${esc(row.unavailable_until)} 结束，不会暂停联系人` : `暂停至 ${esc(row.unavailable_until)}`) : ""}</div></section>
+          </div>
+          <details class="record-details"><summary>查看判断依据与邮件正文</summary>${evidence}<div class="message-preview">${esc(row.body_preview)}</div></details>
+        </article>`;
+      }).join("") : '<div class="empty">没有匹配的处置候选</div>';
     }
     async function runAudit() {
       stopPolling();

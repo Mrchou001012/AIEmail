@@ -7,9 +7,14 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 LEGACY_SERVICES_MAX_LINES = 9_800
+DISPOSITION_SERVICE_MAX_LINES = 1_200
 INDEPENDENT_DOMAIN_MODULES = (
     "coa_delivery.py",
+    "disposition_actions.py",
+    "disposition_audit.py",
     "disposition_batches.py",
+    "disposition_planning.py",
+    "disposition_resolution.py",
     "disposition_service.py",
     "email_identity.py",
     "quote_rendering.py",
@@ -21,6 +26,17 @@ def test_legacy_services_facade_cannot_grow() -> None:
     assert len(lines) <= LEGACY_SERVICES_MAX_LINES, (
         "app/services.py is a frozen compatibility facade. Put new behavior in "
         "a focused domain module or extract more legacy code before adding glue."
+    )
+
+
+def test_disposition_orchestrator_cannot_regrow_into_a_monolith() -> None:
+    lines = (APP_DIR / "disposition_service.py").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(lines) <= DISPOSITION_SERVICE_MAX_LINES, (
+        "app/disposition_service.py coordinates the workflow; put identity "
+        "resolution, plan rendering, actions, or audit rollback in their "
+        "focused disposition modules instead of growing the orchestrator."
     )
 
 

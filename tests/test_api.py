@@ -325,6 +325,19 @@ def test_inbound_dispositions_page_hides_apply_for_unresolved_data() -> None:
     assert "application_blockers" in html
 
 
+def test_inbound_dispositions_page_uses_readable_cards_and_collapsed_details() -> None:
+    html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
+
+    assert 'class="result-list"' in html
+    assert 'class="result-card"' in html
+    assert "客户与联系人" in html
+    assert "准备执行" in html
+    assert "安全检查" in html
+    assert "查看判断依据与邮件正文" in html
+    assert "查看执行记录" in html
+    assert "table-layout:fixed" not in html
+
+
 def test_inbound_dispositions_page_distinguishes_expired_absence() -> None:
     html = INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8")
 
