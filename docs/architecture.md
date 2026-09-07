@@ -13,9 +13,11 @@ Current extracted boundaries:
 - `disposition_service.py`: inbound disposition planning and reversible application;
 - `quote_rendering.py`: deterministic quote rendering without database or delivery effects;
 - `coa_delivery.py`: verified COA attachment preparation and reading;
+- `delivery_safety.py`: recipient preflight, suppression locking, contact-endpoint
+  lifecycle, and deliverability handoff resolution;
 - `email_identity.py`: conservative greeting and signature normalization.
 
-`services.py` temporarily re-exports selected names so existing callers do not need a risky one-shot migration. It is frozen at 9,800 lines by an architecture test and must only shrink over time.
+`services.py` temporarily re-exports selected names so existing callers do not need a risky one-shot migration. It is frozen at 9,200 lines by an architecture test and must only shrink over time.
 
 ## Adding a feature
 

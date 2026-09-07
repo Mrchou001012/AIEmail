@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
-LEGACY_SERVICES_MAX_LINES = 9_800
+LEGACY_SERVICES_MAX_LINES = 9_200
 DISPOSITION_SERVICE_MAX_LINES = 1_200
 INDEPENDENT_DOMAIN_MODULES = (
     "coa_delivery.py",
@@ -16,6 +16,7 @@ INDEPENDENT_DOMAIN_MODULES = (
     "disposition_planning.py",
     "disposition_resolution.py",
     "disposition_service.py",
+    "delivery_safety.py",
     "email_identity.py",
     "quote_rendering.py",
 )
