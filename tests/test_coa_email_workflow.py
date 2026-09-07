@@ -321,3 +321,36 @@ async def test_partial_coa_reply_sends_available_file_and_creates_missing_item_h
     assert handoff_call["facts"]["missing_coa_queries"] == ["YAC-TMCS"]
     assert handoff_call["facts"]["partial_coa_outbox_id"] == 71
     assert "ai_draft_preview" not in handoff_call["facts"]
+
+
+@pytest.mark.asyncio
+async def test_generic_handoff_preview_automatically_routes_explicit_coa_request(
+    monkeypatch,
+):
+    preview = {
+        "subject": "Re: HMDS",
+        "body_text": "Please find attached the requested COA.",
+        "delivery_created": False,
+    }
+    prepare = AsyncMock(return_value={"preview": preview})
+    monkeypatch.setattr(services, "prepare_detected_coa_preview", prepare)
+    analysis = _analysis("YAC-HMDS").model_copy(
+        update={"intent": Intent.QUOTE_REQUEST, "coa_requested": True}
+    )
+    handoff = SimpleNamespace(extracted_facts={})
+    source_email = SimpleNamespace()
+    sales_case = SimpleNamespace()
+    settings = SimpleNamespace()
+
+    result = await services._prepared_handoff_draft_preview(
+        object(),
+        handoff=handoff,
+        source_email=source_email,
+        sales_case=sales_case,
+        analysis=analysis,
+        actor="reviewer",
+        settings=settings,
+    )
+
+    assert result == preview
+    assert prepare.await_args.kwargs["persist"] is False

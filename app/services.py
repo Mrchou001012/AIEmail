@@ -59,6 +59,7 @@ from app.coa_delivery import (
 from app.coa_delivery import (
     read_prepared_coa_attachments as _read_prepared_coa_attachments,
 )
+from app.coa_preview import prepare_detected_coa_preview
 from app.commercial import (
     QuoteContext,
     QuoteContextStatus,
@@ -1548,6 +1549,13 @@ async def _prepared_handoff_draft_preview(
     """
 
     stored_facts = dict(handoff.extracted_facts or {})
+    if analysis.intent == Intent.COA_REQUEST or analysis.coa_requested:
+        result = await prepare_detected_coa_preview(
+            session, handoff=handoff, email_row=source_email, sales_case=sales_case,
+            analysis=analysis, analysis_metadata={}, actor=actor, settings=settings,
+            persist=False,
+        )
+        return result["preview"]
     stored_preview = stored_facts.get("ai_draft_preview")
     prepared_keys = (
         "prepared_coa",
@@ -1821,7 +1829,11 @@ async def stream_handoff_draft_preview(
         yield {
             "type": "status",
             "stage": "prepared",
-            "message": "正在使用已确认的产品目录生成可核对草稿…",
+            "message": (
+                "正在检索并校验 COA 目录…"
+                if handoff.reason_code == HandoffReason.COA_REVIEW.value
+                else "正在使用已确认的产品目录生成可核对草稿…"
+            ),
         }
         yield {"type": "subject", "value": prepared_preview["subject"]}
         yield {"type": "body_reset"}
