@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from email import policy
 from email.message import EmailMessage as MIMEMessage
@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import app.services as services
 from app.ai import InboundAnalysis, ProductLine
 from app.api import _admin_latest_quote_rows, _price_history_by_product
-from app.commercial import get_or_create_current_cycle
 from app.db import (
     AIInvocation,
     AuditEvent,
@@ -35,6 +34,7 @@ from app.db import (
     SalesCase,
 )
 from app.domain import HandoffReason, Intent
+from app.quotations.commercial import get_or_create_current_cycle
 from app.services import (
     active_policy,
     claim_and_run_job,
@@ -50,6 +50,21 @@ from app.services import (
 from app.settings import Settings, get_settings
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def business_clock(monkeypatch):
+    """Inventory tests should reach the inventory gate on weekends too."""
+    observed = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    if observed.weekday() >= 5:
+        observed += timedelta(days=7 - observed.weekday())
+
+    class BusinessDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed.astimezone(tz) if tz else observed.replace(tzinfo=None)
+
+    monkeypatch.setattr("app.quotations.commercial.datetime", BusinessDateTime)
 
 
 async def _seed_case(session: AsyncSession, *, currency: str = "USD") -> SalesCase:
@@ -299,6 +314,7 @@ async def test_quote_review_rejects_changed_price_source(
 async def test_quote_ignore_inventory_quotes_out_of_stock_product(
     db_session: AsyncSession,
     monkeypatch,
+    business_clock,
 ) -> None:
     ids = await seed_demo_data(db_session)
     settings = Settings(
@@ -311,7 +327,8 @@ async def test_quote_ignore_inventory_quotes_out_of_stock_product(
         quote_ignore_inventory=True,
         quote_auto_send_enabled=True,
     )
-    monkeypatch.setattr("app.services.get_settings", lambda: settings)
+    monkeypatch.setattr("app.inbound.inbound_processing.get_settings", lambda: settings)
+    monkeypatch.setattr("app.quotations.single_product_quote.get_settings", lambda: settings)
     cycle = await get_or_create_current_cycle(db_session, settings)
     cycle.price_status = "CONFIRMED"
     cycle.inventory_status = "CONFIRMED"
@@ -361,6 +378,7 @@ async def test_quote_ignore_inventory_quotes_out_of_stock_product(
 async def test_quote_without_ignore_inventory_still_blocks_out_of_stock(
     db_session: AsyncSession,
     monkeypatch,
+    business_clock,
 ) -> None:
     ids = await seed_demo_data(db_session)
     settings = Settings(
@@ -372,7 +390,8 @@ async def test_quote_without_ignore_inventory_still_blocks_out_of_stock(
         commercial_open_hour=0,
         quote_ignore_inventory=False,
     )
-    monkeypatch.setattr("app.services.get_settings", lambda: settings)
+    monkeypatch.setattr("app.inbound.inbound_processing.get_settings", lambda: settings)
+    monkeypatch.setattr("app.quotations.single_product_quote.get_settings", lambda: settings)
     cycle = await get_or_create_current_cycle(db_session, settings)
     cycle.price_status = "CONFIRMED"
     cycle.inventory_status = "CONFIRMED"
@@ -612,7 +631,7 @@ async def test_multi_product_quote_duplicate_mentions_with_conflicting_quantitie
             },
         )
 
-    monkeypatch.setattr("app.services.AIClient.analyze", fake_analyze)
+    monkeypatch.setattr("app.ai.AIClient.analyze", fake_analyze)
     await process_inbound(db_session, email_row.id)
 
     clarification = await db_session.scalar(
@@ -1183,7 +1202,7 @@ async def test_manual_quote_failure_during_staging_is_fully_atomic(
     async def fail_audit(*args: object, **kwargs: object) -> None:
         raise RuntimeError("injected audit failure")
 
-    monkeypatch.setattr(services, "audit", fail_audit)
+    monkeypatch.setattr("app.common.service_core.audit", fail_audit)
     with pytest.raises(RuntimeError, match="injected audit failure"):
         await quote_with_manual_price(
             db_session,
@@ -1220,7 +1239,11 @@ async def _fail_after_outbox_staging(
         assert row is not None
         raise error
 
-    monkeypatch.setattr(services, "stage_outbox", staged_then_failed)
+    for module in (
+        "quotations.single_product_quote", "quotations.multi_product_quote",
+        "quotations.quote_clarification", "quotations.outreach_service", "common.demo_service",
+    ):
+        monkeypatch.setattr(f"app.{module}.stage_outbox", staged_then_failed)
 
 
 async def _business_counts(session: AsyncSession) -> dict[str, int]:

@@ -61,28 +61,26 @@ async def enqueue_job(
         return None
 
 
-async def _service_handler(name: str, session: AsyncSession, *args: Any) -> None:
-    # Late import keeps the queue independent from the legacy services facade
-    # and preserves existing test monkeypatches during the gradual extraction.
-    from app import services
-
-    await getattr(services, name)(session, *args)
-
-
 async def _demo_outreach(session: AsyncSession, payload: dict[str, Any]) -> None:
-    await _service_handler("create_demo_outreach", session, payload)
+    from app.common.demo_service import create_demo_outreach
+
+    await create_demo_outreach(session, payload)
 
 
 async def _case_outreach(session: AsyncSession, payload: dict[str, Any]) -> None:
-    await _service_handler("create_case_outreach", session, payload)
+    from app.quotations.outreach_service import create_case_outreach
+
+    await create_case_outreach(session, payload)
 
 
 async def _process_inbound(session: AsyncSession, payload: dict[str, Any]) -> None:
-    await _service_handler("process_inbound", session, int(payload["email_id"]))
+    from app.inbound.inbound_processing import process_inbound
+
+    await process_inbound(session, int(payload["email_id"]))
 
 
 async def _resume_agent_run(session: AsyncSession, payload: dict[str, Any]) -> None:
-    from app.services import resume_agent_run
+    from app.handoffs.agent_resume import resume_agent_run
 
     await resume_agent_run(
         session,
@@ -93,21 +91,23 @@ async def _resume_agent_run(session: AsyncSession, payload: dict[str, Any]) -> N
 
 
 async def _notify_handoff(session: AsyncSession, payload: dict[str, Any]) -> None:
-    await _service_handler("notify_handoff", session, int(payload["handoff_id"]))
+    from app.common.notifications import notify_handoff
+
+    await notify_handoff(session, int(payload["handoff_id"]))
 
 
 async def _notify_commercial_refresh(
     session: AsyncSession, payload: dict[str, Any]
 ) -> None:
-    await _service_handler(
-        "notify_commercial_refresh", session, int(payload["cycle_id"])
-    )
+    from app.common.notifications import notify_commercial_refresh
+
+    await notify_commercial_refresh(session, int(payload["cycle_id"]))
 
 
 async def _inbound_disposition_batch(
     session: AsyncSession, payload: dict[str, Any]
 ) -> None:
-    from app.disposition_batches import process_disposition_batch
+    from app.dispositions.disposition_batches import process_disposition_batch
 
     next_poll = await process_disposition_batch(
         session,

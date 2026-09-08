@@ -12,7 +12,6 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auto_replies import AutomatedReplyType
 from app.db import (
     AuditEvent,
     CaseStage,
@@ -32,8 +31,9 @@ from app.db import (
     ReactivationRecipient,
     SalesCase,
 )
-from app.deliverability import MXStatus, validate_address_format
+from app.delivery.deliverability import MXStatus, validate_address_format
 from app.imports import load_content
+from app.inbound.auto_replies import AutomatedReplyType
 from app.mail import (
     append_quoted_reply,
     build_message,

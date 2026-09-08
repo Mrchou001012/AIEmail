@@ -1,4 +1,4 @@
-from app.auto_replies import AutomatedReplyType, classify_automated_reply
+from app.inbound.auto_replies import AutomatedReplyType, classify_automated_reply
 
 
 def test_out_of_office_records_return_hint_and_backup_contact() -> None:

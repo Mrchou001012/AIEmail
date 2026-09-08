@@ -1,7 +1,7 @@
 import pytest
 
 from app.ai import stub_analyze
-from app.products import canonical_product_code, find_product_codes, product_codes_match, product_text_key
+from app.catalogs.products import canonical_product_code, find_product_codes, product_codes_match, product_text_key
 
 
 @pytest.mark.parametrize(

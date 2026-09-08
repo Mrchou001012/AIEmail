@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.coa_catalog import COACatalog, COACatalogScanner, COAFindStatus
-from app.coa_delivery import prepare_coa_response
+from app.coa.coa_catalog import COACatalog, COACatalogScanner, COAFindStatus
+from app.coa.coa_delivery import prepare_coa_response
 
 
 def _pdf(path: Path, payload: bytes = b"fake pdf") -> None:
@@ -30,7 +30,7 @@ def test_scanner_selects_only_suffix_free_english_coa_and_builds_lookup(
     output = tmp_path / "runtime" / "coa.json"
 
     monkeypatch.setattr(
-        "app.coa_catalog.extract_document_bounded",
+        "app.coa.coa_catalog.extract_document_bounded",
         lambda path, timeout_seconds: "Product: Acetylacetone\nCAS No. 123-54-6",
     )
     payload = COACatalogScanner(root=root, output_path=output).scan()
@@ -70,7 +70,7 @@ def test_scanner_holds_multiple_or_suffixed_coas_for_review(
     _pdf(root / "SILANE" / "YAC-A110" / "COA-YAC-A110.pdf")
     _pdf(root / "SILANE" / "YAC-A111" / "COA-YAC-A111 customer.pdf")
     output = tmp_path / "coa.json"
-    monkeypatch.setattr("app.coa_catalog.extract_document_bounded", lambda path, timeout_seconds: "")
+    monkeypatch.setattr("app.coa.coa_catalog.extract_document_bounded", lambda path, timeout_seconds: "")
 
     payload = COACatalogScanner(root=root, output_path=output).scan()
 
@@ -96,7 +96,7 @@ def test_incremental_scan_reuses_unchanged_selected_file_and_removes_deleted_fil
         calls.append(path)
         return "CAS 67-64-1"
 
-    monkeypatch.setattr("app.coa_catalog.extract_document_bounded", extract)
+    monkeypatch.setattr("app.coa.coa_catalog.extract_document_bounded", extract)
     scanner = COACatalogScanner(root=root, output_path=output)
     first = scanner.scan()
     second = scanner.scan()
@@ -118,7 +118,7 @@ def test_verified_attachment_rejects_file_changed_after_scan(
     selected = root / "OTHER" / "ACETONE" / "COA-ACETONE.pdf"
     _pdf(selected, b"approved")
     output = tmp_path / "coa.json"
-    monkeypatch.setattr("app.coa_catalog.extract_document_bounded", lambda path, timeout_seconds: "CAS 67-64-1")
+    monkeypatch.setattr("app.coa.coa_catalog.extract_document_bounded", lambda path, timeout_seconds: "CAS 67-64-1")
     COACatalogScanner(root=root, output_path=output).scan()
     catalog = COACatalog(output)
     result = catalog.find("ACETONE")
@@ -137,7 +137,7 @@ def test_prepare_coa_response_verifies_every_product_in_mixed_request(
     _pdf(root / "SILANES" / "YAC-TMCS" / "COA-YAC-TMCS.pdf", b"tmcs")
     output = tmp_path / "coa.json"
     monkeypatch.setattr(
-        "app.coa_catalog.extract_document_bounded",
+        "app.coa.coa_catalog.extract_document_bounded",
         lambda path, timeout_seconds: "",
     )
     COACatalogScanner(root=root, output_path=output).scan()
@@ -166,7 +166,7 @@ def test_prepare_coa_response_returns_verified_available_files_and_missing_items
     _pdf(root / "SILANES" / "YAC-HMDS" / "COA-YAC-HMDS.pdf", b"hmds")
     output = tmp_path / "coa.json"
     monkeypatch.setattr(
-        "app.coa_catalog.extract_document_bounded",
+        "app.coa.coa_catalog.extract_document_bounded",
         lambda path, timeout_seconds: "",
     )
     COACatalogScanner(root=root, output_path=output).scan()

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from app.deliverability import validate_address_format
+from app.delivery.deliverability import validate_address_format
 
 
 class Settings(BaseSettings):

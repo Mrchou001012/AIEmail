@@ -1,7 +1,7 @@
 import dns.exception
 import dns.resolver
 
-from app.deliverability import MXStatus, lookup_mx, validate_address_format
+from app.delivery.deliverability import MXStatus, lookup_mx, validate_address_format
 
 
 def test_address_format_normalizes_domain_and_rejects_bad_syntax() -> None:

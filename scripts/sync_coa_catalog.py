@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 
-from app.coa_catalog import COACatalogScanner
+from app.coa.coa_catalog import COACatalogScanner
 
 
 def main() -> None:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.catalogs.products import find_product_codes
 from app.db import (
     AuditEvent,
     CaseStatus,
@@ -16,7 +17,6 @@ from app.db import (
 )
 from app.domain import HandoffReason
 from app.mail import normalized_subject
-from app.products import find_product_codes
 
 HISTORY_REVIEW_SUMMARY = "Historical Gmail reply requires review"
 HISTORY_CASE_ASSIGNMENT_SUMMARY = "Historical Gmail reply requires case assignment"

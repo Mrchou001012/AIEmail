@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from app.ai import stub_analyze
-from app.auto_replies import classify_automated_reply
-from app.bounces import classify_bounce
+from app.inbound.auto_replies import classify_automated_reply
+from app.inbound.bounces import classify_bounce
 from app.mail import extract_full_reply_source, normalized_subject, parse_mime
 
 Direction = Literal["INBOUND", "OUTBOUND", "UNKNOWN"]

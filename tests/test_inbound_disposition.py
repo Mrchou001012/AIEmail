@@ -1,7 +1,7 @@
 import pytest
 
-from app.auto_replies import AutomatedReplyType, classify_automated_reply
-from app.inbound_disposition import (
+from app.inbound.auto_replies import AutomatedReplyType, classify_automated_reply
+from app.inbound.inbound_disposition import (
     InboundDispositionType,
     classify_inbound_disposition,
 )

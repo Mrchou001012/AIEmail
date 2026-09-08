@@ -1,5 +1,5 @@
 from app.ai import InboundAnalysis, ProductLine
-from app.coa_requests import (
+from app.coa.coa_requests import (
     coa_outbox_business_key,
     outstanding_coa_queries,
     plan_coa_request,

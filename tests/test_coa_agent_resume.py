@@ -4,9 +4,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_runtime import answer_coa_lookup_assistance
 from app.ai import InboundAnalysis
-from app.coa_catalog import COACatalog, COACatalogScanner
+from app.coa.coa_catalog import COACatalog, COACatalogScanner
 from app.db import (
     AgentRun,
     AgentRunStatus,
@@ -20,6 +19,7 @@ from app.db import (
     SalesCase,
 )
 from app.domain import HandoffReason, Intent
+from app.handoffs.agent_runtime import answer_coa_lookup_assistance
 from app.services import create_handoff, queue_prepared_coa_reply, resume_agent_run
 from app.settings import get_settings
 
@@ -37,7 +37,7 @@ async def test_coa_human_correction_resumes_to_verified_review_draft(
     (product_dir / "COA-YAC-TEST customer.pdf").write_bytes(b"customer-specific")
     catalog_path = tmp_path / "runtime" / "coa_catalog.json"
     monkeypatch.setattr(
-        "app.coa_catalog.extract_document_bounded",
+        "app.coa.coa_catalog.extract_document_bounded",
         lambda path, timeout_seconds: "Product YAC-TEST",
     )
     scanner = COACatalogScanner(

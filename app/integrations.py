@@ -2,8 +2,8 @@ import logging
 
 import httpx
 
-from app.commercial import commercial_update_link, review_link
 from app.db import CommercialDataCycle, Handoff, SalesCase
+from app.quotations.commercial import commercial_update_link, review_link
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)

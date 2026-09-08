@@ -19,7 +19,7 @@ from app.db import (
     EmailMessage,
     InboundDispositionBatchItem,
 )
-from app.disposition_batches import (
+from app.dispositions.disposition_batches import (
     batch_item_disposition,
     create_disposition_batch,
     disposition_batch_result,
@@ -212,7 +212,7 @@ async def test_batch_success_maps_reversed_results_by_custom_id(
     _ScriptedBatchAI.reset(
         [[_success(items[1].custom_id), _success(items[0].custom_id)]]
     )
-    monkeypatch.setattr("app.disposition_batches.AIClient", _ScriptedBatchAI)
+    monkeypatch.setattr("app.dispositions.disposition_batches.AIClient", _ScriptedBatchAI)
 
     await _advance_to_terminal(db_session, batch.id, settings)
     result = await disposition_batch_result(db_session, batch.id, settings=settings)
@@ -262,7 +262,7 @@ async def test_batch_retries_only_failed_item_then_succeeds(
             [_success(items[1].custom_id)],
         ]
     )
-    monkeypatch.setattr("app.disposition_batches.AIClient", _ScriptedBatchAI)
+    monkeypatch.setattr("app.dispositions.disposition_batches.AIClient", _ScriptedBatchAI)
 
     await _advance_to_terminal(db_session, batch.id, settings)
     result = await disposition_batch_result(db_session, batch.id, settings=settings)
@@ -301,7 +301,7 @@ async def test_batch_partial_failure_falls_back_and_marks_attention(
     _ScriptedBatchAI.reset(
         [[_success(items[0].custom_id), _error(items[1].custom_id)]]
     )
-    monkeypatch.setattr("app.disposition_batches.AIClient", _ScriptedBatchAI)
+    monkeypatch.setattr("app.dispositions.disposition_batches.AIClient", _ScriptedBatchAI)
 
     await _advance_to_terminal(db_session, batch.id, settings)
     result = await disposition_batch_result(db_session, batch.id, settings=settings)
@@ -337,7 +337,7 @@ async def test_batch_full_submission_failure_exhausts_retries(
         _email("h", "Please send your catalogue"),
     )
     _SubmissionFailureAI.calls = 0
-    monkeypatch.setattr("app.disposition_batches.AIClient", _SubmissionFailureAI)
+    monkeypatch.setattr("app.dispositions.disposition_batches.AIClient", _SubmissionFailureAI)
 
     await _advance_to_terminal(db_session, batch.id, settings)
     result = await disposition_batch_result(db_session, batch.id, settings=settings)
@@ -375,7 +375,7 @@ async def test_manual_retry_resets_only_fallback_items(
     _ScriptedBatchAI.reset(
         [[_success(items[0].custom_id), _error(items[1].custom_id)]]
     )
-    monkeypatch.setattr("app.disposition_batches.AIClient", _ScriptedBatchAI)
+    monkeypatch.setattr("app.dispositions.disposition_batches.AIClient", _ScriptedBatchAI)
     await _advance_to_terminal(db_session, batch.id, settings)
 
     await retry_failed_disposition_batch(db_session, batch.id)
@@ -416,7 +416,7 @@ async def test_provider_result_download_failure_is_bounded_and_falls_back(
     )
     _ResultDownloadFailureAI.reset([[]])
     monkeypatch.setattr(
-        "app.disposition_batches.AIClient", _ResultDownloadFailureAI
+        "app.dispositions.disposition_batches.AIClient", _ResultDownloadFailureAI
     )
 
     await _advance_to_terminal(db_session, batch.id, settings)

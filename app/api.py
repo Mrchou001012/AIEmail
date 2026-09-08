@@ -21,18 +21,17 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.agent_runtime import (
-    answer_coa_lookup_assistance,
-    answer_product_category_assistance,
-    assistance_request_payload,
-    finalize_handoff_agent_run,
+from app.catalogs.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
+from app.catalogs.product_list_service import (
+    prepared_product_list_attachment,
+    product_list_missing_business_facts,
+    queue_prepared_product_list_reply,
 )
-from app.coa_catalog import COACatalog, COACatalogScanner
-from app.commercial import (
-    commercial_update_link,
-    get_or_create_current_cycle,
-    lock_commercial_scope,
-)
+from app.catalogs.products import canonical_product_code, product_text_key
+from app.coa.coa_catalog import COACatalog, COACatalogScanner
+from app.coa.coa_service import queue_prepared_coa_reply
+from app.common.demo_service import seed_demo_data
+from app.common.service_core import active_policy
 from app.db import (
     AgentRun,
     AgentStep,
@@ -64,14 +63,20 @@ from app.db import (
     db_health,
     get_session,
 )
-from app.disposition_batches import (
+from app.delivery.contact_delivery_service import (
+    add_customer_contact_endpoint,
+    replace_handoff_recipient,
+    resolve_deliverability_handoff,
+    suppress_contact_endpoint,
+)
+from app.dispositions.disposition_batches import (
     batch_item_disposition,
     create_disposition_batch,
     disposition_batch_result,
     list_disposition_batches,
     retry_failed_disposition_batch,
 )
-from app.disposition_service import (
+from app.dispositions.disposition_service import (
     apply_email_disposition,
     backfill_inbound_dispositions,
     build_disposition_plan,
@@ -79,8 +84,20 @@ from app.disposition_service import (
     rollback_email_disposition,
 )
 from app.domain import money
+from app.handoffs.agent_runtime import (
+    answer_coa_lookup_assistance,
+    answer_product_category_assistance,
+    assistance_request_payload,
+    finalize_handoff_agent_run,
+)
+from app.handoffs.forwarding_service import forward_handoff_email, list_forward_recipients, save_forward_recipient
+from app.handoffs.handoff_preview import generate_handoff_draft_preview, stream_handoff_draft_preview
+from app.handoffs.handoff_service import assign_handoff_case, create_case_for_handoff, update_handoff_case_product
+from app.handoffs.human_reply_service import queue_human_reply
 from app.history import reconcile_email_history
 from app.imports import generate_templates, import_customers, import_prices
+from app.inbound.email_ingestion import ingest_raw_email
+from app.inbound.inquiry_matching import _product_lookup_conditions
 from app.jobs import enqueue_job
 from app.mail import (
     MAX_OUTBOUND_ATTACHMENT_BYTES,
@@ -100,8 +117,13 @@ from app.nas_knowledge import (
     read_scan_summary,
     set_classification_override,
 )
-from app.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
-from app.products import canonical_product_code, product_text_key
+from app.quotations.commercial import (
+    commercial_update_link,
+    get_or_create_current_cycle,
+    lock_commercial_scope,
+)
+from app.quotations.manual_quote_service import quote_with_manual_price
+from app.quotations.prepared_quote_service import queue_prepared_multi_quote_reply, queue_prepared_quote_reply
 from app.reactivation import (
     ALLOWED_TEMPLATE_FIELDS,
     REPLY_FILTERS,
@@ -112,32 +134,6 @@ from app.reactivation import (
     scan_campaign_candidates,
     start_campaign,
     validate_template,
-)
-from app.services import (
-    _product_lookup_conditions,
-    active_policy,
-    add_customer_contact_endpoint,
-    assign_handoff_case,
-    create_case_for_handoff,
-    forward_handoff_email,
-    generate_handoff_draft_preview,
-    ingest_raw_email,
-    list_forward_recipients,
-    prepared_product_list_attachment,
-    product_list_missing_business_facts,
-    queue_human_reply,
-    queue_prepared_coa_reply,
-    queue_prepared_multi_quote_reply,
-    queue_prepared_product_list_reply,
-    queue_prepared_quote_reply,
-    quote_with_manual_price,
-    replace_handoff_recipient,
-    resolve_deliverability_handoff,
-    save_forward_recipient,
-    seed_demo_data,
-    stream_handoff_draft_preview,
-    suppress_contact_endpoint,
-    update_handoff_case_product,
 )
 from app.settings import Settings, get_settings
 
@@ -1029,6 +1025,11 @@ async def dashboard_data(
                 "imap_downloaded_today_mb": round(
                     (mailbox_usage.imap_download_bytes if mailbox_usage else 0) / 1024 / 1024,
                     2,
+                ),
+                "cooldown_active": bool(
+                    mailbox_throttle
+                    and mailbox_throttle.cooldown_until
+                    and mailbox_throttle.cooldown_until > now
                 ),
                 "cooldown_until": (
                     mailbox_throttle.cooldown_until.isoformat()

@@ -1,4 +1,4 @@
-from app.bounces import BounceType, classify_bounce, classify_smtp_failure
+from app.inbound.bounces import BounceType, classify_bounce, classify_smtp_failure
 
 
 def dsn_raw(*, status: str, diagnostic: str, recipient: str = "buyer@example.com") -> bytes:

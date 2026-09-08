@@ -1,0 +1,35 @@
+# Isolated local verification; does not load .env or mount business data.
+name: aiemail-verification
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: verify
+      POSTGRES_PASSWORD: local-test-only
+      POSTGRES_DB: aiemail_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verify -d aiemail_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      DATABASE_URL: postgresql+asyncpg://verify:local-test-only@db:5432/aiemail_test
+      RUN_DB_INTEGRATION_TESTS: "1"
+      AI_PROVIDER: stub
+      MAIL_TRANSPORT: file
+      DINGTALK_TRANSPORT: log
+      IMAP_SYNC_ENABLED: "false"
+      SAFE_MODE: "true"
+      AUTO_SEND_ENABLED: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+networks:
+  default:
+    internal: true

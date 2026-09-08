@@ -12,9 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import app.services as services
-from app.agent_runtime import answer_product_category_assistance
 from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
 from app.api import handoff_detail
+from app.catalogs.product_catalog import import_product_catalog
 from app.db import (
     AgentRun,
     AgentRunStatus,
@@ -42,7 +42,7 @@ from app.db import (
     EmailMessage as DBEmailMessage,
 )
 from app.domain import HandoffReason
-from app.product_catalog import import_product_catalog
+from app.handoffs.agent_runtime import answer_product_category_assistance
 from app.services import (
     backfill_product_list_requests,
     generate_handoff_draft_preview,
@@ -75,7 +75,7 @@ async def _seed_catalog_and_interest(
     db_session.add(customer)
     await db_session.flush()
     if interests:
-        from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+        from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
         names = await category_names_by_key(db_session)
         merge_customer_interests(
@@ -119,7 +119,7 @@ async def _seed_departed_reactivation_parent(
     db_session.add(customer)
     await db_session.flush()
     if interests:
-        from app.product_catalog import (
+        from app.catalogs.product_catalog import (
             category_names_by_key,
             interest_entry,
             merge_customer_interests,
@@ -311,7 +311,8 @@ async def test_product_list_failure_after_staging_rolls_back_outbox_email_and_au
         assert row is not None
         raise RuntimeError("injected product-list post-stage failure")
 
-    monkeypatch.setattr(services, "stage_outbox", staged_then_failed)
+    monkeypatch.setattr("app.catalogs.general_product_list.stage_outbox", staged_then_failed)
+    monkeypatch.setattr("app.catalogs.category_product_list.stage_outbox", staged_then_failed)
     with pytest.raises(RuntimeError, match="product-list post-stage"):
         await process_inbound(db_session, email_row.id)
 
@@ -382,9 +383,11 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
     acac_row = next(
         row
         for row in sheet.iter_rows(min_row=2, values_only=True)
-        if row[2] == "ACAC"
+        if row[2] == "AcAc"
     )
-    assert acac_row[4] is None
+    assert acac_row[4] == "123-54-6"
+    # Missing specifications stay empty; only the audited CAS is populated.
+    assert acac_row[5] is None
     outbound_email = await db_session.scalar(
         select(DBEmailMessage).where(
             DBEmailMessage.direction == "OUTBOUND",
@@ -565,7 +568,7 @@ async def test_unknown_interest_routes_to_semantic_handoff_when_research_disable
         db_session,
         _message(
             "Product list inquiry",
-            "Please send us your product list.",
+            "Please send the list of solvents available.",
             message_id="no-interest@example.com",
         ),
         mailbox="integration-test",
@@ -618,6 +621,8 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
         "industrial_silanes",
         "pharmaceutical",
         "rubber_plastics",
+        "acetylacetone_salts",
+        "silicone_oil",
     }
 
     category = await db_session.scalar(
@@ -762,8 +767,14 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     assert preview["provider"] == "deterministic-product-list"
     assert preview["missing_business_facts"] == []
     prepared = handoff.extracted_facts["prepared_product_list"]
-    assert prepared["product_count"] == 71
-    assert [row["product_count"] for row in prepared["category_breakdown"]] == [45, 10, 16]
+    assert prepared["product_count"] == 70
+    assert {row["category_key"]: row["product_count"] for row in prepared["category_breakdown"]} == {
+        "industrial_silanes": 44,
+        "pharmaceutical": 9,
+        "rubber_plastics": 15,
+        "acetylacetone_salts": 1,
+        "silicone_oil": 1,
+    }
     assert prepared["payment_term"] == "Prepayment"
     assert prepared["payment_term_source"] == "new_customer_default"
     assert prepared["payment_term_quote_id"] is None
@@ -781,7 +792,7 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     )
     assert attachment.filename == "Lanya_Chem_all_products_product_list.xlsx"
     workbook = load_workbook(BytesIO(attachment.payload), read_only=True)
-    assert workbook.active.max_row == 72
+    assert workbook.active.max_row == 71
     assert await _queued_product_list(db_session) is None
 
     outbox = await queue_prepared_product_list_reply(
@@ -1043,7 +1054,7 @@ async def test_selected_legacy_handoff_can_use_company_research_backfill(
         db_session,
         _message(
             "Legacy product list request",
-            "Please send us your product list.",
+            "Please send the list of solvents available.",
             message_id="research-backfill@example.com",
         ),
         mailbox="integration-test",
@@ -1219,7 +1230,7 @@ async def test_product_list_backfill_creates_case_after_interest_is_mapped(
         db_session,
         _message(
             "Product catalog",
-            "Please send your product list.",
+            "Please send the list of solvents available.",
             message_id="backfill-new-category-case@example.com",
         ),
         mailbox="integration-test",
@@ -1230,7 +1241,7 @@ async def test_product_list_backfill_creates_case_after_interest_is_mapped(
     )
     assert handoff is not None and handoff.case_id is None
 
-    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+    from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
     customer = await db_session.get(Customer, customer_id)
     assert customer is not None
@@ -1284,7 +1295,7 @@ async def test_product_list_backfill_maps_specific_product_in_selected_category(
     )
     assert handoff is not None
 
-    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+    from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
     customer = await db_session.get(Customer, customer_id)
     assert customer is not None
@@ -1293,8 +1304,8 @@ async def test_product_list_backfill_maps_specific_product_in_selected_category(
         customer,
         [
             interest_entry(
-                category_key="pharmaceutical",
-                category_name=names["pharmaceutical"],
+                category_key="acetylacetone_salts",
+                category_name=names["acetylacetone_salts"],
                 source="test-backfill",
                 value="Acetyl Acetone",
             )
@@ -1336,7 +1347,7 @@ async def test_product_list_backfill_preflight_failure_does_not_create_case(
         db_session,
         _message(
             "Product catalog",
-            "Please send your product list.",
+            "Please send the list of solvents available.",
             message_id="backfill-missing-mime@example.com",
         ),
         mailbox="integration-test",
@@ -1347,7 +1358,7 @@ async def test_product_list_backfill_preflight_failure_does_not_create_case(
     )
     assert handoff is not None and handoff.case_id is None
 
-    from app.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
+    from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
     customer = await db_session.get(Customer, customer_id)
     assert customer is not None
@@ -1481,7 +1492,7 @@ async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
     second = await import_product_catalog(db_session, apply=True)
 
     assert first["products_created"] == 71
-    assert first["categories_created"] == 3
+    assert first["categories_created"] == 5
     assert second["products_created"] == 0
     assert second["products_updated"] == 71
     product_count = await db_session.scalar(select(func.count()).select_from(Product))
@@ -1489,7 +1500,7 @@ async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
         select(func.count()).select_from(ProductCategory)
     )
     assert product_count == 71
-    assert category_count == 3
+    assert category_count == 5
     assert mtms.cas_no is None
 
 
@@ -1606,7 +1617,7 @@ async def test_full_customer_workbook_stores_interest_category(
     assert brisben is not None
     brisben_interests = (brisben.metadata_json or {}).get("interests")
     assert brisben_interests is not None
-    assert brisben_interests[0]["category_key"] == "pharmaceutical"
+    assert brisben_interests[0]["category_key"] == "acetylacetone_salts"
     assert brisben_interests[0]["value"] == "Acetyl Acetone"
     brisben_contact = await db_session.scalar(
         select(Contact).where(Contact.email == "brisbenchem@example.com")
@@ -1769,7 +1780,9 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
 
     assert email_row is not None and email_row.case_id is not None
     old_contact = await db_session.get(Contact, old_contact_id)
-    assert old_contact is not None and old_contact.suppressed is False
+    # With disposition application enabled, ingestion already retires the
+    # uniquely linked old endpoint; the human sender remains active below.
+    assert old_contact is not None and old_contact.suppressed is True
     new_contact = await db_session.scalar(
         select(Contact).where(
             func.lower(Contact.email) == "marketing001@witofly.com"

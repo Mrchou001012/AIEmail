@@ -398,7 +398,9 @@ async def test_forward_final_gate_does_not_depend_on_recipient_history(
 
     sent: list[str] = []
     normalized: list[str] = []
-    normalize_recipient = services._normalize_forward_recipient
+    from app.delivery.delivery_safety import normalize_forward_recipient
+
+    normalize_recipient = normalize_forward_recipient
 
     class CapturingTransport:
         def send(self, raw_message: str, message_id: str, recipient: str) -> None:
@@ -409,10 +411,10 @@ async def test_forward_final_gate_does_not_depend_on_recipient_history(
         return normalize_recipient(recipient)
 
     monkeypatch.setattr(
-        services,
-        "_normalize_forward_recipient",
+        "app.delivery.outbound_guards._normalize_forward_recipient",
         capture_normalization,
     )
+    monkeypatch.setattr("app.delivery.outbound_delivery._normalize_forward_recipient", capture_normalization)
     monkeypatch.setattr(services, "transport_for", lambda _settings: CapturingTransport())
     settings = _smtp_forward_settings(safe_allowlist=[recipient_email])
 

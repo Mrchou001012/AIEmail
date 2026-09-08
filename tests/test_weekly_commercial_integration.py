@@ -17,7 +17,6 @@ from app.api import (
     confirm_current_inventory,
     current_commercial_editor,
 )
-from app.commercial import get_or_create_current_cycle
 from app.db import (
     AuditEvent,
     CaseStatus,
@@ -36,6 +35,7 @@ from app.db import (
     SalesCase,
 )
 from app.imports import generate_templates, import_prices
+from app.quotations.commercial import get_or_create_current_cycle
 from app.services import (
     JOB_HANDLERS,
     JobDeferred,

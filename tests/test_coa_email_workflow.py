@@ -4,10 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import app.coa.coa_service as coa_service
+import app.handoffs.handoff_prepared_preview as handoff_service
 import app.services as services
 from app.ai import InboundAnalysis
-from app.coa_catalog import COAFindResult, COAFindStatus
-from app.coa_delivery import COAResponseError, PreparedCOAResponse
+from app.coa.coa_catalog import COAFindResult, COAFindStatus
+from app.coa.coa_delivery import COAResponseError, PreparedCOAResponse
 from app.db import CaseStage, CaseStatus
 from app.domain import Intent
 from app.mail import OutboundAttachment
@@ -58,10 +60,10 @@ async def test_coa_request_creates_review_only_draft_with_pinned_attachment(monk
         catalog_schema="coa-catalog.v1",
     )
     create_handoff = AsyncMock()
-    monkeypatch.setattr(services, "_prepare_coa_response", lambda **_kwargs: response)
-    monkeypatch.setattr(services, "create_handoff", create_handoff)
+    monkeypatch.setattr(coa_service, "_prepare_coa_response", lambda **_kwargs: response)
+    monkeypatch.setattr(coa_service, "create_handoff", create_handoff)
     monkeypatch.setattr(
-        services,
+        coa_service,
         "get_settings",
         lambda: SimpleNamespace(
             coa_catalog_enabled=True,
@@ -100,10 +102,10 @@ async def test_coa_request_with_no_unique_match_asks_for_specific_human_help(mon
             help_needed="confirm the correct suffix-free standard English COA",
         )
 
-    monkeypatch.setattr(services, "_prepare_coa_response", ambiguous_response)
-    monkeypatch.setattr(services, "create_handoff", create_handoff)
+    monkeypatch.setattr(coa_service, "_prepare_coa_response", ambiguous_response)
+    monkeypatch.setattr(coa_service, "create_handoff", create_handoff)
     monkeypatch.setattr(
-        services,
+        coa_service,
         "get_settings",
         lambda: SimpleNamespace(
             coa_catalog_enabled=True,
@@ -165,25 +167,25 @@ async def test_secondary_coa_request_queues_verified_reply_and_allows_quote_to_c
         content_dir=tmp_path,
     )
     stage_outbox = AsyncMock(return_value=SimpleNamespace(id=42))
-    monkeypatch.setattr(services, "get_settings", lambda: settings)
-    monkeypatch.setattr(services, "_prepare_coa_response", lambda **_kwargs: response)
+    monkeypatch.setattr(coa_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(coa_service, "_prepare_coa_response", lambda **_kwargs: response)
     monkeypatch.setattr(
-        services,
+        coa_service,
         "evaluate_send_policy",
         lambda *_args, **_kwargs: SimpleNamespace(allow_send=True, reason=None),
     )
     monkeypatch.setattr(
-        services,
+        coa_service,
         "load_content",
         lambda _path: SimpleNamespace(signature_text="Regards", signature_html=""),
     )
     monkeypatch.setattr(
-        services,
+        coa_service,
         "_reply_source",
         lambda _email: SimpleNamespace(body_text="Original", body_html=None, inline_images=()),
     )
-    monkeypatch.setattr(services, "stage_outbox", stage_outbox)
-    monkeypatch.setattr(services, "audit", AsyncMock())
+    monkeypatch.setattr(coa_service, "stage_outbox", stage_outbox)
+    monkeypatch.setattr(coa_service, "audit", AsyncMock())
 
     analysis = _analysis("YAC-HMDS").model_copy(
         update={"intent": Intent.QUOTE_REQUEST, "coa_requested": True}
@@ -263,26 +265,26 @@ async def test_partial_coa_reply_sends_available_file_and_creates_missing_item_h
     )
     stage_outbox = AsyncMock(return_value=SimpleNamespace(id=71))
     create_handoff = AsyncMock()
-    monkeypatch.setattr(services, "get_settings", lambda: settings)
-    monkeypatch.setattr(services, "_prepare_coa_response", lambda **_kwargs: response)
+    monkeypatch.setattr(coa_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(coa_service, "_prepare_coa_response", lambda **_kwargs: response)
     monkeypatch.setattr(
-        services,
+        coa_service,
         "evaluate_send_policy",
         lambda *_args, **_kwargs: SimpleNamespace(allow_send=True, reason=None),
     )
     monkeypatch.setattr(
-        services,
+        coa_service,
         "load_content",
         lambda _path: SimpleNamespace(signature_text="Regards", signature_html=""),
     )
     monkeypatch.setattr(
-        services,
+        coa_service,
         "_reply_source",
         lambda _email: SimpleNamespace(body_text="Original", body_html=None, inline_images=()),
     )
-    monkeypatch.setattr(services, "stage_outbox", stage_outbox)
-    monkeypatch.setattr(services, "create_handoff", create_handoff)
-    monkeypatch.setattr(services, "audit", AsyncMock())
+    monkeypatch.setattr(coa_service, "stage_outbox", stage_outbox)
+    monkeypatch.setattr(coa_service, "create_handoff", create_handoff)
+    monkeypatch.setattr(coa_service, "audit", AsyncMock())
 
     analysis = _analysis("YAC-HMDS").model_copy(
         update={"intent": Intent.QUOTE_REQUEST, "coa_requested": True}
@@ -333,7 +335,7 @@ async def test_generic_handoff_preview_automatically_routes_explicit_coa_request
         "delivery_created": False,
     }
     prepare = AsyncMock(return_value={"preview": preview})
-    monkeypatch.setattr(services, "prepare_detected_coa_preview", prepare)
+    monkeypatch.setattr(handoff_service, "prepare_detected_coa_preview", prepare)
     analysis = _analysis("YAC-HMDS").model_copy(
         update={"intent": Intent.QUOTE_REQUEST, "coa_requested": True}
     )

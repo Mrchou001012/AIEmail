@@ -10,15 +10,15 @@ import anthropic
 from anthropic.lib._parse._transform import transform_schema
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.auto_replies import latest_authored_text
-from app.domain import Intent
-from app.product_catalog import classify_category_interests
-from app.products import (
+from app.catalogs.product_catalog import classify_category_interests
+from app.catalogs.products import (
     canonical_product_code,
     find_product_code,
     find_product_codes,
     load_product_aliases,
 )
+from app.domain import Intent
+from app.inbound.auto_replies import latest_authored_text
 from app.settings import Settings, get_settings
 
 

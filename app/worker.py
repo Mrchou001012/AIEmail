@@ -3,17 +3,15 @@ import logging
 import socket
 from collections.abc import Callable
 
-from app.coa_catalog import COACatalogScanner
+from app.coa.coa_catalog import COACatalogScanner
 from app.db import SessionLocal
+from app.delivery.outbound_delivery import send_one_outbox
+from app.delivery.outbound_recovery import reconcile_unknown_outbox
+from app.inbound.bounce_service import reconcile_permanent_bounce_handoffs
 from app.jobs import claim_and_run_job
 from app.nas_knowledge import NASKnowledgeScanner
+from app.quotations.commercial_service import ensure_weekly_commercial_refresh
 from app.reactivation import ensure_reactivation_dispatch
-from app.services import (
-    ensure_weekly_commercial_refresh,
-    reconcile_permanent_bounce_handoffs,
-    reconcile_unknown_outbox,
-    send_one_outbox,
-)
 from app.settings import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

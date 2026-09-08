@@ -15,7 +15,8 @@ from openpyxl.utils.datetime import from_excel
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.commercial import get_or_create_current_cycle, lock_commercial_scope
+from app.catalogs.product_catalog import interest_entry, merge_customer_interests
+from app.catalogs.products import canonical_product_code, product_text_key
 from app.db import (
     AuditEvent,
     CaseStatus,
@@ -32,8 +33,7 @@ from app.db import (
     SalesCase,
 )
 from app.history import reconcile_email_history
-from app.product_catalog import interest_entry, merge_customer_interests
-from app.products import canonical_product_code, product_text_key
+from app.quotations.commercial import get_or_create_current_cycle, lock_commercial_scope
 from app.settings import get_settings
 
 CUSTOMER_HEADERS = [

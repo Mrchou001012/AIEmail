@@ -13,6 +13,12 @@ from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.catalogs.product_catalog import (
+    category_interest_entries,
+    interest_entry,
+    merge_customer_interests,
+)
+from app.catalogs.products import canonical_product_code
 from app.db import (
     AuditEvent,
     CaseStatus,
@@ -22,14 +28,8 @@ from app.db import (
     ProductCategory,
     SalesCase,
 )
-from app.deliverability import validate_address_format
+from app.delivery.deliverability import validate_address_format
 from app.history import reconcile_email_history
-from app.product_catalog import (
-    category_interest_entries,
-    interest_entry,
-    merge_customer_interests,
-)
-from app.products import canonical_product_code
 
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,63}", re.IGNORECASE)
 SPLIT_PRODUCT_PATTERN = re.compile(r"[,;，、/\n]+")

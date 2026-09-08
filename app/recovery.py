@@ -21,8 +21,8 @@ from app.db import (
     SalesCase,
     engine,
 )
+from app.inbound.inbound_processing import process_inbound
 from app.mail import ParsedEmail, attachments_require_review, parse_mime
-from app.services import process_inbound
 from app.settings import get_settings
 
 MAX_HEADERLESS_DUPLICATE_GAP_SECONDS = 120

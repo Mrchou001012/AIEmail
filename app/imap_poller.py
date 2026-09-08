@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 
 from app.db import MailboxCursor, MailboxDailyUsage, SessionLocal
 from app.history import reconcile_email_history
+from app.inbound.email_ingestion import ingest_raw_email
 from app.mail import GmailIMAPClient
-from app.services import ingest_raw_email
 from app.settings import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

@@ -13,8 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import stub_analyze
 from app.api import dashboard_data
-from app.auto_replies import AutomatedReplyType
-from app.bounces import BounceType
 from app.db import (
     AgentRun,
     AgentRunStatus,
@@ -40,7 +38,7 @@ from app.db import (
     ReactivationRecipient,
     SalesCase,
 )
-from app.deliverability import MXResult, MXStatus
+from app.delivery.deliverability import MXResult, MXStatus
 from app.domain import HandoffReason
 from app.history import (
     HISTORY_CASE_ASSIGNMENT_SUMMARY,
@@ -48,6 +46,8 @@ from app.history import (
     reconcile_email_history,
 )
 from app.imap_poller import poll_folder_once
+from app.inbound.auto_replies import AutomatedReplyType
+from app.inbound.bounces import BounceType
 from app.mail import OutboundAttachment, extract_full_message_bodies, parse_mime
 from app.recovery import (
     FalseCounterofferDuplicateSource,
@@ -204,7 +204,7 @@ async def test_pending_weekly_prices_do_not_hide_non_quote_handoffs(
         business_timezone="Asia/Kolkata",
         business_open_hour=0,
     )
-    monkeypatch.setattr("app.services.get_settings", lambda: settings)
+    monkeypatch.setattr("app.inbound.inbound_processing.get_settings", lambda: settings)
 
     await process_inbound(db_session, email_row.id)
 
@@ -267,7 +267,7 @@ async def test_safe_inline_image_does_not_force_attachment_handoff(
             "request_hash": hashlib.sha256(f"{subject}\n{body}".encode()).hexdigest(),
         }
 
-    monkeypatch.setattr("app.services.AIClient.analyze", overcautious_analyze)
+    monkeypatch.setattr("app.ai.AIClient.analyze", overcautious_analyze)
 
     await process_inbound(db_session, email_row.id)
 
@@ -830,7 +830,7 @@ async def test_log_only_dingtalk_notification_is_not_marked_sent(
         async def notify(self, handoff: Handoff, case: SalesCase | None) -> str:
             return "LOGGED"
 
-    monkeypatch.setattr("app.services.DingTalkNotifier", LogNotifier)
+    monkeypatch.setattr("app.common.notifications.DingTalkNotifier", LogNotifier)
     await notify_handoff(db_session, handoff.id)
 
     await db_session.refresh(handoff)
@@ -1930,7 +1930,7 @@ async def test_google_security_notification_is_archived_without_sales_workflow(
     ) == 1
 
 
-async def test_departed_contact_is_suppressed_and_handed_off(db_session: AsyncSession) -> None:
+async def test_unverified_departed_contact_is_handed_off_without_suppression(db_session: AsyncSession) -> None:
     case = await _seed_case(db_session, with_quote=True)
     message = MIMEMessage()
     message["From"] = "internal@example.com"
@@ -1953,7 +1953,9 @@ async def test_departed_contact_is_suppressed_and_handed_off(db_session: AsyncSe
     assert handoff is not None
     assert handoff.reason_code == HandoffReason.PERSONNEL_CHANGE.value
     assert handoff.extracted_facts["replacement_emails"] == ["newbuyer@example.com"]
-    assert contact is not None and contact.suppressed
+    # Observation-only disposition mode requires review before retiring an
+    # endpoint with no uniquely verified reactivation parent.
+    assert contact is not None and not contact.suppressed
     assert case.status == CaseStatus.WAITING_HUMAN
     assert email_row.automated_reply_handled_at is not None
     assert await db_session.scalar(

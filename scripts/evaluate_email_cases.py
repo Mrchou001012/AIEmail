@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from app.ai import generic_product_list_requested, stub_analyze
-from app.coa_catalog import COACatalog, COAFindStatus
+from app.coa.coa_catalog import COACatalog, COAFindStatus
 from app.domain import Intent
 from app.mail import parse_mime
 

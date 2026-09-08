@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import app.coa_preview as coa_preview
+import app.coa.coa_preview as coa_preview
 from app.ai import InboundAnalysis
-from app.coa_delivery import PreparedCOAResponse
+from app.coa.coa_delivery import PreparedCOAResponse
 from app.db import CaseStatus
 from app.domain import Intent
 

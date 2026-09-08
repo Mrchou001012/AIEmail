@@ -109,7 +109,7 @@ git status --short
 
 sudo -u aiemail env PYTHONNOUSERSITE=1 \
   /opt/aiemail-env/bin/python -c \
-  'import app.main, app.disposition_service, app.inbound_disposition; print("imports: ok")'
+  'import app.main, app.dispositions.disposition_service, app.inbound.inbound_disposition; print("imports: ok")'
 ```
 
 Untracked production files should still appear. That is expected; do not delete

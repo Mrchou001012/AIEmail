@@ -48,8 +48,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             if value is not None
         }
     )
+    from app.catalogs.product_catalog import import_product_catalog
     from app.db import SessionLocal
-    from app.product_catalog import import_product_catalog
 
     async with SessionLocal() as session:
         result = await import_product_catalog(

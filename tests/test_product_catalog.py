@@ -4,8 +4,7 @@ import pytest
 from openpyxl import load_workbook
 
 from app.ai import stub_analyze
-from app.db import Customer, Product, ProductCategory
-from app.product_catalog import (
+from app.catalogs.product_catalog import (
     build_product_list_attachment,
     classify_category_interests,
     customer_interest_keys,
@@ -14,11 +13,12 @@ from app.product_catalog import (
     render_product_list_email,
     validate_product_list_email,
 )
-from app.products import (
+from app.catalogs.products import (
     canonical_product_code,
     find_product_codes,
     load_product_aliases,
 )
+from app.db import Customer, Product, ProductCategory
 
 
 def test_catalog_yaml_has_audited_categories_and_unique_internal_products() -> None:

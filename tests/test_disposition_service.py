@@ -39,7 +39,7 @@ from app.db import (
     ReactivationRecipient,
     SalesCase,
 )
-from app.disposition_service import (
+from app.dispositions.disposition_service import (
     _parse_return_until,
     apply_email_disposition,
     backfill_inbound_dispositions,
@@ -48,7 +48,7 @@ from app.disposition_service import (
     rollback_email_disposition,
 )
 from app.domain import HandoffReason
-from app.inbound_disposition import InboundDisposition, InboundDispositionType
+from app.inbound.inbound_disposition import InboundDisposition, InboundDispositionType
 from app.services import _handle_automated_reply
 from app.settings import Settings, get_settings
 
