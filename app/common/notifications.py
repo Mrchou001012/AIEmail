@@ -5,12 +5,19 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import CommercialDataCycle, Handoff, SalesCase
+from app.domain import HandoffReason
 from app.integrations import DingTalkNotifier
+
+DINGTALK_SILENCED_HANDOFF_REASONS = frozenset({HandoffReason.BOUNCE_REVIEW.value})
 
 
 async def notify_handoff(session: AsyncSession, handoff_id: int) -> None:
     handoff = await session.get(Handoff, handoff_id)
     if handoff is None or handoff.dingtalk_status == "SENT":
+        return
+    if handoff.reason_code in DINGTALK_SILENCED_HANDOFF_REASONS:
+        handoff.dingtalk_status = "CANCELLED"
+        await session.commit()
         return
     if handoff.status != "OPEN":
         handoff.dingtalk_status = "CANCELLED"
