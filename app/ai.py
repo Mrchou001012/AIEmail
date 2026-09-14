@@ -210,6 +210,12 @@ answer or promise a response timeframe. Do not claim that a quotation, attachmen
 specification, or sample is enclosed unless the application explicitly says so. The closing field
 must be only a short sign-off such as "Best regards,"; do not include a name or company signature
 because the application adds it separately. Keep the email natural and ready for a human to edit.
+When draft_purpose is product_list_reply, write the reply specifically for the approved product
+category and the customer's current message. Product catalog entries and approved attachments are
+application-controlled facts: do not alter, add, or infer any product, code, CAS number, content,
+price, availability, or attachment. You may say the product list is attached only when a non-empty
+approved_attachments list is supplied. Do not dump the complete catalog into the prose when the
+approved attachment contains it.
 Return only the requested structured result."""
 
 COMPANY_RESEARCH_PROMPT = """Research the public business identity and product activity of one
@@ -1282,10 +1288,59 @@ class AIClient:
         )
         request_hash = hashlib.sha256(request_text.encode()).hexdigest()
         subject = _draft_preview_subject(facts)
+        attachment_claim_allowed = bool(facts.get("approved_attachments"))
         yield {"type": "subject", "value": subject}
         yield {"type": "body_reset"}
         if self._client is None:
             contact_name = str(facts.get("contact_name") or "Customer").strip()
+            if facts.get("draft_purpose") == "product_list_reply":
+                category = facts.get("approved_product_category") or {}
+                category_name = str(category.get("name") or "products").strip()
+                attachments = facts.get("approved_attachments") or []
+                attachment_name = str(
+                    attachments[0].get("filename") if attachments else ""
+                ).strip()
+                catalog_sentence = (
+                    f"Please find attached our current {category_name} product list "
+                    f"({attachment_name})."
+                    if attachment_name
+                    else f"We are pleased to share our current {category_name} product range."
+                )
+                interest_sentence = (
+                    "Thank you for your interest in our products."
+                    if category_name.casefold() == "all products"
+                    else f"Thank you for your interest in our {category_name} products."
+                )
+                result = EmailDraftPreview(
+                    subject=subject[:998],
+                    greeting=f"Dear {contact_name},",
+                    paragraphs=[
+                        interest_sentence,
+                        catalog_sentence
+                        + " Please let us know which products and quantities you require so our team can assist further.",
+                    ],
+                    closing="Best regards,",
+                )
+                validate_draft_preview(
+                    result,
+                    attachment_claim_allowed=attachment_claim_allowed,
+                )
+                for block_kind, block in (
+                    ("greeting", result.greeting),
+                    *(("paragraph", paragraph) for paragraph in result.paragraphs),
+                    ("closing", result.closing),
+                ):
+                    yield {"type": "body_block", "kind": block_kind, "value": block}
+                yield {
+                    "type": "complete",
+                    "preview": result,
+                    "metadata": {
+                        "provider": "stub",
+                        "model": "stub-v1",
+                        "request_hash": request_hash,
+                    },
+                }
+                return
             product_code = str(facts.get("product_code") or "").strip()
             quantity = facts.get("quantity")
             request_description = "your inquiry"
@@ -1302,7 +1357,10 @@ class AIClient:
                 ],
                 closing="Best regards,",
             )
-            validate_draft_preview(result)
+            validate_draft_preview(
+                result,
+                attachment_claim_allowed=attachment_claim_allowed,
+            )
             for block_kind, block in (
                 ("greeting", result.greeting),
                 *(("paragraph", paragraph) for paragraph in result.paragraphs),
@@ -1341,7 +1399,8 @@ class AIClient:
                             greeting=greeting,
                             paragraphs=["Thank you for your email."],
                             closing="Best regards,",
-                        )
+                        ),
+                        attachment_claim_allowed=attachment_claim_allowed,
                     )
                     emitted_greeting = greeting
                     yield {"type": "body_block", "kind": "greeting", "value": greeting}
@@ -1355,7 +1414,8 @@ class AIClient:
                             greeting="Dear Customer,",
                             paragraphs=[paragraph],
                             closing="Best regards,",
-                        )
+                        ),
+                        attachment_claim_allowed=attachment_claim_allowed,
                     )
                     emitted_paragraph_count += 1
                     yield {"type": "body_block", "kind": "paragraph", "value": paragraph}
@@ -1370,7 +1430,10 @@ class AIClient:
                 "closing": "Best regards,",
             }
         )
-        validate_draft_preview(parsed_output)
+        validate_draft_preview(
+            parsed_output,
+            attachment_claim_allowed=attachment_claim_allowed,
+        )
         if emitted_greeting is None:
             yield {
                 "type": "body_block",
@@ -1411,21 +1474,26 @@ def render_draft_preview(preview: EmailDraftPreview) -> str:
     return "\n\n".join(blocks)
 
 
-def validate_draft_preview(preview: EmailDraftPreview) -> None:
+def validate_draft_preview(
+    preview: EmailDraftPreview,
+    *,
+    attachment_claim_allowed: bool = False,
+) -> None:
     if "\r" in preview.subject or "\n" in preview.subject:
         raise ValueError("draft preview subject contains a line break")
     rendered = render_draft_preview(preview)
     if MONEY_PATTERN.search(rendered):
         raise ValueError("draft preview contains an unapproved monetary value")
-    forbidden = (
+    forbidden = [
         "guarantee",
         "binding commitment",
         "we accept your order",
         "shipment confirmed",
         "attached quotation",
         "quotation attached",
-        "please find attached",
-    )
+    ]
+    if not attachment_claim_allowed:
+        forbidden.append("please find attached")
     if any(term in rendered.casefold() for term in forbidden):
         raise ValueError("draft preview contains an unsupported commitment or attachment claim")
 

@@ -357,6 +357,14 @@ async def answer_product_category_assistance(
     request.status = AssistanceStatus.ANSWERED
     request.answered_by = actor[:128]
     request.answered_at = now
+    # The pre-selection handoff may contain a generic AI preview. It is not the
+    # product-list draft that will be sent, so remove it immediately to prevent
+    # the review UI from displaying stale content while the resume job runs.
+    pending_facts = dict(handoff.extracted_facts or {})
+    pending_facts.pop("ai_draft_preview", None)
+    pending_facts.pop("prepared_product_list", None)
+    pending_facts["product_list_draft_status"] = "GENERATING"
+    handoff.extracted_facts = pending_facts
     run.version += 1
     run.status = AgentRunStatus.RESUME_QUEUED
     run.current_step = "resume-product-category"

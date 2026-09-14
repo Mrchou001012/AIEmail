@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import InboundAnalysis, generic_product_list_requested
-from app.catalogs.product_catalog import build_product_list_attachment, render_product_list_email
+from app.catalogs.product_catalog import build_product_list_attachment
+from app.catalogs.product_list_drafting import generate_product_list_ai_preview
 from app.coa.coa_preview import prepare_detected_coa_preview
 from app.common.email_identity import reply_contact_name as _reply_contact_name
 from app.common.service_core import (
@@ -19,7 +20,6 @@ from app.common.service_core import (
 )
 from app.db import EmailMessage, Handoff, Product, ProductCategory, SalesCase
 from app.domain import HandoffReason, Intent
-from app.imports import load_content
 from app.settings import Settings
 
 
@@ -163,36 +163,6 @@ async def _prepared_handoff_draft_preview(
             sales_case.contact.name,
             source_email.body_text,
         )
-        subject = source_email.subject if source_email.subject.casefold().startswith("re:") else f"Re: {source_email.subject}"
-        if prepared_product_list.get("scope") == "all":
-            body_text = (
-                f"Dear {contact_name},\n\n"
-                "Thank you for your email. Please find attached our current English product "
-                "catalogue, including the approved product codes, product names, CAS numbers, "
-                "and available content specifications.\n\n"
-                "Please let us know the products and quantities you require so we can confirm "
-                "current availability and pricing."
-            )
-            model = "active-full-product-catalog-v1"
-        else:
-            bundle = load_content(settings.content_dir)
-            rendered_text, _ = render_product_list_email(
-                contact_name=contact_name,
-                category=category,
-                products=products,
-                subject=source_email.subject,
-                signature_text=bundle.signature_text,
-                signature_html=bundle.signature_html,
-                attachment_filename=attachment_filename,
-            )
-            signature_text = bundle.signature_text.strip()
-            body_text = (
-                rendered_text[: -len(signature_text)].rstrip()
-                if signature_text and rendered_text.endswith(signature_text)
-                else rendered_text.rstrip()
-            )
-            model = "active-product-catalog-v1"
-
         payment_requested = _payment_details_requested(request_text)
         payment_term: str | None = None
         payment_term_source: str | None = None
@@ -205,7 +175,7 @@ async def _prepared_handoff_draft_preview(
             payment_term = payment.term
             payment_term_source = payment.source
             payment_term_quote_id = payment.quote_id
-            body_text = f"{body_text.rstrip()}\n\n{_payment_term_sentence(payment)}"
+        payment_sentence = _payment_term_sentence(payment) if payment is not None else None
 
         prepared_product_list = {
             **prepared_product_list,
@@ -223,14 +193,18 @@ async def _prepared_handoff_draft_preview(
         }
         stored_facts["prepared_product_list"] = prepared_product_list
         handoff.reason_code = HandoffReason.PRODUCT_LIST_REVIEW.value
-        handoff.summary = "Product catalog draft prepared; human approval is required"
-        stored_preview = {
-            "subject": subject,
-            "body_text": body_text,
-            "provider": "deterministic-product-list",
-            "model": model,
-            "rag_matches": [],
-        }
+        handoff.summary = "AI product catalog draft prepared; human approval is required"
+        stored_preview = await generate_product_list_ai_preview(
+            settings=settings,
+            subject=source_email.subject,
+            contact_name=contact_name,
+            customer_message=source_email.body_text,
+            category=category,
+            products=products,
+            attachment_filename=attachment_filename,
+            actor=actor,
+            payment_sentence=payment_sentence,
+        )
 
     if not isinstance(stored_preview, dict):
         return None

@@ -505,6 +505,39 @@ def test_stub_draft_preview_is_review_only_and_ignores_historical_prices() -> No
     assert "USD" not in rendered
 
 
+def test_product_list_draft_uses_approved_category_and_attachment() -> None:
+    ai = AIClient(Settings(ai_provider="stub"))
+    preview, metadata = asyncio.run(
+        ai.draft_preview(
+            {
+                "draft_purpose": "product_list_reply",
+                "subject": "Product range",
+                "contact_name": "Ramesh R",
+                "customer_message": "Please send your product list.",
+                "approved_product_category": {
+                    "key": "silicone_oil",
+                    "name": "Silicone Oil",
+                },
+                "approved_product_catalog": [
+                    {"code": "YAC-SO", "name": "Silicone Oil"}
+                ],
+                "approved_attachments": [
+                    {
+                        "filename": "Lanya_Chem_silicone_oil_product_list.xlsx",
+                        "purpose": "verified current product list",
+                    }
+                ],
+            }
+        )
+    )
+
+    rendered = render_draft_preview(preview)
+    assert metadata["provider"] == "stub"
+    assert "Silicone Oil" in rendered
+    assert "Please find attached" in rendered
+    assert "Lanya_Chem_silicone_oil_product_list.xlsx" in rendered
+
+
 def test_draft_preview_rejects_unapproved_money() -> None:
     preview = EmailDraftPreview(
         subject="Re: Inquiry",

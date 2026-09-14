@@ -537,8 +537,14 @@
           ? "当前案例为“产品待确认”：可以先生成或编辑人工回复，但不会进入自动报价。收到具体产品后再补选。"
           : `当前产品：${data.case.product}。如客户更正产品，可在发送前修改。`;
       }
-      if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
-      if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
+      const productListDraftGenerating = data.facts?.product_list_draft_status === "GENERATING";
+      if (productListDraftGenerating) {
+        $("#reply-subject").value = "";
+        $("#reply-body").value = "";
+      } else {
+        if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
+        if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
+      }
       $("#association-tools").classList.toggle("hidden", Boolean(data.case));
       const senderNeedsReview = Boolean(mail) && !data.case && matchingContacts.length === 0;
       $("#sender-contact-review").classList.toggle("hidden", !senderNeedsReview);
@@ -607,8 +613,10 @@
       $("#reply-attachments").disabled = blocked || Boolean(preparedCoa) || Boolean(preparedProductList) || Boolean(preparedQuote) || Boolean(preparedMultiQuote);
       const preview = data.facts?.ai_draft_preview;
       $("#draft-state").textContent = preview
-        ? `预览生成于 ${new Date(preview.generated_at).toLocaleString()} · ${preview.provider}/${preview.model} · RAG 命中 ${(preview.rag_matches || []).length} 条 · 未创建发件任务`
-        : (!data.case ? "请先关联案例后生成。" : "尚未生成 AI 草稿预览。");
+        ? `最终发送草稿生成于 ${new Date(preview.generated_at).toLocaleString()} · ${preview.provider}/${preview.model} · RAG 命中 ${(preview.rag_matches || []).length} 条 · 未创建发件任务`
+        : productListDraftGenerating
+          ? "正在根据所选产品系列生成 AI 草稿；尚未创建发件任务。"
+          : (!data.case ? "请先关联案例后生成。" : "尚未生成 AI 草稿预览。");
       $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
       const deliverability = data.reason === "EMAIL_DELIVERABILITY";
       const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
@@ -981,7 +989,7 @@
       const coaConfirm = retryLookup
         ? "确认已补充或更正标准英文 COA，并用该产品信息重新检索？"
         : "确认该产品目前没有可提供的 COA，并转到人工回复？系统不会虚构或自动发送缺失附件。";
-      if (!confirm(coaLookup ? coaConfirm : "确认该产品系列？Agent 将保存答案并从中断位置继续处理邮件。")) return;
+      if (!confirm(coaLookup ? coaConfirm : "确认该产品系列？Agent 将据此生成可核对的 AI 邮件草稿；邮件不会立即发送，仍需你再次确认。")) return;
       $("#answer-assistance").disabled = true;
       try {
         const result = await api(`/admin/assistance-requests/${request.id}/answer`, {
@@ -997,8 +1005,13 @@
           }),
         });
         notice(result.resume_job_id
-          ? `答案已保存，恢复任务 #${result.resume_job_id} 已排队。`
+          ? `答案已保存，恢复任务 #${result.resume_job_id} 已排队。完成后请核对下方 AI 草稿并再次确认发送。`
           : "已记录暂无 COA，请在下方核对并发送人工回复。", "ok");
+        if (!coaLookup) {
+          $("#reply-subject").value = "";
+          $("#reply-body").value = "";
+          $("#draft-state").textContent = "正在根据所选产品系列生成 AI 草稿；尚未创建发件任务。";
+        }
         if (coaLookup && !retryLookup) {
           $("#reply-subject").value = "";
           $("#reply-body").value = "";

@@ -1,7 +1,6 @@
 """General product list workflow."""
 
 import html
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -9,7 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import InboundAnalysis, generic_product_list_requested
 from app.catalogs.product_catalog import build_product_list_attachment
-from app.common.email_identity import reply_contact_name as _reply_contact_name
+from app.catalogs.product_list_drafting import generate_product_list_ai_preview
+from app.common.email_identity import (
+    reply_contact_name as _reply_contact_name,
+)
+from app.common.email_identity import (
+    strip_duplicate_signature_lead as _strip_duplicate_signature_lead,
+)
 from app.common.email_threading import _reply_references, _reply_source
 from app.common.service_core import (
     _all_products_catalog_category,
@@ -100,19 +105,34 @@ async def _maybe_send_general_product_list(
         file_format="xlsx",
     )
     contact_name = _reply_contact_name(case.contact.name, email_row.body_text)
-    draft_body = (
-        f"Dear {contact_name},\n\n"
-        "Please find attached our current English product catalogue. It includes the approved "
-        "product codes, product names, CAS numbers, and available content specifications.\n\n"
-        "Please let us know the products and quantities you require so we can confirm current "
-        "availability and pricing."
-    )
     payment_requested = _payment_details_requested(request_text)
     payment = await _customer_payment_term(session, customer_id=case.customer_id) if payment_requested else None
     payment_term = payment.term if payment is not None else None
-    if payment is not None:
-        draft_body = f"{draft_body}\n\n{_payment_term_sentence(payment)}"
-    subject = f"Re: {email_row.subject}" if email_row.subject.strip() else "Lanya Chem product catalogue"
+    payment_sentence = _payment_term_sentence(payment) if payment is not None else None
+    try:
+        draft_preview = await generate_product_list_ai_preview(
+            settings=settings,
+            subject=email_row.subject,
+            contact_name=contact_name,
+            customer_message=email_row.body_text,
+            category=category,
+            products=products,
+            attachment_filename=catalog_file.filename,
+            actor="system",
+            payment_sentence=payment_sentence,
+        )
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Company-wide product-list AI drafting failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+    draft_body = str(draft_preview["body_text"])
+    subject = str(draft_preview["subject"])
     prepared = {
         "scope": "all",
         "category_id": None,
@@ -139,19 +159,16 @@ async def _maybe_send_general_product_list(
             facts={
                 **analysis_facts,
                 "prepared_product_list": prepared,
-                "ai_draft_preview": {
-                    "subject": subject,
-                    "body_text": draft_body,
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    "provider": "deterministic-product-list",
-                    "model": "active-full-product-catalog-v1",
-                    "rag_matches": [],
-                },
+                "ai_draft_preview": draft_preview,
             },
             source_email_id=email_row.id,
         )
         return True
     bundle = load_content(settings.content_dir)
+    draft_body = _strip_duplicate_signature_lead(
+        draft_body,
+        bundle.signature_text,
+    )
     signed_text = "\n".join([draft_body, "", bundle.signature_text.strip()])
     signed_html = "".join(f"<p>{html.escape(line) if line else '&nbsp;'}</p>" for line in draft_body.splitlines()) + bundle.signature_html
     source = _reply_source(email_row)

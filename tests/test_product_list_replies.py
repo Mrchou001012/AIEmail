@@ -589,7 +589,9 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
+    # Human category selection must always stop on a visible AI draft, even
+    # when unattended product-list delivery is enabled globally.
+    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", True)
     await _seed_catalog_and_interest(db_session, interests=[])
     email_row = await ingest_raw_email(
         db_session,
@@ -641,6 +643,9 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     assert result.newly_answered is True
     assert result.job is not None and result.job.kind == "resume_agent_run"
     assert result.run.status == AgentRunStatus.RESUME_QUEUED
+    await db_session.refresh(handoff)
+    assert handoff.extracted_facts["product_list_draft_status"] == "GENERATING"
+    assert "ai_draft_preview" not in handoff.extracted_facts
 
     repeated = await answer_product_category_assistance(
         db_session,
@@ -670,8 +675,11 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     assert handoff.reason_code == HandoffReason.PRODUCT_LIST_REVIEW.value
     assert handoff.extracted_facts["human_selected_category"]["category_key"] == "industrial_silanes"
     prepared = handoff.extracted_facts["prepared_product_list"]
+    assert handoff.extracted_facts["product_list_draft_status"] == "READY"
     assert prepared["category_key"] == "industrial_silanes"
     assert prepared["product_ids"]
+    assert prepared["human_confirmation_required"] is True
+    assert prepared["attachment_filename"].endswith(".xlsx")
     steps = (
         (
             await db_session.execute(
@@ -691,6 +699,11 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     assert steps[-1].output_json["next_step"] == "human-draft-approval"
 
     preview = handoff.extracted_facts["ai_draft_preview"]
+    assert preview["provider"] == "stub"
+    assert "Industrial Silanes" in preview["body_text"]
+    assert "Please find attached" in preview["body_text"]
+    assert preview["delivery_created"] is False
+    assert await _queued_product_list(db_session) is None
     outbox = await queue_prepared_product_list_reply(
         db_session,
         handoff_id=handoff.id,
@@ -760,11 +773,11 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     )
     await db_session.refresh(handoff)
 
-    assert "Please find attached our current English product catalogue" in preview["body_text"]
+    assert "Please find attached" in preview["body_text"]
     assert preview["body_text"].startswith("Dear Nikita Karande,")
     assert "reviewing your request" not in preview["body_text"]
     assert "For a first order, our standard payment term is prepayment." in preview["body_text"]
-    assert preview["provider"] == "deterministic-product-list"
+    assert preview["provider"] == "stub"
     assert preview["missing_business_facts"] == []
     prepared = handoff.extracted_facts["prepared_product_list"]
     assert prepared["product_count"] == 70

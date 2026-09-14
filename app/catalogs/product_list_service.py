@@ -19,8 +19,9 @@ def _product_list_outbound_attachments(
     category: ProductCategory,
     products: list[Product],
     request_text: str,
+    default_file_format: str | None = None,
 ) -> tuple[tuple[OutboundAttachment, ...], str | None]:
-    file_format = requested_product_list_file_format(request_text)
+    file_format = requested_product_list_file_format(request_text) or default_file_format
     if file_format is None:
         return (), None
     catalog_file = build_product_list_attachment(

@@ -1,16 +1,21 @@
 """Category product list workflow."""
 
-from datetime import UTC, datetime
+import html
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import InboundAnalysis, requested_product_list_file_format
-from app.catalogs.product_catalog import render_product_list_email
+from app.catalogs.product_list_drafting import generate_product_list_ai_preview
 from app.catalogs.product_list_service import _product_list_outbound_attachments
 from app.catalogs.products import product_codes_match
-from app.common.email_identity import reply_contact_name as _reply_contact_name
+from app.common.email_identity import (
+    reply_contact_name as _reply_contact_name,
+)
+from app.common.email_identity import (
+    strip_duplicate_signature_lead as _strip_duplicate_signature_lead,
+)
 from app.common.email_threading import _reply_references, _reply_source
 from app.common.service_core import (
     _catalog_category_breakdown,
@@ -26,6 +31,34 @@ from app.domain import HandoffReason, SendContext, evaluate_send_policy
 from app.imports import load_content
 from app.mail import append_quoted_reply
 from app.settings import get_settings
+
+
+def _verified_catalog_listing(products: list[Product]) -> tuple[str, str]:
+    """Render approved catalog facts without prescribing the email wording."""
+
+    header = "No. | Code | Product Name | CAS No. | Content"
+    rows: list[str] = [header]
+    html_rows = [
+        '<table border="1" cellpadding="4" cellspacing="0" '
+        'style="border-collapse:collapse">',
+        '<tr><th align="left">No.</th><th align="left">Code</th>'
+        '<th align="left">Product Name</th><th align="left">CAS No.</th>'
+        '<th align="left">Content</th></tr>',
+    ]
+    for number, product in enumerate(products, start=1):
+        values = (
+            str(number),
+            str(product.catalog_code or "-").strip(),
+            str(product.name or "-").strip(),
+            str(product.cas_no or "-").strip(),
+            str(product.content or "-").strip(),
+        )
+        rows.append(" | ".join(values))
+        html_rows.append(
+            "<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in values) + "</tr>"
+        )
+    html_rows.append("</table>")
+    return "\n".join(rows), "".join(html_rows)
 
 
 async def _maybe_send_product_list(
@@ -136,23 +169,113 @@ async def _maybe_send_product_list(
 
     settings = get_settings()
     bundle = load_content(settings.content_dir)
+    request_text = f"{email_row.subject}\n{email_row.body_text}"
+    human_selected_category = isinstance(
+        analysis_facts.get("human_selected_category"),
+        dict,
+    )
+    requires_review = human_selected_category or not settings.product_list_auto_send_enabled
     try:
         attachments, attachment_filename = _product_list_outbound_attachments(
             category=category,
             products=products,
-            request_text=f"{email_row.subject}\n{email_row.body_text}",
+            request_text=request_text,
+            # Every AI-authored product-list email carries the exact verified
+            # catalog as an attachment; the model only writes the surrounding
+            # prose and cannot alter the catalog rows.
+            default_file_format="xlsx",
         )
-        text, html_body = render_product_list_email(
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Product list rendering failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+        )
+        return True
+
+    payment_requested = _payment_details_requested(request_text)
+    payment = await _customer_payment_term(session, customer_id=case.customer_id) if payment_requested else None
+    payment_term = payment.term if payment is not None else None
+    payment_sentence = _payment_term_sentence(payment) if payment is not None else None
+
+    file_format = requested_product_list_file_format(request_text) or "xlsx"
+    try:
+        draft_preview = await generate_product_list_ai_preview(
+            settings=settings,
+            subject=email_row.subject,
             contact_name=_reply_contact_name(case.contact.name, email_row.body_text),
+            customer_message=email_row.body_text,
             category=category,
             products=products,
-            subject=email_row.subject,
-            signature_text=bundle.signature_text,
-            signature_html=bundle.signature_html,
             attachment_filename=attachment_filename,
+            actor="agent-runtime" if human_selected_category else "system",
+            payment_sentence=payment_sentence,
         )
-        signature_text = bundle.signature_text.strip()
-        draft_body = text[: -len(signature_text)].rstrip() if signature_text and text.endswith(signature_text) else text.rstrip()
+    except Exception as exc:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.AI_FAILURE,
+            summary=f"Product-list AI drafting failed: {type(exc).__name__}",
+            facts=analysis_facts,
+            source_email_id=email_row.id,
+            update_existing=human_selected_category,
+        )
+        return True
+
+    if requires_review:
+        await create_handoff(
+            session,
+            case=case,
+            reason=HandoffReason.PRODUCT_LIST_REVIEW,
+            summary=f"AI product-list draft prepared for {category.name}; human approval is required",
+            facts={
+                **analysis_facts,
+                "product_list_draft_status": "READY",
+                "prepared_product_list": {
+                    "category_id": category.id,
+                    "category_key": category.key,
+                    "category_name": category.name,
+                    "product_ids": [product.id for product in products],
+                    "product_codes": [product.code for product in products],
+                    "product_count": len(products),
+                    "category_breakdown": await _catalog_category_breakdown(session, products),
+                    "file_format": file_format,
+                    "attachment_filename": attachment_filename,
+                    "payment_requested": payment_requested,
+                    "payment_term": payment_term,
+                    "payment_term_source": payment.source if payment is not None else None,
+                    "payment_term_quote_id": payment.quote_id if payment is not None else None,
+                    "missing_business_facts": [],
+                    "human_confirmation_required": True,
+                },
+                "ai_draft_preview": draft_preview,
+            },
+            source_email_id=email_row.id,
+            update_existing=True,
+        )
+        return True
+
+    try:
+        draft_body = _strip_duplicate_signature_lead(
+            str(draft_preview["body_text"]),
+            bundle.signature_text,
+        )
+        catalog_text, catalog_html = _verified_catalog_listing(products)
+        text = "\n".join(
+            [draft_body, "", catalog_text, "", bundle.signature_text.strip()]
+        )
+        html_body = (
+            "".join(
+                f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
+                for line in draft_body.splitlines()
+            )
+            + catalog_html
+            + bundle.signature_html
+        )
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
             text,
@@ -172,56 +295,11 @@ async def _maybe_send_product_list(
             source_email_id=email_row.id,
         )
         return True
-    subject = f"Re: {email_row.subject}" if email_row.subject.strip() else f"Our {category.name} product list"
-    product_list_request_text = f"{email_row.subject}\n{email_row.body_text}"
-    payment_requested = _payment_details_requested(product_list_request_text)
-    payment = await _customer_payment_term(session, customer_id=case.customer_id) if payment_requested else None
-    payment_term = payment.term if payment is not None else None
-    if payment is not None:
-        draft_body = f"{draft_body}\n\n{_payment_term_sentence(payment)}"
-    if not settings.product_list_auto_send_enabled:
-        file_format = requested_product_list_file_format(f"{email_row.subject}\n{email_row.body_text}")
-        await create_handoff(
-            session,
-            case=case,
-            reason=HandoffReason.PRODUCT_LIST_REVIEW,
-            summary=f"Product-list draft prepared for {category.name}; human approval is required",
-            facts={
-                **analysis_facts,
-                "prepared_product_list": {
-                    "category_id": category.id,
-                    "category_key": category.key,
-                    "category_name": category.name,
-                    "product_ids": [product.id for product in products],
-                    "product_codes": [product.code for product in products],
-                    "product_count": len(products),
-                    "category_breakdown": await _catalog_category_breakdown(session, products),
-                    "file_format": file_format,
-                    "attachment_filename": attachment_filename,
-                    "payment_requested": payment_requested,
-                    "payment_term": payment_term,
-                    "payment_term_source": payment.source if payment is not None else None,
-                    "payment_term_quote_id": payment.quote_id if payment is not None else None,
-                    "missing_business_facts": [],
-                },
-                "ai_draft_preview": {
-                    "subject": subject,
-                    "body_text": draft_body,
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    "provider": "deterministic-product-list",
-                    "model": "active-product-catalog-v1",
-                    "rag_matches": [],
-                },
-            },
-            source_email_id=email_row.id,
-            update_existing=True,
-        )
-        return True
     outbox = await stage_outbox(
         session,
         case=case,
         message_kind="PRODUCT_LIST",
-        subject=subject,
+        subject=str(draft_preview["subject"]),
         text_body=text,
         html_body=html_body,
         business_key=f"inbound-product-list:{email_row.id}",
