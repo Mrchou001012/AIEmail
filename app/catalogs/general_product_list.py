@@ -3,12 +3,14 @@
 import html
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai import InboundAnalysis, generic_product_list_requested
-from app.catalogs.product_catalog import build_product_list_attachment
+from app.ai import InboundAnalysis
 from app.catalogs.product_list_drafting import generate_product_list_ai_preview
+from app.catalogs.product_list_service import (
+    official_product_catalog_attachment,
+    official_product_catalog_sha256,
+)
 from app.common.email_identity import (
     reply_contact_name as _reply_contact_name,
 )
@@ -18,14 +20,13 @@ from app.common.email_identity import (
 from app.common.email_threading import _reply_references, _reply_source
 from app.common.service_core import (
     _all_products_catalog_category,
-    _catalog_category_breakdown,
     _customer_payment_term,
     _payment_details_requested,
     _payment_term_sentence,
     create_handoff,
     stage_outbox,
 )
-from app.db import EmailMessage, Product, ProductCategory, SalesCase
+from app.db import EmailMessage, SalesCase
 from app.domain import HandoffReason, SendContext, evaluate_send_policy
 from app.imports import load_content
 from app.mail import OutboundAttachment, append_quoted_reply
@@ -40,31 +41,17 @@ async def _maybe_send_general_product_list(
     analysis: InboundAnalysis,
     analysis_facts: dict[str, Any],
 ) -> bool:
-    """Prepare the dynamic company-wide English catalog for a generic request."""
+    """Reply to a product-list request with the official company PDF."""
 
     request_text = f"{email_row.subject}\n{email_row.body_text}"
-    if not generic_product_list_requested(request_text):
-        return False
-    products = list(
-        (
-            await session.scalars(
-                select(Product)
-                .join(ProductCategory, Product.category_id == ProductCategory.id)
-                .where(
-                    Product.active.is_(True),
-                    Product.catalog_visible.is_(True),
-                    ProductCategory.active.is_(True),
-                )
-                .order_by(ProductCategory.sort_order, Product.sort_order, Product.id)
-            )
-        ).all()
-    )
-    if not products:
+    try:
+        catalog_file = official_product_catalog_attachment()
+    except ValueError as exc:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.PRODUCT_LIST_REVIEW,
-            summary="Generic product-list request has no active approved catalog rows",
+            summary=str(exc),
             facts=analysis_facts,
             source_email_id=email_row.id,
         )
@@ -99,11 +86,6 @@ async def _maybe_send_general_product_list(
         )
         return True
     category = _all_products_catalog_category()
-    catalog_file = build_product_list_attachment(
-        category=category,
-        products=products,
-        file_format="xlsx",
-    )
     contact_name = _reply_contact_name(case.contact.name, email_row.body_text)
     payment_requested = _payment_details_requested(request_text)
     payment = await _customer_payment_term(session, customer_id=case.customer_id) if payment_requested else None
@@ -116,7 +98,7 @@ async def _maybe_send_general_product_list(
             contact_name=contact_name,
             customer_message=email_row.body_text,
             category=category,
-            products=products,
+            products=[],
             attachment_filename=catalog_file.filename,
             actor="system",
             payment_sentence=payment_sentence,
@@ -134,16 +116,18 @@ async def _maybe_send_general_product_list(
     draft_body = str(draft_preview["body_text"])
     subject = str(draft_preview["subject"])
     prepared = {
-        "scope": "all",
+        "scope": "official_catalog",
         "category_id": None,
         "category_key": "all_products",
         "category_name": "All Products",
-        "product_ids": [product.id for product in products],
-        "product_codes": [product.code for product in products],
-        "product_count": len(products),
-        "category_breakdown": await _catalog_category_breakdown(session, products),
-        "file_format": "xlsx",
+        "product_ids": [],
+        "product_codes": [],
+        "product_count": None,
+        "category_breakdown": [],
+        "file_format": "pdf",
+        "attachment_kind": "official_catalog_pdf",
         "attachment_filename": catalog_file.filename,
+        "attachment_sha256": official_product_catalog_sha256(catalog_file),
         "payment_requested": payment_requested,
         "payment_term": payment_term,
         "payment_term_source": payment.source if payment is not None else None,

@@ -583,25 +583,35 @@
       productListReview.classList.toggle("hidden", !preparedProductList);
       productListReview.classList.toggle("warning", productListBlocked);
       if (preparedProductList) {
+        const officialCatalog = preparedProductList.scope === "official_catalog";
         const codes = preparedProductList.catalog_codes || [];
         const breakdown = preparedProductList.category_breakdown || [];
         const scopeLabel = preparedProductList.scope === "all"
           ? "全部产品"
+          : preparedProductList.scope === "official_catalog"
+            ? "官方完整产品册"
           : (preparedProductList.category_name || preparedProductList.category_key || "指定分类");
-        const breakdownHtml = breakdown.length
+        const breakdownHtml = officialCatalog
+          ? '<div class="file-help">该附件是官方完整产品册，不再按系统推断的产品分类裁剪。</div>'
+          : breakdown.length
           ? `<div class="catalog-breakdown">${breakdown.map((row) => `<span>${esc(row.category_name)} · ${esc(row.product_count)} 个</span>`).join("")}</div>`
           : '<div class="file-help">分类明细将在重新生成草稿后显示</div>';
-        const codeDetails = codes.length
+        const codeDetails = officialCatalog
+          ? '<div class="file-help">完整产品内容请下载官方 PDF 产品册查看。</div>'
+          : codes.length
           ? `<details class="catalog-code-details"><summary>查看 ${esc(codes.length)} 个对外产品代码</summary><div class="catalog-codes">${esc(codes.join(", "))}</div></details>`
-          : '<div class="file-help">完整对外产品字段请下载 Excel 预览。</div>';
+          : '<div class="file-help">当前分类没有可显示的对外产品代码。</div>';
         const missingText = productListBlocked
           ? '<div class="danger"><strong>尚不能发送：</strong>当前草稿还没有按付款规则生成。系统将沿用客户最近一次已发送报价中的付款条件；没有这类历史时默认首单预付款。请点击上方“重新生成”后再核对。</div>'
           : "";
         const download = preparedProductList.file_format
-          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 Excel 预览</a></div>`
+          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 ${esc(preparedProductList.attachment_filename || "产品目录附件")}</a></div>`
+          : "";
+        const catalogCount = preparedProductList.product_count
+          ? ` · ${esc(preparedProductList.product_count)} 个产品`
           : "";
         productListReview.innerHTML = `
-          <div class="catalog-title">产品目录附件：${esc(scopeLabel)} · ${esc(preparedProductList.product_count || codes.length)} 个产品</div>
+          <div class="catalog-title">产品目录附件：${esc(scopeLabel)}${catalogCount}</div>
           ${breakdownHtml}
           ${codeDetails}
           ${download}

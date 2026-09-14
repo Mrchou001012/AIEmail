@@ -1,17 +1,40 @@
 """Product-list preparation, delivery, and human approval workflows."""
 
+import hashlib
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai import requested_product_list_file_format
-from app.catalogs.product_catalog import build_product_list_attachment
 from app.common.service_core import _all_products_catalog_category, _customer_payment_term, _payment_details_requested
 from app.db import EmailMessage, Handoff, Outbox, Product, ProductCategory, SalesCase
 from app.domain import HandoffReason
 from app.handoffs.human_reply_service import queue_human_reply
 from app.mail import OutboundAttachment
+from app.settings import get_settings
+
+OFFICIAL_PRODUCT_CATALOG_FILENAME = "Catalog.pdf"
+
+
+def official_product_catalog_attachment() -> OutboundAttachment:
+    """Load the version-controlled official catalog without generating a file."""
+
+    path = get_settings().content_dir / OFFICIAL_PRODUCT_CATALOG_FILENAME
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError(f"official product catalog is missing: {path}") from exc
+    if not payload.startswith(b"%PDF-"):
+        raise ValueError("official product catalog is not a valid PDF")
+    return OutboundAttachment(
+        filename=OFFICIAL_PRODUCT_CATALOG_FILENAME,
+        content_type="application/pdf",
+        payload=payload,
+    )
+
+
+def official_product_catalog_sha256(attachment: OutboundAttachment) -> str:
+    return hashlib.sha256(attachment.payload).hexdigest()
 
 
 def _product_list_outbound_attachments(
@@ -21,24 +44,11 @@ def _product_list_outbound_attachments(
     request_text: str,
     default_file_format: str | None = None,
 ) -> tuple[tuple[OutboundAttachment, ...], str | None]:
-    file_format = requested_product_list_file_format(request_text) or default_file_format
-    if file_format is None:
-        return (), None
-    catalog_file = build_product_list_attachment(
-        category=category,
-        products=products,
-        file_format=file_format,
-    )
-    return (
-        (
-            OutboundAttachment(
-                filename=catalog_file.filename,
-                content_type=catalog_file.content_type,
-                payload=catalog_file.payload,
-            ),
-        ),
-        catalog_file.filename,
-    )
+    # Keep the legacy arguments while callers migrate; attachment selection is
+    # intentionally no longer affected by category or requested spreadsheet format.
+    _ = category, products, request_text, default_file_format
+    attachment = official_product_catalog_attachment()
+    return (attachment,), attachment.filename
 
 
 async def _validated_prepared_product_list(
@@ -52,7 +62,10 @@ async def _validated_prepared_product_list(
     prepared = (handoff.extracted_facts or {}).get("prepared_product_list")
     if handoff.reason_code != HandoffReason.PRODUCT_LIST_REVIEW.value or not isinstance(prepared, dict):
         raise ValueError("handoff has no prepared product-list draft")
-    if prepared.get("scope") == "all":
+    if prepared.get("scope") == "official_catalog":
+        category = _all_products_catalog_category()
+        products = []
+    elif prepared.get("scope") == "all":
         category = _all_products_catalog_category()
         products = list(
             (
@@ -130,23 +143,15 @@ async def prepared_product_list_attachment(
 ) -> OutboundAttachment:
     """Build a review-only catalog download without creating delivery work."""
 
-    _, prepared, category, products = await _validated_prepared_product_list(
+    _, prepared, _, _ = await _validated_prepared_product_list(
         session,
         handoff_id=handoff_id,
     )
-    file_format = prepared.get("file_format")
-    if file_format not in {"xlsx", "csv"}:
-        raise ValueError("prepared product list does not have a downloadable attachment")
-    catalog_file = build_product_list_attachment(
-        category=category,
-        products=products,
-        file_format=file_format,
-    )
-    return OutboundAttachment(
-        filename=catalog_file.filename,
-        content_type=catalog_file.content_type,
-        payload=catalog_file.payload,
-    )
+    attachment = official_product_catalog_attachment()
+    expected_hash = str(prepared.get("attachment_sha256") or "")
+    if expected_hash and official_product_catalog_sha256(attachment) != expected_hash:
+        raise ValueError("official product catalog changed after draft creation; regenerate the draft")
+    return attachment
 
 
 async def queue_prepared_product_list_reply(
@@ -161,7 +166,7 @@ async def queue_prepared_product_list_reply(
 ) -> Outbox:
     """Approve a catalog draft after confirming its active product snapshot."""
 
-    handoff, prepared, category, products = await _validated_prepared_product_list(
+    handoff, prepared, _, _ = await _validated_prepared_product_list(
         session,
         handoff_id=handoff_id,
     )
@@ -176,23 +181,12 @@ async def queue_prepared_product_list_reply(
             "prepared product-list reply is incomplete; missing approved business facts: "
             + ", ".join(str(value) for value in missing_business_facts)
         )
-    file_format = prepared.get("file_format")
-    attachments: tuple[OutboundAttachment, ...] = ()
-    if file_format is not None:
-        if file_format not in {"xlsx", "csv"}:
-            raise ValueError("prepared product-list attachment format is invalid")
-        catalog_file = build_product_list_attachment(
-            category=category,
-            products=products,
-            file_format=file_format,
-        )
-        attachments = (
-            OutboundAttachment(
-                filename=catalog_file.filename,
-                content_type=catalog_file.content_type,
-                payload=catalog_file.payload,
-            ),
-        )
+    attachment = official_product_catalog_attachment()
+    expected_hash = str(prepared.get("attachment_sha256") or "")
+    if not expected_hash:
+        raise ValueError("prepared product-list draft predates the official PDF; regenerate the draft")
+    if official_product_catalog_sha256(attachment) != expected_hash:
+        raise ValueError("official product catalog changed after draft creation; regenerate the draft")
     return await queue_human_reply(
         session,
         handoff_id=handoff_id,
@@ -201,5 +195,5 @@ async def queue_prepared_product_list_reply(
         actor=actor,
         note=note,
         resume_automation=resume_automation,
-        attachments=attachments,
+        attachments=(attachment,),
     )

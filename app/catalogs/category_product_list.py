@@ -6,9 +6,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai import InboundAnalysis, requested_product_list_file_format
+from app.ai import InboundAnalysis
 from app.catalogs.product_list_drafting import generate_product_list_ai_preview
-from app.catalogs.product_list_service import _product_list_outbound_attachments
+from app.catalogs.product_list_service import (
+    _product_list_outbound_attachments,
+    official_product_catalog_sha256,
+)
 from app.catalogs.products import product_codes_match
 from app.common.email_identity import (
     reply_contact_name as _reply_contact_name,
@@ -31,34 +34,6 @@ from app.domain import HandoffReason, SendContext, evaluate_send_policy
 from app.imports import load_content
 from app.mail import append_quoted_reply
 from app.settings import get_settings
-
-
-def _verified_catalog_listing(products: list[Product]) -> tuple[str, str]:
-    """Render approved catalog facts without prescribing the email wording."""
-
-    header = "No. | Code | Product Name | CAS No. | Content"
-    rows: list[str] = [header]
-    html_rows = [
-        '<table border="1" cellpadding="4" cellspacing="0" '
-        'style="border-collapse:collapse">',
-        '<tr><th align="left">No.</th><th align="left">Code</th>'
-        '<th align="left">Product Name</th><th align="left">CAS No.</th>'
-        '<th align="left">Content</th></tr>',
-    ]
-    for number, product in enumerate(products, start=1):
-        values = (
-            str(number),
-            str(product.catalog_code or "-").strip(),
-            str(product.name or "-").strip(),
-            str(product.cas_no or "-").strip(),
-            str(product.content or "-").strip(),
-        )
-        rows.append(" | ".join(values))
-        html_rows.append(
-            "<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in values) + "</tr>"
-        )
-    html_rows.append("</table>")
-    return "\n".join(rows), "".join(html_rows)
 
 
 async def _maybe_send_product_list(
@@ -180,17 +155,13 @@ async def _maybe_send_product_list(
             category=category,
             products=products,
             request_text=request_text,
-            # Every AI-authored product-list email carries the exact verified
-            # catalog as an attachment; the model only writes the surrounding
-            # prose and cannot alter the catalog rows.
-            default_file_format="xlsx",
         )
     except Exception as exc:
         await create_handoff(
             session,
             case=case,
             reason=HandoffReason.AI_FAILURE,
-            summary=f"Product list rendering failed: {type(exc).__name__}",
+            summary=f"Official product catalog loading failed: {type(exc).__name__}",
             facts=analysis_facts,
             source_email_id=email_row.id,
         )
@@ -201,7 +172,7 @@ async def _maybe_send_product_list(
     payment_term = payment.term if payment is not None else None
     payment_sentence = _payment_term_sentence(payment) if payment is not None else None
 
-    file_format = requested_product_list_file_format(request_text) or "xlsx"
+    catalog_attachment = attachments[0]
     try:
         draft_preview = await generate_product_list_ai_preview(
             settings=settings,
@@ -243,8 +214,12 @@ async def _maybe_send_product_list(
                     "product_codes": [product.code for product in products],
                     "product_count": len(products),
                     "category_breakdown": await _catalog_category_breakdown(session, products),
-                    "file_format": file_format,
+                    "file_format": "pdf",
+                    "attachment_kind": "official_catalog_pdf",
                     "attachment_filename": attachment_filename,
+                    "attachment_sha256": official_product_catalog_sha256(
+                        catalog_attachment
+                    ),
                     "payment_requested": payment_requested,
                     "payment_term": payment_term,
                     "payment_term_source": payment.source if payment is not None else None,
@@ -264,18 +239,11 @@ async def _maybe_send_product_list(
             str(draft_preview["body_text"]),
             bundle.signature_text,
         )
-        catalog_text, catalog_html = _verified_catalog_listing(products)
-        text = "\n".join(
-            [draft_body, "", catalog_text, "", bundle.signature_text.strip()]
-        )
-        html_body = (
-            "".join(
-                f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
-                for line in draft_body.splitlines()
-            )
-            + catalog_html
-            + bundle.signature_html
-        )
+        text = "\n".join([draft_body, "", bundle.signature_text.strip()])
+        html_body = "".join(
+            f"<p>{html.escape(line) if line else '&nbsp;'}</p>"
+            for line in draft_body.splitlines()
+        ) + bundle.signature_html
         source = _reply_source(email_row)
         text, html_body = append_quoted_reply(
             text,

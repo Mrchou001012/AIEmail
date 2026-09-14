@@ -7,7 +7,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.ai import explicit_product_list_requested, generic_product_list_requested
+from app.ai import explicit_product_list_requested
 from app.common.service_core import CaseLessReactivationParent, NewInquiryResolution
 from app.db import CaseStage, CaseStatus, Contact, EmailMessage, PricePolicy, Product, Quote, SalesCase
 from app.domain import HandoffReason
@@ -18,7 +18,6 @@ from app.inbound.inquiry_matching import (
     _resolve_category_inquiry_case,
 )
 from app.mail import ParsedEmail, has_thread_subject_prefix, normalized_subject
-from app.settings import get_settings
 
 
 async def _resolve_new_inquiry_case(
@@ -94,6 +93,43 @@ async def _resolve_new_inquiry_case(
             "product_codes": product_codes,
         }
     )
+    if not product_codes and explicit_product_list_requested(combined_text):
+        # The official company PDF covers every product family. A plain catalog
+        # request therefore needs neither CRM category matching nor public-web
+        # company research. Keep it as a productless case for the bounded
+        # product-list reply workflow.
+        currency_rows = await session.execute(
+            select(SalesCase.currency).where(
+                SalesCase.customer_id == contact.customer_id,
+                SalesCase.status.not_in(
+                    [CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]
+                ),
+            )
+        )
+        currencies = set(currency_rows.scalars().all())
+        currency = next(iter(currencies)) if len(currencies) == 1 else "USD"
+        sales_case = SalesCase(
+            customer_id=contact.customer_id,
+            contact_id=contact.id,
+            product_id=None,
+            category_id=None,
+            currency=currency,
+            stage=CaseStage.QUOTING,
+            status=CaseStatus.ACTIVE,
+            subject_key=normalized_subject(parsed.subject)[:255],
+        )
+        session.add(sales_case)
+        await session.flush()
+        return NewInquiryResolution(
+            sales_case,
+            facts={
+                **facts,
+                "currency": currency,
+                "product_pending": True,
+                "category_pending": False,
+                "match_basis": "official_product_catalog_request",
+            },
+        )
     if len(product_codes) != 1:
         if not product_codes:
             category_resolution = await _resolve_category_inquiry_case(
@@ -104,62 +140,6 @@ async def _resolve_new_inquiry_case(
             )
             if category_resolution is not None:
                 return category_resolution
-            # An explicit list request from one known contact is safe to
-            # represent as a product/category-pending case.  This lets the
-            # normal AI job run bounded company research instead of creating a
-            # premature case-less handoff.  Multiple internal interests remain
-            # ambiguous and are never overridden by public web evidence.
-            if (
-                (get_settings().company_research_enabled or generic_product_list_requested(combined_text))
-                and explicit_product_list_requested(combined_text)
-                and not facts.get("active_interest_categories")
-            ):
-                currency_rows = await session.execute(
-                    select(SalesCase.currency).where(
-                        SalesCase.customer_id == contact.customer_id,
-                        SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
-                    )
-                )
-                currencies = set(currency_rows.scalars().all())
-                currency = next(iter(currencies)) if len(currencies) == 1 else "USD"
-                sales_case = SalesCase(
-                    customer_id=contact.customer_id,
-                    contact_id=contact.id,
-                    product_id=None,
-                    category_id=None,
-                    currency=currency,
-                    stage=CaseStage.QUOTING,
-                    status=CaseStatus.ACTIVE,
-                    subject_key=normalized_subject(parsed.subject)[:255],
-                )
-                session.add(sales_case)
-                await session.flush()
-                return NewInquiryResolution(
-                    sales_case,
-                    facts={
-                        **facts,
-                        "currency": currency,
-                        "product_pending": True,
-                        "category_pending": True,
-                        "match_basis": (
-                            "generic_product_list_pending_catalog"
-                            if generic_product_list_requested(combined_text)
-                            else "explicit_product_list_pending_company_research"
-                        ),
-                    },
-                )
-            if explicit_product_list_requested(combined_text) and not facts.get("active_interest_categories"):
-                return NewInquiryResolution(
-                    None,
-                    HandoffReason.PRODUCT_CATEGORY_REVIEW,
-                    "Product-list request has no unique CRM/Excel category; company research is disabled",
-                    {
-                        **facts,
-                        "product_pending": True,
-                        "category_pending": True,
-                        "company_research": {"status": "DISABLED"},
-                    },
-                )
         elif len(product_codes) > 1:
             # Multi-product quotation: keep the whole thread for automatic
             # processing only when every named product exists in the active

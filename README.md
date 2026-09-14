@@ -78,7 +78,7 @@ The demo script reports whether outreach was newly queued or already present, wa
 
 Duplicate raw messages do not create duplicate email-processing jobs. If a recovered worker processes the same inbound email again, the unique source-email constraint reuses the first handoff, audit event, and notification job.
 
-## Categorized product catalog and automatic product-list replies
+## Product catalog and automatic product-list replies
 
 The categorized product list from `产品们.docx` is stored as `config/product_catalog.yaml`
 (three major categories: Industrial Silanes, Pharmaceutical, Rubber & Plastics; 70
@@ -104,32 +104,27 @@ stored on `customers.metadata_json["interests"]` (the English `POST /admin/impor
 does the same from the product's category). For example, `工业硅烷` records an
 `industrial_silanes` interest.
 
-When a new inbound email arrives from a known contact and names no specific product
-code, the resolver creates a category case only when the CRM record has exactly one
-active interest category. The AI then classifies the email (product list/catalog
-requests and category-only mentions such as "we are interested in industrial silane"
-are `product_list_request`); the worker queues a deterministic, price-free reply with
-the full product list for that category (`message_kind=PRODUCT_LIST`) instead of a
-human handoff. If the customer names a specific product code together with a product
-list request, the reply uses that product's category. Risky intents (samples, orders,
-shipping, technical, complaints, counteroffers), suppressed contacts, missing
-`auto_send_allowed`, and low-confidence messages still create a handoff exactly as
-before.
+For a plain product-list/catalog request, the resolver no longer guesses a product
+category from CRM interests or public company research. The AI writes only the
+customer-facing reply prose, and delivery always attaches the version-controlled
+official `config/content/Catalog.pdf` (`message_kind=PRODUCT_LIST`). The PDF is not
+generated from database rows and the email body does not reproduce a fixed product
+table. Requests for Excel or CSV still receive the official PDF so there is only one
+approved catalog artifact.
 
-An explicit request such as "share your products with CAS# in Excel" attaches an
-`.xlsx` workbook; an explicit CSV request attaches UTF-8 CSV. The file contains only
-active products from the selected category and only curated database fields (series,
-code, product name, CAS number, and content). Missing CAS numbers remain blank: neither
-the model nor the renderer infers catalog facts. The same catalog remains visible in
-the message body, and the attachment metadata is persisted with the outbound email.
+`PRODUCT_LIST_AUTO_SEND_ENABLED=true` allows a policy-safe request to be queued after
+AI drafting. When it is false, the same AI draft and PDF appear in the handoff review
+page and require explicit approval. The prepared draft stores the PDF SHA-256; approval
+fails closed if the file changed or if the draft predates this PDF workflow. Risky
+intents (samples, orders, shipping, technical, complaints, counteroffers), suppressed
+contacts, missing `auto_send_allowed`, and low-confidence messages still create a
+handoff exactly as before.
 
 ### Optional public company research for unknown product interests
 
-When a known contact explicitly asks for a product list but CRM/Excel contains
-no active interest category, the application can perform a bounded Anthropic
-web search before deciding which catalog series is relevant. Internal
-CRM/Excel interests always win: research is skipped when there is one known
-category, and multiple internal categories still require a human decision.
+Plain product-list requests bypass company research because they receive the official
+complete PDF. Company research remains available for legacy/category-specific review
+and backfill workflows where a category decision is still genuinely required.
 
 Research and autonomous use have separate switches. Start in observation mode:
 
@@ -841,7 +836,7 @@ PRODUCT_LIST_AUTO_SEND_ENABLED=false
 QUOTE_AUTO_SEND_ENABLED=false
 ```
 
-An exact COA request, a known-category product-list request, or a policy-valid
+An exact COA request, a product-list request, or a policy-valid
 standard quote then creates an editable review draft. COA and product-list
 attachments are regenerated or re-read at approval. A quote approval rechecks
 the active price-policy source hash, commercial price/inventory cycle, quote

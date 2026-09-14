@@ -7,8 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import InboundAnalysis, generic_product_list_requested
-from app.catalogs.product_catalog import build_product_list_attachment
 from app.catalogs.product_list_drafting import generate_product_list_ai_preview
+from app.catalogs.product_list_service import (
+    official_product_catalog_attachment,
+    official_product_catalog_sha256,
+)
 from app.coa.coa_preview import prepare_detected_coa_preview
 from app.common.email_identity import reply_contact_name as _reply_contact_name
 from app.common.service_core import (
@@ -72,41 +75,27 @@ async def _prepared_handoff_draft_preview(
 
     prepared_product_list = stored_facts.get("prepared_product_list")
     if generic_catalog_request and not isinstance(prepared_product_list, dict):
-        products = list(
-            (
-                await session.scalars(
-                    select(Product)
-                    .join(ProductCategory, Product.category_id == ProductCategory.id)
-                    .where(
-                        Product.active.is_(True),
-                        Product.catalog_visible.is_(True),
-                        ProductCategory.active.is_(True),
-                    )
-                    .order_by(
-                        ProductCategory.sort_order,
-                        Product.sort_order,
-                        Product.id,
-                    )
-                )
-            ).all()
-        )
-        if not products:
-            raise ValueError("客户要求产品清单，但当前没有已启用的产品目录；请先导入或启用产品数据")
+        catalog_file = official_product_catalog_attachment()
         prepared_product_list = {
-            "scope": "all",
+            "scope": "official_catalog",
             "category_id": None,
             "category_key": "all_products",
             "category_name": "All Products",
-            "product_ids": [product.id for product in products],
-            "product_codes": [product.code for product in products],
-            "file_format": "xlsx",
+            "product_ids": [],
+            "product_codes": [],
+            "file_format": "pdf",
+            "attachment_kind": "official_catalog_pdf",
+            "attachment_filename": catalog_file.filename,
+            "attachment_sha256": official_product_catalog_sha256(catalog_file),
         }
         stored_facts["prepared_product_list"] = prepared_product_list
 
     missing_business_facts: list[str] = []
     if isinstance(prepared_product_list, dict):
-        file_format: str | None
-        if prepared_product_list.get("scope") == "all":
+        if prepared_product_list.get("scope") == "official_catalog":
+            category = _all_products_catalog_category()
+            products = []
+        elif prepared_product_list.get("scope") == "all":
             category = _all_products_catalog_category()
             products = list(
                 (
@@ -126,7 +115,6 @@ async def _prepared_handoff_draft_preview(
                     )
                 ).all()
             )
-            file_format = "xlsx"
         else:
             category_id = int(prepared_product_list.get("category_id") or 0)
             loaded_category = await session.get(ProductCategory, category_id)
@@ -146,19 +134,11 @@ async def _prepared_handoff_draft_preview(
                     )
                 ).all()
             )
-            raw_file_format = prepared_product_list.get("file_format")
-            file_format = str(raw_file_format) if raw_file_format is not None else None
-        if not products:
+        if not products and prepared_product_list.get("scope") != "official_catalog":
             raise ValueError("已准备的产品清单中没有启用的产品")
 
-        attachment_filename: str | None = None
-        if file_format is not None:
-            catalog_file = build_product_list_attachment(
-                category=category,
-                products=products,
-                file_format=str(file_format),
-            )
-            attachment_filename = catalog_file.filename
+        catalog_file = official_product_catalog_attachment()
+        attachment_filename = catalog_file.filename
         contact_name = _reply_contact_name(
             sales_case.contact.name,
             source_email.body_text,
@@ -167,6 +147,7 @@ async def _prepared_handoff_draft_preview(
         payment_term: str | None = None
         payment_term_source: str | None = None
         payment_term_quote_id: int | None = None
+        payment_sentence: str | None = None
         if payment_requested:
             payment = await _customer_payment_term(
                 session,
@@ -175,16 +156,27 @@ async def _prepared_handoff_draft_preview(
             payment_term = payment.term
             payment_term_source = payment.source
             payment_term_quote_id = payment.quote_id
-        payment_sentence = _payment_term_sentence(payment) if payment is not None else None
+            payment_sentence = _payment_term_sentence(payment)
 
+        official_scope = prepared_product_list.get("scope") in {
+            "all",
+            "official_catalog",
+        }
         prepared_product_list = {
             **prepared_product_list,
-            "product_ids": [product.id for product in products],
-            "product_codes": [product.code for product in products],
-            "product_count": len(products),
-            "category_breakdown": await _catalog_category_breakdown(session, products),
-            "file_format": file_format,
+            "product_ids": [] if official_scope else [product.id for product in products],
+            "product_codes": [] if official_scope else [product.code for product in products],
+            "product_count": None if official_scope else len(products),
+            "category_breakdown": (
+                []
+                if official_scope
+                else await _catalog_category_breakdown(session, products)
+            ),
+            "file_format": "pdf",
+            "scope": "official_catalog" if official_scope else prepared_product_list.get("scope"),
+            "attachment_kind": "official_catalog_pdf",
             "attachment_filename": attachment_filename,
+            "attachment_sha256": official_product_catalog_sha256(catalog_file),
             "payment_requested": payment_requested,
             "payment_term": payment_term,
             "payment_term_source": payment_term_source,

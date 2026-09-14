@@ -210,8 +210,8 @@ answer or promise a response timeframe. Do not claim that a quotation, attachmen
 specification, or sample is enclosed unless the application explicitly says so. The closing field
 must be only a short sign-off such as "Best regards,"; do not include a name or company signature
 because the application adds it separately. Keep the email natural and ready for a human to edit.
-When draft_purpose is product_list_reply, write the reply specifically for the approved product
-category and the customer's current message. Product catalog entries and approved attachments are
+When draft_purpose is product_list_reply, write the reply specifically for the approved catalog
+scope and the customer's current message. Product catalog entries and approved attachments are
 application-controlled facts: do not alter, add, or infer any product, code, CAS number, content,
 price, availability, or attachment. You may say the product list is attached only when a non-empty
 approved_attachments list is supplied. Do not dump the complete catalog into the prose when the
@@ -1300,17 +1300,22 @@ class AIClient:
                 attachment_name = str(
                     attachments[0].get("filename") if attachments else ""
                 ).strip()
-                catalog_sentence = (
-                    f"Please find attached our current {category_name} product list "
-                    f"({attachment_name})."
-                    if attachment_name
-                    else f"We are pleased to share our current {category_name} product range."
-                )
-                interest_sentence = (
-                    "Thank you for your interest in our products."
-                    if category_name.casefold() == "all products"
-                    else f"Thank you for your interest in our {category_name} products."
-                )
+                complete_catalog = category_name.casefold() == "all products"
+                if complete_catalog:
+                    catalog_sentence = (
+                        f"Please find attached our current complete product catalog ({attachment_name})."
+                        if attachment_name
+                        else "We are pleased to share our current complete product catalog."
+                    )
+                    interest_sentence = "Thank you for your interest in our products."
+                else:
+                    catalog_sentence = (
+                        f"Please find attached our current {category_name} product list "
+                        f"({attachment_name})."
+                        if attachment_name
+                        else f"We are pleased to share our current {category_name} product range."
+                    )
+                    interest_sentence = f"Thank you for your interest in our {category_name} products."
                 result = EmailDraftPreview(
                     subject=subject[:998],
                     greeting=f"Dear {contact_name},",

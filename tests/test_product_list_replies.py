@@ -3,10 +3,8 @@ from decimal import Decimal
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
-from io import BytesIO
 
 import pytest
-from openpyxl import load_workbook
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -16,12 +14,7 @@ from app.ai import AIClient, CompanyCategoryDecision, CompanyResearchSource
 from app.api import handoff_detail
 from app.catalogs.product_catalog import import_product_catalog
 from app.db import (
-    AgentRun,
-    AgentRunStatus,
-    AgentStep,
     AIInvocation,
-    AssistanceRequest,
-    AssistanceStatus,
     AuditEvent,
     CaseStage,
     CaseStatus,
@@ -42,7 +35,6 @@ from app.db import (
     EmailMessage as DBEmailMessage,
 )
 from app.domain import HandoffReason
-from app.handoffs.agent_runtime import answer_product_category_assistance
 from app.services import (
     backfill_product_list_requests,
     generate_handoff_draft_preview,
@@ -50,7 +42,6 @@ from app.services import (
     prepared_product_list_attachment,
     process_inbound,
     queue_prepared_product_list_reply,
-    resume_agent_run,
     send_one_outbox,
 )
 from app.settings import get_settings
@@ -238,6 +229,35 @@ async def _queued_product_list(db_session: AsyncSession) -> Outbox | None:
     )
 
 
+async def _make_case_less_legacy_handoff(
+    db_session: AsyncSession,
+    email_row: DBEmailMessage,
+) -> Handoff:
+    """Recreate the pre-official-PDF state used by backfill-only tests."""
+
+    sales_case = (
+        await db_session.get(SalesCase, email_row.case_id)
+        if email_row.case_id is not None
+        else None
+    )
+    email_row.case_id = None
+    await db_session.flush()
+    if sales_case is not None:
+        await db_session.delete(sales_case)
+    handoff = Handoff(
+        case_id=None,
+        source_email_id=email_row.id,
+        reason_code=HandoffReason.HUMAN_CONTROL.value,
+        summary="Legacy product-list request requires review",
+        extracted_facts={"product_pending": True},
+        status="OPEN",
+        dingtalk_status="SENT",
+    )
+    db_session.add(handoff)
+    await db_session.commit()
+    return handoff
+
+
 async def test_crm_interest_triggers_automatic_product_list_reply(
     db_session: AsyncSession,
 ) -> None:
@@ -255,18 +275,24 @@ async def test_crm_interest_triggers_automatic_product_list_reply(
     case = await db_session.get(SalesCase, email_row.case_id)
     assert case is not None
     assert case.product_id is None
-    assert case.category_id is not None
-    category = await db_session.get(ProductCategory, case.category_id)
-    assert category is not None and category.key == "industrial_silanes"
+    assert case.category_id is None
     assert await db_session.scalar(select(func.count()).select_from(Handoff)) == 0
 
     await process_inbound(db_session, email_row.id)
 
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
-    assert outbox.business_key == f"inbound-product-list:{email_row.id}"
-    assert "YAC-A110" in outbox.raw_message
-    assert "919-30-2" in outbox.raw_message
+    assert outbox.business_key == f"inbound-product-list:{email_row.id}:all"
+    mime = BytesParser(policy=policy.default).parsebytes(
+        outbox.raw_message.encode("utf-8")
+    )
+    attachments = [
+        part for part in mime.walk() if part.get_content_disposition() == "attachment"
+    ]
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "Catalog.pdf"
+    assert attachments[0].get_content_type() == "application/pdf"
+    assert attachments[0].get_payload(decode=True).startswith(b"%PDF-")
     assert "USD" not in outbox.raw_message
     assert "Please send us your product list for industrial silane." in outbox.raw_message
     # One copy in the plain part and one in the HTML part; neither part should
@@ -325,7 +351,7 @@ async def test_product_list_failure_after_staging_rolls_back_outbox_email_and_au
     assert after == before
 
 
-async def test_excel_cas_request_attaches_verified_catalog_workbook(
+async def test_excel_cas_request_still_attaches_official_catalog_pdf(
     db_session: AsyncSession,
 ) -> None:
     await _seed_catalog_and_interest(db_session, interests=["pharmaceutical"])
@@ -359,7 +385,7 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
             .all()
         )
         pytest.fail(
-            "catalog workbook was not queued: "
+            "official catalog was not queued: "
             f"analysis={invocation.parsed_output if invocation else None}; "
             f"handoffs={[(item.reason_code, item.summary) for item in handoffs]}"
         )
@@ -374,20 +400,9 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
     ]
     assert len(attachments) == 1
     attachment = attachments[0]
-    assert attachment.get_filename() == "Lanya_Chem_all_products_product_list.xlsx"
-    workbook = load_workbook(
-        BytesIO(attachment.get_payload(decode=True)),
-        data_only=False,
-    )
-    sheet = workbook["Product List"]
-    acac_row = next(
-        row
-        for row in sheet.iter_rows(min_row=2, values_only=True)
-        if row[2] == "AcAc"
-    )
-    assert acac_row[4] == "123-54-6"
-    # Missing specifications stay empty; only the audited CAS is populated.
-    assert acac_row[5] is None
+    assert attachment.get_filename() == "Catalog.pdf"
+    assert attachment.get_content_type() == "application/pdf"
+    assert attachment.get_payload(decode=True).startswith(b"%PDF-")
     outbound_email = await db_session.scalar(
         select(DBEmailMessage).where(
             DBEmailMessage.direction == "OUTBOUND",
@@ -396,7 +411,7 @@ async def test_excel_cas_request_attaches_verified_catalog_workbook(
     )
     assert outbound_email is not None
     assert any(
-        item["filename"] == "Lanya_Chem_all_products_product_list.xlsx"
+        item["filename"] == "Catalog.pdf"
         for item in outbound_email.attachment_metadata
     ), outbound_email.attachment_metadata
 
@@ -420,7 +435,7 @@ async def test_generic_category_interest_email_auto_replies(
 
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
-    assert "YAC-S313" in outbox.raw_message
+    assert "Catalog.pdf" in outbox.raw_message
 
 
 async def test_productless_quote_with_category_interest_sends_one_clarification(
@@ -560,7 +575,7 @@ async def test_sample_request_still_requires_human(db_session: AsyncSession) -> 
     assert handoff.reason_code == HandoffReason.SAMPLE_REQUEST.value
 
 
-async def test_unknown_interest_routes_to_semantic_handoff_when_research_disabled(
+async def test_unknown_interest_uses_official_catalog_without_category_handoff(
     db_session: AsyncSession,
 ) -> None:
     await _seed_catalog_and_interest(db_session, interests=[])
@@ -574,135 +589,58 @@ async def test_unknown_interest_routes_to_semantic_handoff_when_research_disable
         mailbox="integration-test",
     )
 
-    assert email_row is not None and email_row.case_id is None
+    assert email_row is not None and email_row.case_id is not None
+    await process_inbound(db_session, email_row.id)
 
-    handoff = await db_session.scalar(
+    assert await _queued_product_list(db_session) is not None
+    assert await db_session.scalar(
         select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None
-    assert handoff.reason_code == HandoffReason.PRODUCT_CATEGORY_REVIEW.value
-    assert handoff.extracted_facts["company_research"]["status"] == "DISABLED"
-    assert await _queued_product_list(db_session) is None
+    ) is None
 
 
-async def test_human_category_answer_resumes_agent_to_product_list_draft(
+async def test_plain_product_list_review_skips_category_selection_and_uses_pdf(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Human category selection must always stop on a visible AI draft, even
-    # when unattended product-list delivery is enabled globally.
-    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", True)
+    monkeypatch.setattr(get_settings(), "product_list_auto_send_enabled", False)
     await _seed_catalog_and_interest(db_session, interests=[])
     email_row = await ingest_raw_email(
         db_session,
         _message(
             "Product list inquiry",
             "Please send the list of solvents available.",
-            message_id="agent-category-resume@example.com",
+            message_id="official-catalog-review@example.com",
         ),
         mailbox="integration-test",
     )
     assert email_row is not None
+    await process_inbound(db_session, email_row.id)
 
     handoff = await db_session.scalar(
         select(Handoff).where(Handoff.source_email_id == email_row.id)
     )
     assert handoff is not None
-    run = await db_session.scalar(
-        select(AgentRun).where(AgentRun.handoff_id == handoff.id)
-    )
-    assert run is not None
-    assert run.status == AgentRunStatus.WAITING_HUMAN
-    request = await db_session.scalar(
-        select(AssistanceRequest).where(AssistanceRequest.run_id == run.id)
-    )
-    assert request is not None
-    assert request.status == AssistanceStatus.OPEN
-    assert request.request_type == "PRODUCT_CATEGORY_SELECTION"
-    assert {item["key"] for item in request.options_json} == {
-        "industrial_silanes",
-        "pharmaceutical",
-        "rubber_plastics",
-        "acetylacetone_salts",
-        "silicone_oil",
-    }
-
-    category = await db_session.scalar(
-        select(ProductCategory).where(
-            ProductCategory.key == "industrial_silanes"
-        )
-    )
-    assert category is not None
-    result = await answer_product_category_assistance(
-        db_session,
-        request_id=request.id,
-        category_id=category.id,
-        actor="reviewer",
-        note="Confirmed from the customer's business profile",
-    )
-    assert result.newly_answered is True
-    assert result.job is not None and result.job.kind == "resume_agent_run"
-    assert result.run.status == AgentRunStatus.RESUME_QUEUED
-    await db_session.refresh(handoff)
-    assert handoff.extracted_facts["product_list_draft_status"] == "GENERATING"
-    assert "ai_draft_preview" not in handoff.extracted_facts
-
-    repeated = await answer_product_category_assistance(
-        db_session,
-        request_id=request.id,
-        category_id=category.id,
-        actor="reviewer",
-    )
-    assert repeated.newly_answered is False
-    assert repeated.job is not None and repeated.job.id == result.job.id
-
-    await resume_agent_run(
-        db_session,
-        run_id=run.id,
-        expected_version=run.version,
-        assistance_request_id=request.id,
-    )
-
     assert await _queued_product_list(db_session) is None
-    await db_session.refresh(run)
-    await db_session.refresh(request)
-    await db_session.refresh(handoff)
-    assert run.status == AgentRunStatus.WAITING_HUMAN
-    assert run.current_step == "approve-product-list-draft"
-    assert request.status == AssistanceStatus.APPLIED
-    assert request.applied_at is not None
     assert handoff.status == "OPEN"
     assert handoff.reason_code == HandoffReason.PRODUCT_LIST_REVIEW.value
-    assert handoff.extracted_facts["human_selected_category"]["category_key"] == "industrial_silanes"
     prepared = handoff.extracted_facts["prepared_product_list"]
-    assert handoff.extracted_facts["product_list_draft_status"] == "READY"
-    assert prepared["category_key"] == "industrial_silanes"
-    assert prepared["product_ids"]
-    assert prepared["human_confirmation_required"] is True
-    assert prepared["attachment_filename"].endswith(".xlsx")
-    steps = (
-        (
-            await db_session.execute(
-                select(AgentStep)
-                .where(AgentStep.run_id == run.id)
-                .order_by(AgentStep.sequence)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert [step.kind for step in steps] == [
-        "HUMAN_HANDOFF",
-        "HUMAN_INPUT",
-        "RESUME_EXECUTION",
-    ]
-    assert steps[-1].output_json["next_step"] == "human-draft-approval"
+    assert prepared["scope"] == "official_catalog"
+    assert prepared["category_id"] is None
+    assert prepared["product_ids"] == []
+    assert prepared["attachment_filename"] == "Catalog.pdf"
+    assert prepared["file_format"] == "pdf"
+    assert len(prepared["attachment_sha256"]) == 64
 
     preview = handoff.extracted_facts["ai_draft_preview"]
     assert preview["provider"] == "stub"
-    assert "Industrial Silanes" in preview["body_text"]
     assert "Please find attached" in preview["body_text"]
     assert preview["delivery_created"] is False
+    attachment = await prepared_product_list_attachment(
+        db_session,
+        handoff_id=handoff.id,
+    )
+    assert attachment.filename == "Catalog.pdf"
+    assert attachment.payload.startswith(b"%PDF-")
     assert await _queued_product_list(db_session) is None
     outbox = await queue_prepared_product_list_reply(
         db_session,
@@ -723,9 +661,8 @@ async def test_human_category_answer_resumes_agent_to_product_list_draft(
     assert outbox.approval_handoff_id == handoff.id
     assert outbox.human_approved_by == "reviewer"
     await db_session.refresh(handoff)
-    await db_session.refresh(run)
     assert handoff.status == "RESOLVED"
-    assert run.status == AgentRunStatus.COMPLETED
+    assert "Catalog.pdf" in outbox.raw_message
 
 
 async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_customer_to_prepayment(
@@ -756,7 +693,7 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     )
     assert handoff is not None
     facts = dict(handoff.extracted_facts or {})
-    assert facts["prepared_product_list"]["scope"] == "all"
+    assert facts["prepared_product_list"]["scope"] == "official_catalog"
     facts["ai_draft_preview"] = {
         "subject": "Re: Checking in from Lanya Chem",
         "body_text": "We are reviewing your request and will get back to you.",
@@ -780,14 +717,8 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
     assert preview["provider"] == "stub"
     assert preview["missing_business_facts"] == []
     prepared = handoff.extracted_facts["prepared_product_list"]
-    assert prepared["product_count"] == 70
-    assert {row["category_key"]: row["product_count"] for row in prepared["category_breakdown"]} == {
-        "industrial_silanes": 44,
-        "pharmaceutical": 9,
-        "rubber_plastics": 15,
-        "acetylacetone_salts": 1,
-        "silicone_oil": 1,
-    }
+    assert prepared["product_count"] is None
+    assert prepared["category_breakdown"] == []
     assert prepared["payment_term"] == "Prepayment"
     assert prepared["payment_term_source"] == "new_customer_default"
     assert prepared["payment_term_quote_id"] is None
@@ -795,17 +726,14 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
 
     detail = await handoff_detail(handoff.id, "reviewer", db_session)
     review_codes = detail["facts"]["prepared_product_list"]["catalog_codes"]
-    assert review_codes
-    assert all(review_codes)
-    assert "YAC-N823(98%)" not in review_codes
+    assert review_codes == []
 
     attachment = await prepared_product_list_attachment(
         db_session,
         handoff_id=handoff.id,
     )
-    assert attachment.filename == "Lanya_Chem_all_products_product_list.xlsx"
-    workbook = load_workbook(BytesIO(attachment.payload), read_only=True)
-    assert workbook.active.max_row == 71
+    assert attachment.filename == "Catalog.pdf"
+    assert attachment.payload.startswith(b"%PDF-")
     assert await _queued_product_list(db_session) is None
 
     outbox = await queue_prepared_product_list_reply(
@@ -816,7 +744,7 @@ async def test_manual_draft_regeneration_preserves_catalog_and_defaults_new_cust
         actor="reviewer",
     )
     assert outbox.message_kind == "HUMAN_REPLY"
-    assert "Lanya_Chem_all_products_product_list.xlsx" in outbox.raw_message
+    assert "Catalog.pdf" in outbox.raw_message
 
 
 async def test_product_list_payment_term_uses_latest_sent_customer_quote(
@@ -915,7 +843,7 @@ async def test_product_list_payment_term_uses_latest_sent_customer_quote(
     assert "used previously: 30% deposit / 70% before shipment" in preview["body_text"]
 
 
-async def test_company_research_observation_mode_records_evidence_without_sending(
+async def test_plain_product_list_bypasses_company_research_observation_mode(
     db_session: AsyncSession,
     monkeypatch,
 ) -> None:
@@ -924,37 +852,12 @@ async def test_company_research_observation_mode_records_evidence_without_sendin
     monkeypatch.setattr(settings, "company_research_enabled", True)
     monkeypatch.setattr(settings, "company_research_auto_send_enabled", False)
 
+    calls = 0
+
     async def research(*args, **kwargs):
-        return (
-            CompanyCategoryDecision(
-                identity_confidence=0.98,
-                recommended_category_key="industrial_silanes",
-                category_confidence=0.94,
-                runner_up_category_key="rubber_plastics",
-                runner_up_confidence=0.20,
-                conflicting_evidence=False,
-                rationale="Two sources identify industrial silane distribution.",
-            ),
-            [
-                CompanyResearchSource(
-                    url="https://industry.example/ethachem",
-                    title="Industry directory",
-                    cited_text="Industrial silane distributor",
-                ),
-                CompanyResearchSource(
-                    url="https://trade.example/ethachem",
-                    title="Trade profile",
-                    cited_text="Silane coupling agents",
-                ),
-            ],
-            {
-                "provider": "anthropic",
-                "model": "claude-test",
-                "request_hash": "a" * 64,
-                "input_tokens": 20,
-                "output_tokens": 10,
-            },
-        )
+        nonlocal calls
+        calls += 1
+        raise AssertionError("plain product-list requests must not run company research")
 
     monkeypatch.setattr(AIClient, "research_company_category", research)
     email_row = await ingest_raw_email(
@@ -970,22 +873,15 @@ async def test_company_research_observation_mode_records_evidence_without_sendin
 
     await process_inbound(db_session, email_row.id)
 
-    assert await _queued_product_list(db_session) is None
-    handoff = await db_session.scalar(
-        select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None
-    assert handoff.reason_code == HandoffReason.PRODUCT_CATEGORY_REVIEW.value
-    research_facts = handoff.extracted_facts["company_research"]
-    assert research_facts["gate"]["eligible"] is True
-    assert research_facts["decision"]["recommended_category_key"] == "industrial_silanes"
+    assert await _queued_product_list(db_session) is not None
+    assert calls == 0
     invocation = await db_session.scalar(
         select(AIInvocation).where(AIInvocation.purpose == "company_category_research")
     )
-    assert invocation is not None and invocation.success is True
+    assert invocation is None
 
 
-async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
+async def test_plain_product_list_bypasses_company_research_and_category_cache(
     db_session: AsyncSession,
     monkeypatch,
 ) -> None:
@@ -998,26 +894,7 @@ async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
     async def research(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return (
-            CompanyCategoryDecision(
-                identity_confidence=0.98,
-                recommended_category_key="industrial_silanes",
-                category_confidence=0.94,
-                runner_up_category_key="rubber_plastics",
-                runner_up_confidence=0.20,
-                conflicting_evidence=False,
-                rationale="Two sources identify industrial silane distribution.",
-            ),
-            [
-                CompanyResearchSource(url="https://industry.example/ethachem"),
-                CompanyResearchSource(url="https://trade.example/ethachem"),
-            ],
-            {
-                "provider": "anthropic",
-                "model": "claude-test",
-                "request_hash": "b" * 64,
-            },
-        )
+        raise AssertionError("plain product-list requests must not run company research")
 
     monkeypatch.setattr(AIClient, "research_company_category", research)
     first = await ingest_raw_email(
@@ -1037,7 +914,7 @@ async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
     )
     assert first_outbox is not None
     first_case = await db_session.get(SalesCase, first.case_id)
-    assert first_case is not None and first_case.category_id is not None
+    assert first_case is not None and first_case.category_id is None
 
     second = await ingest_raw_email(
         db_session,
@@ -1055,7 +932,9 @@ async def test_company_research_high_confidence_auto_sends_and_reuses_cache(
         select(Outbox).where(Outbox.business_key == f"inbound-product-list:{second.id}")
     )
     assert second_outbox is not None
-    assert calls == 1
+    second_case = await db_session.get(SalesCase, second.case_id)
+    assert second_case is not None and second_case.category_id is None
+    assert calls == 0
 
 
 async def test_selected_legacy_handoff_can_use_company_research_backfill(
@@ -1072,11 +951,8 @@ async def test_selected_legacy_handoff_can_use_company_research_backfill(
         ),
         mailbox="integration-test",
     )
-    assert email_row is not None and email_row.case_id is None
-    handoff = await db_session.scalar(
-        select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None
+    assert email_row is not None
+    handoff = await _make_case_less_legacy_handoff(db_session, email_row)
 
     sales_case = SalesCase(
         customer_id=customer_id,
@@ -1155,7 +1031,7 @@ async def test_selected_legacy_handoff_can_use_company_research_backfill(
     assert sales_case.category_id is not None
 
 
-async def test_multiple_interests_route_to_human(db_session: AsyncSession) -> None:
+async def test_multiple_interests_do_not_block_official_catalog(db_session: AsyncSession) -> None:
     await _seed_catalog_and_interest(
         db_session,
         interests=["industrial_silanes", "pharmaceutical"],
@@ -1170,16 +1046,18 @@ async def test_multiple_interests_route_to_human(db_session: AsyncSession) -> No
         mailbox="integration-test",
     )
 
-    assert email_row is not None and email_row.case_id is None
-    handoff = await db_session.scalar(
+    assert email_row is not None and email_row.case_id is not None
+    case = await db_session.get(SalesCase, email_row.case_id)
+    assert case is not None and case.category_id is None
+
+    await process_inbound(db_session, email_row.id)
+
+    outbox = await _queued_product_list(db_session)
+    assert outbox is not None
+    assert "Catalog.pdf" in outbox.raw_message
+    assert await db_session.scalar(
         select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None
-    assert handoff.reason_code == HandoffReason.NEW_INQUIRY_REVIEW.value
-    assert handoff.extracted_facts["active_interest_categories"] == [
-        "industrial_silanes",
-        "pharmaceutical",
-    ]
+    ) is None
 
 
 async def test_product_list_backfill_previews_then_queues_old_open_handoff(
@@ -1248,11 +1126,9 @@ async def test_product_list_backfill_creates_case_after_interest_is_mapped(
         ),
         mailbox="integration-test",
     )
-    assert email_row is not None and email_row.case_id is None
-    handoff = await db_session.scalar(
-        select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None and handoff.case_id is None
+    assert email_row is not None
+    handoff = await _make_case_less_legacy_handoff(db_session, email_row)
+    assert handoff.case_id is None
 
     from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
@@ -1365,11 +1241,9 @@ async def test_product_list_backfill_preflight_failure_does_not_create_case(
         ),
         mailbox="integration-test",
     )
-    assert email_row is not None and email_row.case_id is None
-    handoff = await db_session.scalar(
-        select(Handoff).where(Handoff.source_email_id == email_row.id)
-    )
-    assert handoff is not None and handoff.case_id is None
+    assert email_row is not None
+    handoff = await _make_case_less_legacy_handoff(db_session, email_row)
+    assert handoff.case_id is None
 
     from app.catalogs.product_catalog import category_names_by_key, interest_entry, merge_customer_interests
 
@@ -1436,6 +1310,7 @@ async def test_product_list_backfill_excludes_non_unique_excel_interests(
         mailbox="integration-test",
     )
     assert email_row is not None
+    await _make_case_less_legacy_handoff(db_session, email_row)
 
     result = await backfill_product_list_requests(db_session, apply=False)
     assert result["candidate_count"] == 0
@@ -1443,7 +1318,7 @@ async def test_product_list_backfill_excludes_non_unique_excel_interests(
     assert await _queued_product_list(db_session) is None
 
 
-async def test_product_specific_list_request_sends_product_category(
+async def test_product_specific_list_request_sends_official_catalog(
     db_session: AsyncSession,
 ) -> None:
     await _seed_catalog_and_interest(db_session, interests=["industrial_silanes"])
@@ -1492,8 +1367,7 @@ async def test_product_specific_list_request_sends_product_category(
 
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
-    assert "YAC-A110" in outbox.raw_message
-    assert "YAC-N113" in outbox.raw_message
+    assert "Catalog.pdf" in outbox.raw_message
 
 
 async def test_catalog_import_is_idempotent(db_session: AsyncSession) -> None:
@@ -1706,9 +1580,7 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
     assert new_contact.customer_id == customer_id
 
     case = await db_session.get(SalesCase, email_row.case_id)
-    assert case is not None and case.category_id is not None
-    category = await db_session.get(ProductCategory, case.category_id)
-    assert category is not None and category.key == "industrial_silanes"
+    assert case is not None and case.category_id is None
 
     monkeypatch.setattr(get_settings(), "inbound_disposition_apply_enabled", True)
     await process_inbound(db_session, email_row.id)
@@ -1716,7 +1588,7 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
     assert "marketing001@witofly.com" in outbox.raw_message
-    assert "YAC-A110" in outbox.raw_message
+    assert "Catalog.pdf" in outbox.raw_message
     await db_session.refresh(old_contact)
     assert old_contact.suppressed is True
     assert old_contact.lifecycle_status == "DEPARTED"
@@ -1731,7 +1603,7 @@ async def test_departed_reply_from_same_domain_retires_old_contact_and_auto_send
     assert recipient is not None and recipient.status == "REPLIED"
 
 
-async def test_departed_reply_without_interest_researches_and_auto_sends(
+async def test_departed_reply_without_interest_skips_research_and_sends_catalog(
     db_session: AsyncSession,
     monkeypatch,
 ) -> None:
@@ -1744,37 +1616,12 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
     monkeypatch.setattr(settings, "company_research_auto_send_enabled", True)
     monkeypatch.setattr(settings, "inbound_disposition_apply_enabled", True)
 
+    calls = 0
+
     async def research(*args, **kwargs):
-        return (
-            CompanyCategoryDecision(
-                identity_confidence=0.98,
-                recommended_category_key="industrial_silanes",
-                category_confidence=0.94,
-                runner_up_category_key="rubber_plastics",
-                runner_up_confidence=0.20,
-                conflicting_evidence=False,
-                rationale="Two sources identify industrial silane distribution.",
-            ),
-            [
-                CompanyResearchSource(
-                    url="https://industry.example/witofly",
-                    title="Industry directory",
-                    cited_text="Industrial silane distributor",
-                ),
-                CompanyResearchSource(
-                    url="https://trade.example/witofly",
-                    title="Trade profile",
-                    cited_text="Silane coupling agents",
-                ),
-            ],
-            {
-                "provider": "anthropic",
-                "model": "claude-test",
-                "request_hash": "e" * 64,
-                "input_tokens": 20,
-                "output_tokens": 10,
-            },
-        )
+        nonlocal calls
+        calls += 1
+        raise AssertionError("plain product-list requests must not run company research")
 
     monkeypatch.setattr(AIClient, "research_company_category", research)
     email_row = await ingest_raw_email(
@@ -1809,7 +1656,8 @@ async def test_departed_reply_without_interest_researches_and_auto_sends(
     outbox = await _queued_product_list(db_session)
     assert outbox is not None
     assert "marketing001@witofly.com" in outbox.raw_message
-    assert "YAC-A110" in outbox.raw_message
+    assert "Catalog.pdf" in outbox.raw_message
+    assert calls == 0
     await db_session.refresh(old_contact)
     assert old_contact.suppressed is True
     assert old_contact.lifecycle_status == "DEPARTED"

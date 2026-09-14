@@ -216,7 +216,9 @@ def test_handoff_review_page_exposes_complete_human_workflow() -> None:
     assert "/draft-preview/stream" in html
     assert 'id="prepared-product-list-review"' in html
     assert "/prepared-product-list/download" in html
-    assert "下载 Excel 预览" in html
+    assert "官方完整产品册" in html
+    assert "下载 ${esc(preparedProductList.attachment_filename" in html
+    assert "官方 PDF 产品册" in html
     assert "查看 ${esc(codes.length)} 个对外产品代码" in html
     assert "preparedProductList.catalog_codes" in html
     assert 'id="send-attachment-summary"' in html
