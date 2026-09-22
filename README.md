@@ -6,6 +6,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/Docker_Compose-local_demo-2496ED?logo=docker&logoColor=white)
+![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-D22128?logo=apache&logoColor=white)
 
 AI Sales Agent connects an inbox, structured commercial data, and optional AI
 models without handing control of business-critical decisions to the model. AI
@@ -265,3 +266,7 @@ catalogs, signatures, infrastructure paths, and runbooks outside Git.
 
 If you discover a security issue, report it privately to the repository owner
 instead of opening a public issue.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

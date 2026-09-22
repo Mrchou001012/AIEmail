@@ -7,6 +7,7 @@ name = "ai-sales-agent"
 version = "0.1.0"
 description = "Bounded AI sales email and deterministic quoting MVP"
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.34,<1",
