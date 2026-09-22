@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <link rel="stylesheet" href="/admin/static/admin-shared.css">
+  <title>AIEmail 全部记录</title>
+  <style>
+    body { margin: 0; background: var(--page-bg); color: var(--text-primary); font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    button, select, input { font: inherit; }
+    .shell { width: min(1440px, calc(100% - 48px)); margin: 0 auto; padding: 28px 0 40px; }
+    .title-area { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+    .title-area h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+    .title-area .sub { margin-top: 6px; color: var(--text-secondary); font-size: 13px; }
+    .main-card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: var(--radius-card); box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04); overflow: hidden; }
+    .table-scroll { overflow-x: auto; }
+    .table-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+    .table-scroll::-webkit-scrollbar-thumb { background: #d5dbe5; border-radius: 999px; }
+    .page-ellipsis { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; color: var(--text-secondary); }
+    @media (max-width: 1100px) { .shell { width: calc(100% - 32px); } }
+    @media (min-width: 1140px) { .table-scroll { overflow-x: visible; } }
+    @media (max-width: 768px) { .title-area { flex-direction: column; } .shell { width: calc(100% - 24px); padding-top: 16px; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="title-area">
+      <div>
+        <h1>全部记录</h1>
+        <div class="sub">查看并筛选全部人工处理、发件队列和后台任务记录</div>
+      </div>
+      <a class="view-all-button" href="/dashboard"><span>←</span> 返回运行看板</a>
+    </header>
+
+    <section class="main-card">
+      <div class="card-header">
+        <h2>记录类型</h2>
+        <div class="segmented-control" id="tabs" role="tablist" aria-label="记录类型">
+          <button class="segmented-item" id="tab-handoffs" data-tab="handoffs" type="button" role="tab" aria-controls="records-panel" aria-selected="true" tabindex="0">人工处理单</button>
+          <button class="segmented-item" id="tab-outbox" data-tab="outbox" type="button" role="tab" aria-controls="records-panel" aria-selected="false" tabindex="-1">发件队列</button>
+          <button class="segmented-item" id="tab-jobs" data-tab="jobs" type="button" role="tab" aria-controls="records-panel" aria-selected="false" tabindex="-1">后台任务</button>
+        </div>
+      </div>
+
+      <div class="table-toolbar">
+        <div class="filter-group">
+          <label for="status-filter">状态</label>
+          <select id="status-filter"><option value="">全部</option></select>
+          <button id="reset-filter" type="button">重置筛选</button>
+        </div>
+        <div class="record-count" id="record-count">共 <strong>0</strong> 条记录</div>
+      </div>
+
+      <div class="table-scroll" id="records-panel" role="tabpanel" aria-labelledby="tab-handoffs" tabindex="0">
+        <table class="records-table">
+          <thead id="head"></thead>
+          <tbody id="rows"><tr><td colspan="6" class="empty">正在加载…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="pagination-bar">
+        <span class="page-range" id="page-range">—</span>
+        <div class="page-buttons" id="page-buttons"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/admin/static/records-requests.js"></script>
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    const pageSize = 100;
+    const tabs = ["handoffs", "outbox", "jobs"];
+    let filterOptions = {
+      handoffs: ["OPEN", "RESOLVED"],
+      outbox: ["PENDING", "CLAIMED", "SENT", "FAILED", "CANCELLED", "UNKNOWN"],
+      jobs: ["PENDING", "RUNNING", "DONE", "FAILED"],
+    };
+    const columns = {
+      handoffs: [
+        ["时间", "col-time"], ["原因", "col-reason"], ["摘要", "col-summary"],
+        ["状态", "col-status"], ["钉钉", "col-dingtalk"], ["更新时间", "col-updated"],
+      ],
+      outbox: [
+        ["时间", "col-time"], ["收件人", "col-recipient"], ["类型", "col-kind"],
+        ["状态", "col-status"], ["重试", "col-attempts"], ["错误", "col-error"],
+      ],
+      jobs: [
+        ["时间", "col-time"], ["任务", "col-kind"], ["状态", "col-status"],
+        ["尝试", "col-attempts"], ["可用时间", "col-available"], ["错误", "col-error"],
+      ],
+    };
+    const state = {
+      handoffs: {offset: 0, status: ""},
+      outbox: {offset: 0, status: ""},
+      jobs: {offset: 0, status: ""},
+    };
+    let current = "handoffs";
+    let lastData = null;
+    const requestCoordinator = AdminRecordsRequests.createRequestCoordinator();
+    const recordEndpoints = {
+      handoffs: "/admin/handoff-records",
+      outbox: "/admin/outbox",
+      jobs: "/admin/jobs",
+    };
+
+    function activeFromHash() {
+      const value = location.hash.replace("#", "");
+      return tabs.includes(value) ? value : "handoffs";
+    }
+    function fmt(value) {
+      if (!value) return "—";
+      return String(value).replace("T", " ").slice(0, 19);
+    }
+    function timeCell(value) {
+      const text = fmt(value);
+      const space = text.indexOf(" ");
+      if (space < 0) return `<span class="time-cell"><span class="time-date">${esc(text)}</span></span>`;
+      return `<span class="time-cell"><span class="time-date">${esc(text.slice(0, space))}</span><span class="time-time">${esc(text.slice(space + 1))}</span></span>`;
+    }
+    function short(value, max) {
+      const text = String(value ?? "").replace(/\s+/g, " ").trim();
+      return text.length > max ? `${text.slice(0, max)}…` : text;
+    }
+    function statusClass(value) {
+      const text = String(value || "").toUpperCase();
+      if (["SENT", "DONE", "RESOLVED"].includes(text)) return "green";
+      if (["FAILED", "UNKNOWN"].includes(text)) return "red";
+      if (["OPEN", "WAITING_HUMAN", "CLAIMED"].includes(text)) return "amber";
+      if (["RECEIVED", "ACTIVE"].includes(text)) return "blue";
+      if (["PROCESSING", "RUNNING"].includes(text)) return "purple";
+      return "gray";
+    }
+    function statusTag(value) {
+      const text = String(value ?? "UNKNOWN");
+      return `<span class="status-tag ${statusClass(text)}" title="${esc(text)}">${esc(text)}</span>`;
+    }
+    function reasonClass(value) {
+      const text = String(value || "").toUpperCase();
+      if (["AI_FAILURE", "BOUNCE_REVIEW", "SEND_FAILURE"].includes(text)) return "danger";
+      if (["INVENTORY_UNAVAILABLE", "INVENTORY_REVIEW"].includes(text)) return "inventory";
+      if (["THREAD_AMBIGUOUS", "PRIOR_CONTEXT"].includes(text)) return "thread";
+      if (["HUMAN_CONTROL"].includes(text)) return "neutral";
+      return "warn";
+    }
+    function reasonTag(value) {
+      const text = String(value || "UNKNOWN");
+      return `<span class="reason-tag ${reasonClass(text)}" title="${esc(text)}">${esc(text)}</span>`;
+    }
+    function renderTabs() {
+      document.querySelectorAll(".segmented-item").forEach((button) => {
+        const active = button.dataset.tab === current;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+        if (active) $("#records-panel").setAttribute("aria-labelledby", button.id);
+      });
+    }
+    function renderFilter() {
+      const select = $("#status-filter");
+      select.innerHTML = '<option value="">全部</option>' +
+        filterOptions[current].map((value) => `<option value="${value}">${value}</option>`).join("");
+      select.value = state[current].status;
+    }
+    function renderHead() {
+      $("#head").innerHTML = "<tr>" + columns[current].map(([name, cls]) => `<th class="${cls}">${name}</th>`).join("") + "</tr>";
+    }
+    function renderRow(row, tab) {
+      if (tab === "handoffs") {
+        const summary = String(row.summary || "");
+        return `<tr>
+          <td class="col-time">${timeCell(row.created_at)}</td>
+          <td class="col-reason">${reasonTag(row.reason)}</td>
+          <td class="col-summary"><a class="summary-link" href="/admin/handoffs/${row.id}/review" title="${esc(summary)}"><span class="summary-id">#${esc(row.id)}</span><span class="ellipsis">${esc(summary || "（无摘要）")}</span></a></td>
+          <td class="col-status">${statusTag(row.status)}</td>
+          <td class="col-dingtalk">${statusTag(row.dingtalk_status)}</td>
+          <td class="col-updated">${timeCell(row.updated_at)}</td>
+        </tr>`;
+      }
+      if (tab === "outbox") {
+        const recipient = String(row.recipient || "");
+        return `<tr>
+          <td class="col-time">${timeCell(row.created_at)}</td>
+          <td class="col-recipient"><span class="ellipsis" title="${esc(recipient)}">${esc(recipient)}</span></td>
+          <td class="col-kind"><span class="status-tag gray" title="${esc(row.message_kind)}">${esc(row.message_kind)}</span> #${esc(row.id)}</td>
+          <td class="col-status">${statusTag(row.status)}</td>
+          <td class="col-attempts">${esc(row.attempts)}</td>
+          <td class="col-error">${row.last_error ? `<span class="error-text ellipsis" title="${esc(row.last_error)}">${esc(short(row.last_error, 120))}</span>` : ""}</td>
+        </tr>`;
+      }
+      const kind = String(row.kind || "");
+      return `<tr>
+        <td class="col-time">${timeCell(row.created_at)}</td>
+        <td class="col-kind"><span class="status-tag gray" title="${esc(kind)}">${esc(kind)}</span> #${esc(row.id)}</td>
+        <td class="col-status">${statusTag(row.status)}</td>
+        <td class="col-attempts">${esc(row.attempts)}/${esc(row.max_attempts)}</td>
+        <td class="col-available">${timeCell(row.available_at)}</td>
+        <td class="col-error">${row.last_error ? `<span class="error-text ellipsis" title="${esc(row.last_error)}">${esc(short(row.last_error, 120))}</span>` : ""}</td>
+      </tr>`;
+    }
+    function pageNumbers(totalPages, currentPage) {
+      if (totalPages <= 7) return Array.from({length: totalPages}, (_, index) => index + 1);
+      const candidates = new Set([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
+      const sorted = [...candidates].filter((page) => page >= 1 && page <= totalPages).sort((a, b) => a - b);
+      const output = [];
+      let previous = 0;
+      for (const page of sorted) {
+        if (page - previous > 1) output.push("…");
+        output.push(page);
+        previous = page;
+      }
+      return output;
+    }
+    function renderPagination(data, tab) {
+      const total = data ? data.total : 0;
+      const items = (data && data.items) || [];
+      $("#record-count").innerHTML = `共 <strong>${total}</strong> 条记录`;
+      if (!data) {
+        $("#page-range").textContent = "—";
+        $("#page-buttons").innerHTML = "";
+        return;
+      }
+      const currentPage = Math.floor(data.offset / pageSize) + 1;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const start = total === 0 ? 0 : data.offset + 1;
+      const end = total === 0 ? 0 : data.offset + items.length;
+      $("#page-range").textContent = total === 0
+        ? "共 0 条记录"
+        : `显示第 ${start}–${end} 条，共 ${total} 条`;
+      const buttons = [];
+      buttons.push(`<button class="page-button" id="page-prev" type="button" ${data.offset <= 0 ? "disabled" : ""}>上一页</button>`);
+      for (const page of pageNumbers(totalPages, currentPage)) {
+        if (page === "…") {
+          buttons.push('<span class="page-ellipsis">…</span>');
+        } else {
+          buttons.push(`<button class="page-button ${page === currentPage ? "active" : ""}" data-page="${page}" type="button" ${page === currentPage ? 'aria-current="page"' : ""}>${page}</button>`);
+        }
+      }
+      buttons.push(`<button class="page-button" id="page-next" type="button" ${data.offset + items.length >= total ? "disabled" : ""}>下一页</button>`);
+      $("#page-buttons").innerHTML = buttons.join("");
+      document.querySelectorAll("#page-buttons [data-page]").forEach((button) => {
+        button.addEventListener("click", () => {
+          state[tab].offset = (Number(button.dataset.page) - 1) * pageSize;
+          load();
+        });
+      });
+      $("#page-prev").addEventListener("click", () => {
+        state[tab].offset = Math.max(0, state[tab].offset - pageSize);
+        load();
+      });
+      $("#page-next").addEventListener("click", () => {
+        state[tab].offset = Math.min((totalPages - 1) * pageSize, state[tab].offset + pageSize);
+        load();
+      });
+    }
+    async function api(path, options = {}) {
+      const response = await fetch(path, options);
+      if (!response.ok) {
+        let message = `${response.status} ${response.statusText}`;
+        try { message = (await response.json()).detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      return response.json();
+    }
+    async function load() {
+      const request = requestCoordinator.begin({
+        tab: current,
+        status: state[current].status,
+        offset: state[current].offset,
+      });
+      renderTabs();
+      renderFilter();
+      renderHead();
+      const params = new URLSearchParams({
+        offset: String(request.snapshot.offset),
+        limit: String(pageSize),
+      });
+      if (request.snapshot.status) params.set("status", request.snapshot.status);
+      try {
+        const data = await api(`${recordEndpoints[request.snapshot.tab]}?${params}`, {
+          signal: request.signal,
+        });
+        if (!requestCoordinator.isCurrent(request) || current !== request.snapshot.tab) return;
+        lastData = data;
+        $("#rows").innerHTML = (lastData.items || []).length
+          ? lastData.items.map((row) => renderRow(row, request.snapshot.tab)).join("")
+          : '<tr><td colspan="6" class="empty">没有匹配记录</td></tr>';
+      } catch (error) {
+        if (error.name === "AbortError" || !requestCoordinator.isCurrent(request)) return;
+        lastData = null;
+        $("#rows").innerHTML = `<tr><td colspan="6" class="empty">加载失败：${esc(error.message)}</td></tr>`;
+      }
+      renderPagination(lastData, request.snapshot.tab);
+    }
+    document.querySelectorAll(".segmented-item").forEach((button) => {
+      button.addEventListener("click", () => { location.hash = button.dataset.tab; });
+      button.addEventListener("keydown", (event) => {
+        const index = tabs.indexOf(button.dataset.tab);
+        let nextIndex = null;
+        if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+        if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === "Home") nextIndex = 0;
+        if (event.key === "End") nextIndex = tabs.length - 1;
+        if (nextIndex === null) return;
+        event.preventDefault();
+        const next = document.querySelector(`[data-tab="${tabs[nextIndex]}"]`);
+        next.focus();
+        location.hash = tabs[nextIndex];
+      });
+    });
+    $("#status-filter").addEventListener("change", () => {
+      state[current].status = $("#status-filter").value;
+      state[current].offset = 0;
+      load();
+    });
+    $("#reset-filter").addEventListener("click", () => {
+      state[current].status = "";
+      state[current].offset = 0;
+      load();
+    });
+    window.addEventListener("hashchange", () => {
+      const next = activeFromHash();
+      if (next !== current) {
+        current = next;
+        load();
+      }
+    });
+    async function initialize() {
+      try {
+        filterOptions = await api("/admin/record-statuses");
+      } catch (_) {
+        // Keep the complete local fallback when status metadata is unavailable.
+      }
+      current = activeFromHash();
+      load();
+    }
+    initialize();
+  </script>
+</body>
+</html>

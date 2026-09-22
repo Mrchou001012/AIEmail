@@ -1,0 +1,1179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <title>AIEmail 人工处理</title>
+  <style>
+    :root { color-scheme: light; --bg:#f5f7fb; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#175cd3; --red:#b42318; --green:#067647; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,input,select,textarea { font:inherit; }
+    .shell { max-width:1180px; margin:0 auto; padding:24px; }
+    .top { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    h1 { margin:0; font-size:24px; }
+    .sub { color:var(--muted); margin-top:4px; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(380px,.8fr); gap:18px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 4px 18px rgba(16,24,40,.04); margin-bottom:18px; }
+    .card h2 { font-size:16px; margin:0 0 14px; }
+    .meta { display:grid; grid-template-columns:120px 1fr; gap:8px 14px; }
+    .label { color:var(--muted); }
+    .pill { display:inline-flex; border-radius:999px; padding:3px 9px; background:#eef4ff; color:#1849a9; font-weight:650; }
+    .danger { color:var(--red); }
+    .success { color:var(--green); }
+    .mail { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:14px; max-height:620px; overflow:auto; }
+    .mail.html { white-space:normal; background:#fff; }
+    .mail.html img { max-width:100%; height:auto; }
+    .mail.html table { max-width:100%; }
+    .mail.html blockquote { margin:10px 0 10px 12px; padding-left:12px; border-left:2px solid #d0d5dd; }
+    .aiemail-remote-image { display:inline-block; padding:4px 8px; border:1px dashed #f79009; border-radius:6px; color:#b54708; background:#fffaeb; }
+    .remote-image-controls { display:flex; align-items:center; gap:10px; margin-top:10px; padding:9px 11px; border-radius:9px; background:#fffaeb; color:#7a2e0e; }
+    .remote-image-controls button { flex:0 0 auto; background:#fef0c7; color:#7a2e0e; }
+    .source-attachments { margin-top:12px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .source-attachments-title { padding:9px 12px; background:#f8fafc; font-weight:650; }
+    .source-attachment { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:10px 12px; border-top:1px solid var(--line); }
+    .source-attachment-info { min-width:0; overflow-wrap:anywhere; }
+    .source-attachment-actions { display:flex; gap:10px; white-space:nowrap; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:260px; overflow:auto; }
+    label { display:block; font-weight:650; margin:12px 0 6px; }
+    input,select,textarea { width:100%; border:1px solid #c7d0dd; border-radius:9px; padding:9px 11px; background:#fff; color:var(--ink); }
+    textarea { min-height:250px; resize:vertical; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+    button { border:0; border-radius:9px; padding:9px 13px; cursor:pointer; background:#e9eef6; color:var(--ink); font-weight:650; }
+    button.primary { background:var(--blue); color:#fff; }
+    button.secondary { background:#fff; border:1px dashed #c7d0dd; color:var(--blue); }
+    button.warn { background:#fff1f0; color:var(--red); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    button:not(:disabled) { transition:background .12s ease, filter .12s ease, transform .06s ease; }
+    button:not(:disabled):hover { filter:brightness(.97); }
+    button:not(:disabled):active { transform:translateY(1px); }
+    input:focus, select:focus, textarea:focus { outline:2px solid rgba(23,92,211,.22); outline-offset:0; border-color:var(--blue); }
+    .check { display:flex; align-items:center; gap:8px; font-weight:400; }
+    .check input { width:auto; }
+    .file-help { color:var(--muted); font-size:12px; margin-top:6px; }
+    .file-list { margin-top:8px; padding:9px 11px; border-radius:9px; background:#f8fafc; color:var(--muted); overflow-wrap:anywhere; }
+    .prepared-review { margin-top:12px; padding:12px; border:1px solid #b2ccff; border-radius:10px; background:#f5f8ff; }
+    .prepared-review.warning { border-color:#f7d394; background:#fffaeb; }
+    .prepared-review .catalog-title { font-weight:700; color:#1849a9; }
+    .catalog-breakdown { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+    .catalog-breakdown span { display:inline-flex; border-radius:999px; padding:3px 9px; background:#e7efff; color:#344054; font-size:12px; }
+    .catalog-code-details { margin-top:9px; color:var(--muted); }
+    .catalog-code-details summary { cursor:pointer; color:var(--blue); font-weight:650; }
+    .prepared-review .catalog-codes { margin-top:7px; padding:8px 10px; max-height:120px; overflow:auto; border-radius:8px; background:#fff; color:var(--muted); overflow-wrap:anywhere; }
+    .button-link { display:inline-flex; border-radius:9px; padding:9px 13px; background:#e9eef6; color:var(--blue); font-weight:650; }
+    .suggested-tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .suggested-tag { display:inline-flex; align-items:center; gap:5px; background:#eef4ff; color:#1849a9; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:650; }
+    .suggested-tag .qty { color:#667085; font-weight:400; }
+    .price-line { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; align-items:center; background:#f8fafc; border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:8px; }
+    .price-line .manual-price-product { grid-column:1 / -1; }
+    .price-line .sub { grid-column:1 / -1; margin:2px 0 0; font-size:12px; }
+    .price-line input { padding:9px 10px; }
+    .price-line .manual-price-remove { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border-radius:10px; background:#fff; border:1px solid var(--line); color:var(--muted); }
+    .price-line .manual-price-remove svg { display:block; }
+    .price-line .manual-price-remove:hover { background:#fff1f0; color:var(--red); border-color:#fda29b; }
+    .identity-review { margin:12px 0; padding:12px; border:1px solid #f7d394; border-radius:10px; background:#fffaeb; }
+    .identity-review strong { color:#7a2e0e; }
+    .row.compact { grid-template-columns:minmax(0,1fr) auto; }
+    #notice { display:none; margin-bottom:16px; border-radius:10px; padding:11px 13px; background:#eef4ff; }
+    #notice.error { display:block; background:#fff1f0; color:var(--red); }
+    #notice.ok { display:block; background:#ecfdf3; color:var(--green); }
+    .hidden { display:none !important; }
+    @media (max-width:850px) {
+      .grid { grid-template-columns:1fr; }
+      .shell { padding:14px; }
+      .meta { grid-template-columns:90px 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="top">
+      <div><h1>人工处理 <span id="handoff-id"></span></h1><div class="sub" id="headline">正在读取处理单…</div></div>
+      <a href="/dashboard">← 返回运行看板</a>
+    </div>
+    <div id="notice"></div>
+    <div class="grid">
+      <section>
+        <article class="card">
+          <h2>客户原邮件</h2>
+          <div class="meta" id="email-meta"></div>
+          <div class="mail" id="email-body">暂无原邮件</div>
+          <div class="remote-image-controls hidden" id="remote-image-controls">
+            <button id="load-remote-images" type="button">加载远程图片</button>
+            <span id="remote-image-help">默认已拦截；加载后可能向图片服务器暴露你的 IP 和浏览行为。</span>
+          </div>
+          <div class="source-attachments hidden" id="source-attachments"></div>
+        </article>
+        <article class="card">
+          <h2>系统判断</h2>
+          <div class="meta" id="handoff-meta"></div>
+          <pre id="facts">{}</pre>
+        </article>
+        <article class="card">
+          <h2>当前关联案例</h2>
+          <div id="case-detail" class="sub">尚未关联案例</div>
+          <div class="hidden" id="case-product-tools">
+            <label for="case-product-select">案例产品</label>
+            <div class="row">
+              <select id="case-product-select"></select>
+              <button id="set-case-product" type="button">设置案例产品</button>
+            </div>
+            <div class="file-help" id="case-product-help">
+              产品目录、泛询盘等可先以“产品待确认”建案；确认具体产品后再在这里补选。待确认期间不会进入自动报价。
+            </div>
+          </div>
+          <div id="association-tools">
+            <label for="case-select">关联已有案例</label>
+            <select id="case-select"></select>
+            <button id="assign" type="button">确认关联</button>
+            <div id="new-case-tools">
+              <label>或建立新案例</label>
+              <div class="identity-review hidden" id="sender-contact-review">
+                <strong>当前发件地址尚未登记，不能直接建案</strong>
+                <div class="file-help">
+                  如果客户更换了邮箱，请先搜索原公司或旧邮箱，人工确认归属后把
+                  <span id="current-sender-email"></span> 作为同一客户下的新联系人加入。旧邮箱和历史邮件都会保留。
+                </div>
+                <label for="contact-search">搜索原公司、联系人或旧邮箱</label>
+                <div class="row compact">
+                  <input id="contact-search" maxlength="320" placeholder="例如：公司名或旧邮箱">
+                  <button id="contact-search-button" type="button">搜索客户</button>
+                </div>
+                <div class="file-help" id="contact-search-state">请核对搜索结果后再确认，系统不会根据引用邮件自动认领客户。</div>
+                <label for="customer-match-select">确认所属客户</label>
+                <select id="customer-match-select"><option value="">暂无搜索结果</option></select>
+                <label for="new-sender-name">新联系人称呼</label>
+                <input id="new-sender-name" maxlength="255" value="Customer">
+                <div class="actions">
+                  <button class="primary" id="add-sender-contact" type="button" disabled>确认归属并新增联系人</button>
+                </div>
+              </div>
+              <div class="row"><select id="contact-select"></select><select id="product-select"></select></div>
+              <div class="row"><input id="currency" value="INR" maxlength="3" aria-label="币种"><button id="create-case" type="button">建立并关联</button></div>
+            </div>
+          </div>
+        </article>
+      </section>
+      <aside>
+        <article class="card hidden" id="agent-assistance-card">
+          <h2>Agent 继续处理</h2>
+          <div class="sub" id="agent-run-state"></div>
+          <div id="assistance-question"></div>
+          <div id="assistance-category-fields">
+            <label for="assistance-category">产品系列</label>
+            <select id="assistance-category"></select>
+          </div>
+          <div class="hidden" id="assistance-coa-fields">
+            <label for="assistance-coa-action">处理方式</label>
+            <select id="assistance-coa-action">
+              <option value="RETRY_LOOKUP">已补充或更正 COA，重新检索</option>
+              <option value="NO_COA_AVAILABLE">该产品目前没有 COA，转人工回复</option>
+            </select>
+            <div id="assistance-coa-retry-fields">
+              <label for="assistance-coa-query">修正后的产品名或产品代码</label>
+              <input id="assistance-coa-query" maxlength="255" placeholder="例如：DEMO-P900">
+              <label for="assistance-coa-cas">CAS（可选）</label>
+              <input id="assistance-coa-cas" maxlength="32" placeholder="例如：123-45-6">
+            </div>
+            <div class="file-help">也可以直接使用下方“人工回复”的附件入口发送一次性文件；NAS 映射仍保持只读。</div>
+          </div>
+          <label for="assistance-note">选择依据（可选）</label>
+          <input id="assistance-note" maxlength="2000" placeholder="例如：根据客户主营业务确认发送该系列">
+          <div class="actions">
+            <button class="primary" id="answer-assistance" type="button">提交并让 Agent 继续</button>
+          </div>
+          <div class="file-help" id="assistance-state"></div>
+        </article>
+        <article class="card" id="manual-price-card">
+          <h2>快速定价并发送报价</h2>
+          <div class="sub" id="manual-price-help">产品默认不预选；按需添加产品并填写单价、数量，可一次为多个产品定价，系统生成一封报价邮件发送，价格保存为历史参考；下次同产品询价仍转人工。</div>
+          <div id="manual-price-suggested" class="suggested-tags"></div>
+          <div id="manual-price-lines"></div>
+          <div class="actions">
+            <button id="manual-price-add" class="secondary" type="button">＋ 添加产品</button>
+          </div>
+          <label for="manual-price-note">处理备注</label>
+          <input id="manual-price-note" maxlength="2000" placeholder="例如：客户要 DEMO-P302，人工定价后系统代发">
+          <div class="actions">
+            <button class="primary" id="manual-price-send" type="button">定价并发送报价</button>
+          </div>
+          <div class="sub" id="manual-price-state"></div>
+        </article>
+        <article class="card" id="forward-card">
+          <h2>转发给业务员接管</h2>
+          <div class="sub" id="forward-help">输入业务员邮箱，系统按 Gmail 转发格式发送完整邮件（保留正文与附件），并把该案例转为人工接管，之后 AI 不再处理此案例。</div>
+          <label for="forward-recipient">业务员邮箱</label>
+          <input id="forward-recipient" type="email" maxlength="320" list="forward-recipient-list" placeholder="name@company.example" autocomplete="off">
+          <datalist id="forward-recipient-list"></datalist>
+          <label for="forward-note">转发备注（可选）</label>
+          <input id="forward-note" maxlength="2000" placeholder="例如：请跟进并处理该询盘">
+          <div class="actions">
+            <button class="primary" id="forward-send" type="button">转发并转人工接管</button>
+          </div>
+          <div class="sub" id="forward-state"></div>
+        </article>
+        <article class="card" id="reply-card">
+          <h2>人工回复</h2>
+          <div class="sub">可先调用当前大模型和历史邮件 RAG 生成预览。生成只保存草稿，不会发邮件或通知钉钉。</div>
+          <div class="actions"><button id="generate-draft" type="button">生成 / 重新生成 AI 草稿预览</button></div>
+          <div class="sub" id="draft-state"></div>
+          <div class="prepared-review hidden" id="prepared-product-list-review"></div>
+          <label for="reply-subject">邮件主题</label>
+          <input id="reply-subject" maxlength="998">
+          <label for="reply-body">邮件正文</label>
+          <textarea id="reply-body" maxlength="50000"></textarea>
+          <label for="reply-attachments">回复附件（可选）</label>
+          <input id="reply-attachments" type="file" multiple>
+          <div class="file-help">最多 10 个附件；单个不超过 10 MB，总计不超过 15 MB。系统会阻止可执行脚本等危险文件。</div>
+          <div class="file-list" id="attachment-list">未选择附件</div>
+          <label for="reply-note">处理备注</label>
+          <input id="reply-note" maxlength="2000" placeholder="例如：已核对价格并人工回复">
+          <label class="check"><input id="resume" type="checkbox">发送后恢复该案例的 AI 自动处理</label>
+          <div class="file-help hidden" id="send-attachment-summary"></div>
+          <div class="actions"><button class="primary" id="send" type="button">确认并加入发件队列</button></div>
+          <div class="sub" id="send-state"></div>
+        </article>
+        <article class="card">
+          <h2>其他处理</h2>
+          <div class="sub hidden" id="deliverability-help">该地址无法投递，请勿回复。确认后系统将抑制这个具体地址、跳过对应唤醒任务并暂停案例；不会影响同公司的其他邮箱。</div>
+          <div class="hidden" id="recipient-replacement">
+            <label>失败邮箱</label>
+            <div class="file-list" id="failed-recipient">—</div>
+            <label for="replacement-name">新联系人称呼</label>
+            <input id="replacement-name" maxlength="255" placeholder="留空则沿用原联系人称呼">
+            <label for="replacement-email">替代邮箱</label>
+            <input id="replacement-email" type="email" maxlength="320" placeholder="name@example.com">
+            <label class="check"><input id="replacement-resume" type="checkbox">替换后恢复当前案例的 AI 自动处理</label>
+            <div class="actions">
+              <button class="primary" id="replace-recipient" type="button">停用旧邮箱并添加替代邮箱</button>
+            </div>
+            <div class="file-help">只迁移当前处理单关联的案例；同公司其他邮箱和其他案例不会被修改。已启动的唤醒批次不会自动改收件人。</div>
+          </div>
+          <div class="actions">
+            <button class="warn hidden" id="suppress-recipient" type="button">标记地址不可投递并关闭</button>
+            <button id="takeover" type="button">人工接管</button>
+            <button id="pause" type="button">暂停案例</button>
+            <button id="resume-case" type="button">恢复案例</button>
+            <button class="warn" id="resolve" type="button">关闭处理单</button>
+          </div>
+        </article>
+      </aside>
+    </div>
+  </main>
+  <script src="/admin/static/handoff-price-lines.js"></script>
+  <script>
+    const id = Number(location.pathname.match(/handoffs\/(\d+)\/review/)?.[1]);
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    let state = null;
+    let blockedRemoteImages = [];
+    let directoryCustomers = [];
+    let automaticContactLookupKey = "";
+
+    function formatApiError(detail, fallback) {
+      if (typeof detail === "string" && detail.trim()) return detail;
+      if (Array.isArray(detail)) {
+        const messages = detail.map((item) => {
+          if (typeof item === "string") return item;
+          if (!item || typeof item !== "object") return String(item ?? "");
+          const path = Array.isArray(item.loc)
+            ? item.loc.filter((part) => part !== "body").join(".")
+            : "";
+          return [path, item.msg || item.message].filter(Boolean).join(": ") || JSON.stringify(item);
+        }).filter(Boolean);
+        if (messages.length) return messages.join("；");
+      }
+      if (detail && typeof detail === "object") {
+        return detail.message || detail.error || JSON.stringify(detail);
+      }
+      return fallback;
+    }
+
+    async function responseError(response) {
+      const fallback = `${response.status} ${response.statusText}`;
+      try {
+        const payload = await response.json();
+        return formatApiError(payload.detail ?? payload, fallback);
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {headers:{"Content-Type":"application/json", ...(options.headers || {})}, ...options});
+      if (!response.ok) {
+        throw new Error(await responseError(response));
+      }
+      return response.json();
+    }
+    async function readNdjson(response, onEvent) {
+      if (!response.ok) {
+        throw new Error(await responseError(response));
+      }
+      if (!response.body) throw new Error("当前浏览器不支持流式响应");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      try {
+        while (true) {
+          const {value, done} = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.trim()) await onEvent(JSON.parse(line));
+          }
+          if (done) break;
+        }
+        if (buffer.trim()) await onEvent(JSON.parse(buffer));
+      } catch (error) {
+        await reader.cancel();
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    function notice(message, kind = "ok") { const node = $("#notice"); node.className = kind; node.textContent = message; }
+    function options(select, rows, label) {
+      select.innerHTML = rows.length ? rows.map((row) => `<option value="${esc(row.id)}">${esc(label(row))}</option>`).join("") : '<option value="">暂无可选项</option>';
+    }
+    function defaultContactSearch(email) {
+      const [localPart = "", domain = ""] = String(email || "").toLowerCase().split("@");
+      const domainLabel = domain.split(".")[0] || "";
+      const publicMailDomains = new Set(["gmail", "googlemail", "outlook", "hotmail", "yahoo", "qq", "163", "126"]);
+      if (domainLabel && !publicMailDomains.has(domainLabel)) return domainLabel;
+      return localPart.replace(/[+._-]+/g, " ").trim();
+    }
+    function renderDirectoryCustomers(contacts) {
+      const seen = new Set();
+      directoryCustomers = [];
+      for (const row of contacts || []) {
+        if (seen.has(row.customer_id)) continue;
+        seen.add(row.customer_id);
+        directoryCustomers.push(row);
+      }
+      const select = $("#customer-match-select");
+      select.innerHTML = directoryCustomers.length
+        ? '<option value="">请选择并核对客户</option>' + directoryCustomers.map((row) =>
+            `<option value="${esc(row.customer_id)}">${esc(`${row.company_name} · 依据：${row.name} / ${row.email}`)}</option>`
+          ).join("")
+        : '<option value="">没有匹配客户，请修改关键词后重试</option>';
+      $("#add-sender-contact").disabled = true;
+      $("#contact-search-state").textContent = directoryCustomers.length
+        ? `找到 ${directoryCustomers.length} 个客户候选；请人工核对公司和旧邮箱。`
+        : "没有找到候选客户；可改用公司名、联系人名或旧邮箱搜索。";
+    }
+    async function searchContactDirectory({silent = false} = {}) {
+      const query = $("#contact-search").value.trim();
+      if (!query) {
+        if (!silent) notice("请输入原公司、联系人或旧邮箱。", "error");
+        return;
+      }
+      $("#contact-search-button").disabled = true;
+      $("#contact-search-state").textContent = "正在查询联系人目录…";
+      try {
+        const result = await api(`/admin/contact-directory?query=${encodeURIComponent(query)}`);
+        renderDirectoryCustomers(result.contacts || []);
+      } catch (error) {
+        $("#contact-search-state").textContent = `查询失败：${error.message}`;
+        if (!silent) notice(error.message, "error");
+      } finally {
+        $("#contact-search-button").disabled = false;
+      }
+    }
+    function renderCase(data) {
+      const node = $("#case-detail");
+      if (!data) { node.textContent = "尚未关联案例；发送前必须关联或建立案例。"; return; }
+      const product = data.product || "产品待确认";
+      node.innerHTML = `<div class="meta"><span class="label">案例</span><strong>#${esc(data.id)} · ${esc(data.company)}</strong><span class="label">联系人</span><span>${esc(data.contact_name)} · ${esc(data.contact_email)}</span><span class="label">产品</span><span>${esc(product)} · ${esc(data.currency)}</span><span class="label">状态</span><span>${esc(data.stage)} / ${esc(data.status)}</span><span class="label">最新报价</span><span>${data.latest_quote ? esc(`${data.latest_quote.currency} ${data.latest_quote.unit_price} · ${data.latest_quote.quantity} · 有效至 ${data.latest_quote.valid_until}`) : "无"}</span></div>`;
+    }
+    function fileSize(bytes) {
+      const value = Number(bytes || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+      return `${(value / 1024 / 1024).toFixed(2)} MB`;
+    }
+    async function renderSourceEmail(mail) {
+      const body = $("#email-body");
+      const attachmentBox = $("#source-attachments");
+      const remoteControls = $("#remote-image-controls");
+      body.classList.remove("html");
+      body.textContent = mail?.body_text || "暂无原邮件";
+      attachmentBox.classList.add("hidden");
+      attachmentBox.innerHTML = "";
+      blockedRemoteImages = [];
+      remoteControls.classList.add("hidden");
+      $("#load-remote-images").disabled = false;
+      if (!mail) return;
+      try {
+        const display = await api(`/admin/emails/${mail.id}/display`);
+        if (display.body_html) {
+          body.classList.add("html");
+          body.innerHTML = display.body_html;
+        } else {
+          body.textContent = display.body_text || mail.body_text || "暂无原邮件";
+        }
+        const attachments = display.attachments || [];
+        blockedRemoteImages = display.remote_images || [];
+        if (blockedRemoteImages.length) {
+          $("#load-remote-images").textContent = `加载远程图片（${blockedRemoteImages.length}）`;
+          $("#remote-image-help").textContent = "默认已拦截；加载后可能向图片服务器暴露你的 IP 和浏览行为。";
+          remoteControls.classList.remove("hidden");
+        }
+        if (attachments.length) {
+          attachmentBox.innerHTML = `
+            <div class="source-attachments-title">附件（${attachments.length}）</div>
+            ${attachments.map((item) => `
+              <div class="source-attachment">
+                <div class="source-attachment-info">
+                  <strong>${esc(item.filename)}</strong>
+                  <div class="sub">${esc(item.content_type)} · ${esc(fileSize(item.size))}</div>
+                </div>
+                <div class="source-attachment-actions">
+                  <a href="${esc(item.view_url)}" target="_blank" rel="noopener noreferrer">查看</a>
+                  <a href="${esc(item.download_url)}">下载</a>
+                </div>
+              </div>`).join("")}`;
+          attachmentBox.classList.remove("hidden");
+        }
+        if (display.notice) {
+          attachmentBox.innerHTML += `<div class="source-attachment"><span class="sub">${esc(display.notice)}</span></div>`;
+          attachmentBox.classList.remove("hidden");
+        }
+      } catch (error) {
+        attachmentBox.innerHTML = `<div class="source-attachment"><span class="sub">原始格式暂不可用，当前显示纯文本：${esc(error.message)}</span></div>`;
+        attachmentBox.classList.remove("hidden");
+      }
+    }
+    function renderAssistance(data) {
+      const card = $("#agent-assistance-card");
+      const requests = data.assistance_requests || [];
+      const request = requests.find((item) => item.status === "OPEN") || requests[requests.length - 1];
+      card.classList.toggle("hidden", !request);
+      if (!request) return;
+      const run = data.agent_run;
+      $("#agent-run-state").textContent = run
+        ? `任务 #${run.id} · ${run.status} · 版本 ${run.version} · 当前步骤 ${run.current_step || "—"}`
+        : "Agent 任务状态不可用";
+      $("#assistance-question").textContent = request.question || "请补充 Agent 继续执行所需的信息。";
+      const coaLookup = request.request_type === "COA_LOOKUP_CORRECTION";
+      $("#assistance-category-fields").classList.toggle("hidden", coaLookup);
+      $("#assistance-coa-fields").classList.toggle("hidden", !coaLookup);
+      const choices = [...(request.options || [])].sort((left, right) => Number(right.recommended) - Number(left.recommended));
+      $("#assistance-category").innerHTML = choices.length
+        ? '<option value="">请选择产品系列</option>' + choices.map((item) => {
+            const label = `${item.recommended ? "建议 · " : ""}${item.name}${item.name_zh ? ` / ${item.name_zh}` : ""}`;
+            return `<option value="${esc(item.category_id)}">${esc(label)}</option>`;
+          }).join("")
+        : '<option value="">当前没有可用产品系列</option>';
+      if (request.answer?.category_id) {
+        $("#assistance-category").value = String(request.answer.category_id);
+      }
+      if (coaLookup) {
+        $("#assistance-coa-action").value = request.answer?.coa_resolution || "RETRY_LOOKUP";
+        if (!$("#assistance-coa-query").value) {
+          $("#assistance-coa-query").value = request.answer?.product_query
+            || (data.facts?.missing_coa_queries || [])[0]
+            || data.facts?.coa_query
+            || "";
+        }
+        if (!$("#assistance-coa-cas").value) {
+          $("#assistance-coa-cas").value = request.answer?.cas_number || data.facts?.coa_cas_number || "";
+        }
+      }
+      const retryable = request.status === "ANSWERED" && run?.status === "BLOCKED";
+      const open = (request.status === "OPEN" || retryable) && data.status === "OPEN";
+      const coaAction = $("#assistance-coa-action").value;
+      const retryLookup = coaAction === "RETRY_LOOKUP";
+      $("#assistance-category").disabled = !open || retryable;
+      $("#assistance-coa-action").disabled = !open || retryable;
+      $("#assistance-coa-retry-fields").classList.toggle("hidden", coaLookup && !retryLookup);
+      $("#assistance-coa-query").disabled = !open || retryable || !retryLookup;
+      $("#assistance-coa-cas").disabled = !open || retryable || !retryLookup;
+      $("#assistance-note").disabled = !open;
+      $("#answer-assistance").disabled = !open || (coaLookup ? (retryLookup && !$("#assistance-coa-query").value.trim()) : choices.length === 0);
+      $("#answer-assistance").textContent = retryable
+        ? "重新尝试继续处理"
+        : coaLookup && !retryLookup
+          ? "确认暂无 COA，转人工回复"
+          : "提交并让 Agent 继续";
+      $("#assistance-state").textContent = request.status === "OPEN"
+        ? "提交后会创建幂等恢复任务；发送前仍会重新检查授权、附件和收件安全。"
+        : request.status === "ANSWERED"
+          ? retryable
+            ? `上次恢复被阻止：${run?.last_error || "请检查当前业务状态后重试。"}`
+            : "答案已保存，Agent 恢复任务正在队列中。"
+          : request.status === "APPLIED"
+            ? "答案已应用，Agent 已完成后续处理。"
+            : `当前状态：${request.status}`;
+    }
+    function render(data) {
+      state = data;
+      $("#handoff-id").textContent = `#${data.id}`;
+      $("#headline").textContent = `${data.reason} · ${data.status} · ${data.summary}`;
+      const mail = data.source_email;
+      $("#email-meta").innerHTML = mail ? `<span class="label">发件人</span><span>${esc(mail.from)}</span><span class="label">主题</span><strong>${esc(mail.subject)}</strong><span class="label">时间</span><span>${esc(new Date(mail.received_at).toLocaleString())}</span><span class="label">MIME 资源</span><span>${esc((mail.attachments || []).length ? `${mail.attachments.length} 个（内嵌图片会显示在正文中）` : "无")}</span>` : '<span class="danger">该处理单没有原始收件</span>';
+      $("#email-body").textContent = mail?.body_text || "暂无原邮件";
+      $("#handoff-meta").innerHTML = `<span class="label">原因</span><span class="pill">${esc(data.reason)}</span><span class="label">摘要</span><span>${esc(data.summary)}</span><span class="label">通知</span><span>${esc(data.dingtalk_status)}</span><span class="label">处理备注</span><span>${esc(data.resolution_note || "无")}</span>`;
+      $("#facts").textContent = JSON.stringify(data.facts || {}, null, 2);
+      renderAssistance(data);
+      renderCase(data.case);
+      options($("#case-select"), data.candidate_cases || [], (row) => `#${row.id} · ${row.company} · ${row.product || "产品待确认"} · ${row.status}`);
+      const matchingContacts = data.matching_contacts || [];
+      options($("#contact-select"), matchingContacts, (row) => `${row.name} · ${row.email}`);
+      const productOptions = (data.products || [])
+        .map((row) => `<option value="${esc(row.id)}">${esc(`${row.code} · ${row.name}`)}</option>`)
+        .join("");
+      $("#product-select").innerHTML = `<option value="">产品待确认 / 产品目录咨询</option>${productOptions}`;
+      $("#case-product-select").innerHTML = `<option value="">请选择具体产品</option>${productOptions}`;
+      $("#case-product-tools").classList.toggle("hidden", !data.case);
+      if (data.case) {
+        $("#case-product-select").value = data.case.product_id ? String(data.case.product_id) : "";
+        $("#set-case-product").disabled = data.status !== "OPEN" || Boolean(data.approved_outbox);
+        $("#case-product-help").textContent = data.case.product_pending
+          ? "当前案例为“产品待确认”：可以先生成或编辑人工回复，但不会进入自动报价。收到具体产品后再补选。"
+          : `当前产品：${data.case.product}。如客户更正产品，可在发送前修改。`;
+      }
+      const productListDraftGenerating = data.facts?.product_list_draft_status === "GENERATING";
+      if (productListDraftGenerating) {
+        $("#reply-subject").value = "";
+        $("#reply-body").value = "";
+      } else {
+        if (!$("#reply-subject").value) $("#reply-subject").value = data.suggested_reply?.subject || "";
+        if (!$("#reply-body").value) $("#reply-body").value = data.suggested_reply?.body_text || "";
+      }
+      $("#association-tools").classList.toggle("hidden", Boolean(data.case));
+      const senderNeedsReview = Boolean(mail) && !data.case && matchingContacts.length === 0;
+      $("#sender-contact-review").classList.toggle("hidden", !senderNeedsReview);
+      $("#current-sender-email").textContent = mail?.from || "";
+      $("#create-case").disabled = data.status !== "OPEN" || matchingContacts.length === 0;
+      $("#assign").disabled = data.status !== "OPEN" || !(data.candidate_cases || []).length;
+      if (senderNeedsReview && !$("#contact-search").value) {
+        $("#contact-search").value = defaultContactSearch(mail.from);
+      }
+      const blocked = data.status !== "OPEN" || !data.case || Boolean(data.approved_outbox);
+      const preparedCoa = data.facts?.prepared_coa;
+      const preparedProductList = data.facts?.prepared_product_list;
+      const preparedQuote = data.facts?.prepared_quote;
+      const preparedMultiQuote = data.facts?.prepared_multi_quote;
+      $("#generate-draft").disabled = blocked;
+      const missingBusinessFacts = preparedProductList?.missing_business_facts || [];
+      const productListBlocked = missingBusinessFacts.length > 0;
+      $("#send").disabled = blocked || productListBlocked;
+      $("#send").textContent = productListBlocked
+        ? "付款条件待重新生成，暂不可发送"
+        : preparedCoa
+        ? "确认并加入发件队列"
+        : preparedProductList
+          ? "确认并加入发件队列"
+        : preparedQuote
+          ? "确认报价并加入发件队列"
+        : preparedMultiQuote
+          ? "确认多产品报价并加入发件队列"
+        : "确认并加入发件队列";
+      const automaticAttachment = preparedCoa?.filename || preparedProductList?.attachment_filename || "";
+      $("#send-attachment-summary").textContent = automaticAttachment
+        ? `发送时将自动附加：${automaticAttachment}`
+        : "";
+      $("#send-attachment-summary").classList.toggle("hidden", !automaticAttachment);
+      const productListReview = $("#prepared-product-list-review");
+      productListReview.classList.toggle("hidden", !preparedProductList);
+      productListReview.classList.toggle("warning", productListBlocked);
+      if (preparedProductList) {
+        const officialCatalog = preparedProductList.scope === "official_catalog";
+        const codes = preparedProductList.catalog_codes || [];
+        const breakdown = preparedProductList.category_breakdown || [];
+        const scopeLabel = preparedProductList.scope === "all"
+          ? "全部产品"
+          : preparedProductList.scope === "official_catalog"
+            ? "官方完整产品册"
+          : (preparedProductList.category_name || preparedProductList.category_key || "指定分类");
+        const breakdownHtml = officialCatalog
+          ? '<div class="file-help">该附件是官方完整产品册，不再按系统推断的产品分类裁剪。</div>'
+          : breakdown.length
+          ? `<div class="catalog-breakdown">${breakdown.map((row) => `<span>${esc(row.category_name)} · ${esc(row.product_count)} 个</span>`).join("")}</div>`
+          : '<div class="file-help">分类明细将在重新生成草稿后显示</div>';
+        const codeDetails = officialCatalog
+          ? '<div class="file-help">完整产品内容请下载官方 PDF 产品册查看。</div>'
+          : codes.length
+          ? `<details class="catalog-code-details"><summary>查看 ${esc(codes.length)} 个对外产品代码</summary><div class="catalog-codes">${esc(codes.join(", "))}</div></details>`
+          : '<div class="file-help">当前分类没有可显示的对外产品代码。</div>';
+        const missingText = productListBlocked
+          ? '<div class="danger"><strong>尚不能发送：</strong>当前草稿还没有按付款规则生成。系统将沿用客户最近一次已发送报价中的付款条件；没有这类历史时默认首单预付款。请点击上方“重新生成”后再核对。</div>'
+          : "";
+        const download = preparedProductList.file_format
+          ? `<div class="actions"><a class="button-link" href="/admin/handoffs/${id}/prepared-product-list/download">下载 ${esc(preparedProductList.attachment_filename || "产品目录附件")}</a></div>`
+          : "";
+        const catalogCount = preparedProductList.product_count
+          ? ` · ${esc(preparedProductList.product_count)} 个产品`
+          : "";
+        productListReview.innerHTML = `
+          <div class="catalog-title">产品目录附件：${esc(scopeLabel)}${catalogCount}</div>
+          ${breakdownHtml}
+          ${codeDetails}
+          ${download}
+          ${missingText}
+        `;
+      } else {
+        productListReview.innerHTML = "";
+      }
+      $("#reply-attachments").disabled = blocked || Boolean(preparedCoa) || Boolean(preparedProductList) || Boolean(preparedQuote) || Boolean(preparedMultiQuote);
+      const preview = data.facts?.ai_draft_preview;
+      $("#draft-state").textContent = preview
+        ? `最终发送草稿生成于 ${new Date(preview.generated_at).toLocaleString()} · ${preview.provider}/${preview.model} · RAG 命中 ${(preview.rag_matches || []).length} 条 · 未创建发件任务`
+        : productListDraftGenerating
+          ? "正在根据所选产品系列生成 AI 草稿；尚未创建发件任务。"
+          : (!data.case ? "请先关联案例后生成。" : "尚未生成 AI 草稿预览。");
+      $("#send-state").textContent = data.approved_outbox ? `已由 ${data.approved_outbox.human_approved_by} 确认，发件状态：${data.approved_outbox.status}` : (!data.case ? "请先关联案例。" : "");
+      const deliverability = data.reason === "EMAIL_DELIVERABILITY";
+      const deliveryReport = deliverability || data.reason === "BOUNCE_REVIEW";
+      const failedRecipient = String(data.facts?.recipient || data.case?.contact_email || "").trim();
+      $("#reply-card").classList.toggle("hidden", deliveryReport);
+      $("#deliverability-help").classList.toggle("hidden", !deliverability);
+      $("#recipient-replacement").classList.toggle("hidden", !deliveryReport || !failedRecipient);
+      $("#failed-recipient").textContent = failedRecipient || "未识别";
+      if (!$("#replacement-name").value && data.case?.contact_name) {
+        $("#replacement-name").value = data.case.contact_name;
+      }
+      $("#replace-recipient").disabled = data.status !== "OPEN" || !failedRecipient;
+      $("#suppress-recipient").classList.toggle("hidden", !deliverability);
+      $("#suppress-recipient").disabled = data.status !== "OPEN";
+      $("#resolve").classList.toggle("hidden", deliverability);
+      renderManualPrice(data);
+      renderForward(data);
+    }
+    const manualPriceProducts = [];
+    const manualPriceHistory = {};
+    let manualPriceOpen = false;
+    function manualPriceRow(productId, quantity) {
+      const row = document.createElement("div");
+      row.className = "price-line";
+      row.dataset.priceLine = "";
+      row.innerHTML = `
+        <select class="manual-price-product" aria-label="产品">
+          <option value="">选择产品…</option>
+        </select>
+        <input class="manual-price-value" type="number" min="0.0001" max="1000000000" step="0.0001" placeholder="单价">
+        <input class="manual-price-quantity" type="number" min="1" step="1" placeholder="数量">
+        <button class="manual-price-remove" type="button" title="移除这行" aria-label="移除这行">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+        <div class="sub manual-price-history">暂无可参考的历史价格</div>`;
+      const select = row.querySelector(".manual-price-product");
+      for (const product of manualPriceProducts) {
+        const option = document.createElement("option");
+        option.value = product.id;
+        option.textContent = `${product.code} · ${product.name}`;
+        select.appendChild(option);
+      }
+      if (productId) select.value = String(productId);
+      if (quantity) row.querySelector(".manual-price-quantity").value = quantity;
+      select.addEventListener("change", () => updateManualPriceRowHistory(row));
+      row.querySelector(".manual-price-remove").addEventListener("click", () => {
+        row.remove();
+        updateManualPriceSendState();
+      });
+      updateManualPriceRowHistory(row);
+      return row;
+    }
+    function updateManualPriceRowHistory(row) {
+      const select = row.querySelector(".manual-price-product");
+      const node = row.querySelector(".manual-price-history");
+      const productId = Number(select.value);
+      if (!productId) {
+        node.textContent = "暂无可参考的历史价格";
+        return;
+      }
+      const history = manualPriceHistory[String(productId)] || [];
+      node.textContent = history.length
+        ? history.map((item) => `${item.currency} ${item.price} · ${item.valid_from}${item.active ? "（现行）" : ""}`).join("；")
+        : "该产品暂无历史价格";
+    }
+    function updateManualPriceSendState() {
+      const selects = [...document.querySelectorAll("#manual-price-lines .manual-price-product")];
+      $("#manual-price-send").disabled = !manualPriceOpen || !selects.some((select) => Number(select.value) > 0);
+    }
+    function renderManualPrice(data) {
+      manualPriceOpen = data.status === "OPEN";
+      manualPriceProducts.length = 0;
+      for (const product of data.products || []) manualPriceProducts.push(product);
+      for (const key of Object.keys(manualPriceHistory)) delete manualPriceHistory[key];
+      for (const [key, rows] of Object.entries(data.price_history_by_product || {})) {
+        manualPriceHistory[key] = rows;
+      }
+      const productById = new Map((data.products || []).map((product) => [String(product.id), product]));
+      const suggested = data.suggested_lines || [];
+      const suggestedNode = $("#manual-price-suggested");
+      suggestedNode.innerHTML = "";
+      if (suggested.length) {
+        const hint = document.createElement("span");
+        hint.className = "sub";
+        hint.textContent = "该处理单涉及：";
+        suggestedNode.appendChild(hint);
+        for (const line of suggested) {
+          const product = productById.get(String(line.product_id));
+          const tag = document.createElement("span");
+          tag.className = "suggested-tag";
+          tag.textContent = product ? product.code : String(line.product_id);
+          if (line.quantity) {
+            const qty = document.createElement("span");
+            qty.className = "qty";
+            qty.textContent = `数量 ${line.quantity}`;
+            tag.appendChild(qty);
+          }
+          suggestedNode.appendChild(tag);
+        }
+      }
+      const container = $("#manual-price-lines");
+      container.innerHTML = "";
+      container.appendChild(manualPriceRow(null, null));
+      const state = $("#manual-price-state");
+      state.textContent = data.status !== "OPEN" ? "处理单已关闭，不可定价发送。" : "";
+      updateManualPriceSendState();
+    }
+    function renderForward(data) {
+      const closed = data.status !== "OPEN";
+      const state = $("#forward-state");
+      state.textContent = closed ? "处理单已关闭，不可转发。" : "";
+      $("#forward-recipient").disabled = closed;
+      $("#forward-note").disabled = closed;
+      $("#forward-send").disabled = closed;
+    }
+    let forwardRecipientTimer = null;
+    async function loadForwardRecipients() {
+      const query = $("#forward-recipient").value.trim();
+      try {
+        const rows = await api(`/admin/forward-recipients?query=${encodeURIComponent(query)}`);
+        const list = $("#forward-recipient-list");
+        list.innerHTML = "";
+        for (const row of rows) {
+          const option = document.createElement("option");
+          option.value = row.email;
+          option.label = row.name ? `${row.name} <${row.email}>` : row.email;
+          list.appendChild(option);
+        }
+      } catch (_) {
+        // 联想失败不应阻断手动输入和转发。
+      }
+    }
+    async function load() {
+      try {
+        const data = await api(`/admin/handoffs/${id}`);
+        render(data);
+        await renderSourceEmail(data.source_email);
+        await loadForwardRecipients();
+        const lookupKey = data.source_email && !(data.matching_contacts || []).length && !data.case
+          ? `${data.id}:${String(data.source_email.from).toLowerCase()}`
+          : "";
+        if (lookupKey && lookupKey !== automaticContactLookupKey) {
+          automaticContactLookupKey = lookupKey;
+          await searchContactDirectory({silent:true});
+        }
+      } catch (error) {
+        notice(error.message, "error");
+      }
+    }
+    async function post(path, payload, success) { try { await api(path, {method:"POST", body:JSON.stringify(payload)}); notice(success); await load(); } catch (error) { notice(error.message, "error"); } }
+    function renderAttachments() {
+      const files = [...$("#reply-attachments").files];
+      const total = files.reduce((sum, file) => sum + file.size, 0);
+      $("#attachment-list").textContent = files.length
+        ? `${files.map((file) => `${file.name}（${(file.size / 1024 / 1024).toFixed(2)} MB）`).join("、")}；共 ${files.length} 个，${(total / 1024 / 1024).toFixed(2)} MB`
+        : "未选择附件";
+    }
+
+    $("#assign").addEventListener("click", () => {
+      const caseId = Number($("#case-select").value);
+      if (!caseId) {
+        notice("请先选择可关联的案例。", "error");
+        return;
+      }
+      post(`/admin/handoffs/${id}/assign`, {case_id:caseId}, "案例已关联。");
+    });
+    $("#contact-search-button").addEventListener("click", () => searchContactDirectory());
+    $("#contact-search").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") searchContactDirectory();
+    });
+    $("#customer-match-select").addEventListener("change", () => {
+      $("#add-sender-contact").disabled = !Number($("#customer-match-select").value) || state?.status !== "OPEN";
+    });
+    $("#add-sender-contact").addEventListener("click", async () => {
+      const customerId = Number($("#customer-match-select").value);
+      const selected = directoryCustomers.find((row) => row.customer_id === customerId);
+      const sender = String(state?.source_email?.from || "").trim();
+      const name = $("#new-sender-name").value.trim() || "Customer";
+      if (!customerId || !selected || !sender) {
+        notice("请先选择并核对所属客户。", "error");
+        return;
+      }
+      if (!confirm(`确认把 ${sender} 作为“${selected.company_name}”的新联系人加入？旧邮箱和历史记录会保留。`)) return;
+      $("#add-sender-contact").disabled = true;
+      try {
+        const result = await api(`/admin/customers/${customerId}/contacts`, {
+          method:"POST",
+          body:JSON.stringify({
+            email:sender,
+            name,
+            note:`Handoff #${id}: 人工确认客户更换或新增发件地址`,
+          }),
+        });
+        await load();
+        notice(result.created
+          ? `已将 ${result.email} 添加为“${selected.company_name}”的新联系人。现在可建立“产品待确认”案例。`
+          : `${result.email} 已属于该客户。现在可建立或关联案例。`);
+      } catch (error) {
+        notice(error.message, "error");
+      } finally {
+        $("#add-sender-contact").disabled = false;
+      }
+    });
+    $("#product-select").addEventListener("change", () => { const product = state?.products?.find((item) => item.id === Number($("#product-select").value)); if (product?.currencies?.length === 1) $("#currency").value = product.currencies[0]; });
+    $("#create-case").addEventListener("click", () => {
+      const contactId = Number($("#contact-select").value);
+      if (!contactId) {
+        notice("当前发件地址尚未登记。请先确认客户归属并新增联系人。", "error");
+        return;
+      }
+      const selectedProduct = $("#product-select").value;
+      post(
+        `/admin/handoffs/${id}/cases`,
+        {
+          contact_id:contactId,
+          product_id:selectedProduct ? Number(selectedProduct) : null,
+          currency:$("#currency").value.trim().toUpperCase(),
+        },
+        selectedProduct ? "新案例已建立并关联。" : "产品待确认案例已建立并关联。"
+      );
+    });
+    $("#set-case-product").addEventListener("click", () => {
+      const selectedProduct = Number($("#case-product-select").value);
+      if (!selectedProduct) {
+        notice("请先选择具体产品。", "error");
+        return;
+      }
+      post(
+        `/admin/handoffs/${id}/case-product`,
+        {product_id:selectedProduct},
+        "案例产品已更新。"
+      );
+    });
+    $("#manual-price-add").addEventListener("click", () => {
+      $("#manual-price-lines").appendChild(manualPriceRow(null, null));
+      updateManualPriceSendState();
+    });
+    $("#manual-price-send").addEventListener("click", async () => {
+      try {
+        AdminPriceLines.collectPriceLines($("#manual-price-lines"));
+      } catch (error) {
+        notice(error.message, "error");
+        return;
+      }
+      const lines = [];
+      const labels = [];
+      for (const row of document.querySelectorAll("#manual-price-lines > [data-price-line]")) {
+        const select = row.querySelector(".manual-price-product");
+        const productId = Number(select.value);
+        if (!productId) continue;
+        const price = Number(row.querySelector(".manual-price-value").value);
+        const quantity = Number(row.querySelector(".manual-price-quantity").value);
+        if (!(price > 0) || !(quantity > 0)) {
+          notice("请为每个已选产品填写单价和数量。", "error");
+          return;
+        }
+        labels.push(`${select.selectedOptions[0] ? select.selectedOptions[0].textContent : productId}：INR ${price} × ${quantity}`);
+        lines.push({product_id: productId, standard_price: price, quantity});
+      }
+      if (!lines.length) {
+        notice("请至少选择一个产品并填写单价和数量。", "error");
+        return;
+      }
+      if (!confirm(`确认按以下内容定价并自动发送一封报价邮件？\n${labels.join("\n")}\n价格会保存为历史参考，不用于后续自动报价。`)) return;
+      $("#manual-price-send").disabled = true;
+      try {
+        await api(`/admin/handoffs/${id}/price-quote`, {
+          method:"POST",
+          body:JSON.stringify({
+            lines,
+            currency:"INR",
+            note:$("#manual-price-note").value.trim(),
+          }),
+        });
+        notice("价格已保存，报价已加入发件队列。", "ok");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        updateManualPriceSendState();
+      }
+    });
+    $("#forward-recipient").addEventListener("input", () => {
+      clearTimeout(forwardRecipientTimer);
+      forwardRecipientTimer = setTimeout(loadForwardRecipients, 300);
+    });
+    $("#forward-send").addEventListener("click", async () => {
+      const recipient = $("#forward-recipient").value.trim();
+      const note = $("#forward-note").value.trim();
+      if (!recipient || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) {
+        notice("请输入有效的业务员邮箱。", "error");
+        return;
+      }
+      if (!confirm(`确认将本案例完整转发给 ${recipient} 并转为人工接管？转发后 AI 将不再处理该案例。`)) return;
+      $("#forward-send").disabled = true;
+      try {
+        await api(`/admin/handoffs/${id}/forward`, {
+          method: "POST",
+          body: JSON.stringify({recipient, note}),
+        });
+        notice("已转发给业务员，案例已转人工接管。", "ok");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#forward-send").disabled = state?.status !== "OPEN";
+      }
+    });
+    $("#load-remote-images").addEventListener("click", () => {
+      if (!blockedRemoteImages.length) return;
+      if (!confirm("远程图片可能用于追踪邮件是否被打开，并会向对方服务器暴露你的 IP。确认加载吗？")) return;
+      let loaded = 0;
+      let linked = 0;
+      for (const item of blockedRemoteImages) {
+        const placeholder = document.querySelector(`[data-remote-image="${item.token}"]`);
+        if (!placeholder) continue;
+        if (String(item.url).toLowerCase().startsWith("https://")) {
+          const image = document.createElement("img");
+          image.src = item.url;
+          image.alt = item.alt || "远程图片";
+          image.loading = "lazy";
+          image.referrerPolicy = "no-referrer";
+          placeholder.replaceWith(image);
+          loaded += 1;
+        } else {
+          const link = document.createElement("a");
+          link.href = item.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = item.alt || "在新窗口查看非 HTTPS 远程图片";
+          placeholder.replaceWith(link);
+          linked += 1;
+        }
+      }
+      $("#load-remote-images").disabled = true;
+      $("#remote-image-help").textContent = `已加载 ${loaded} 张；${linked ? `${linked} 张非 HTTPS 图片仅提供新窗口链接。` : "远程图片不会保存到本服务器。"}`;
+    });
+    $("#reply-attachments").addEventListener("change", renderAttachments);
+    $("#assistance-coa-action").addEventListener("change", () => {
+      const retryLookup = $("#assistance-coa-action").value === "RETRY_LOOKUP";
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN");
+      const open = Boolean(request) && state?.status === "OPEN";
+      $("#assistance-coa-retry-fields").classList.toggle("hidden", !retryLookup);
+      $("#assistance-coa-query").disabled = !open || !retryLookup;
+      $("#assistance-coa-cas").disabled = !open || !retryLookup;
+      $("#answer-assistance").disabled = !open || (retryLookup && !$("#assistance-coa-query").value.trim());
+      $("#answer-assistance").textContent = retryLookup
+        ? "提交并让 Agent 继续"
+        : "确认暂无 COA，转人工回复";
+    });
+    $("#assistance-coa-query").addEventListener("input", () => {
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN");
+      if (request?.request_type === "COA_LOOKUP_CORRECTION" && state?.status === "OPEN") {
+        $("#answer-assistance").disabled = $("#assistance-coa-action").value === "RETRY_LOOKUP"
+          && !$("#assistance-coa-query").value.trim();
+      }
+    });
+    $("#answer-assistance").addEventListener("click", async () => {
+      const request = (state?.assistance_requests || []).find((item) => item.status === "OPEN")
+        || ((state?.agent_run?.status === "BLOCKED")
+          ? (state?.assistance_requests || []).find((item) => item.status === "ANSWERED")
+          : null);
+      const categoryId = Number($("#assistance-category").value);
+      const coaLookup = request?.request_type === "COA_LOOKUP_CORRECTION";
+      const coaResolution = $("#assistance-coa-action").value;
+      const retryLookup = coaResolution === "RETRY_LOOKUP";
+      const productQuery = $("#assistance-coa-query").value.trim();
+      if (!request || (coaLookup ? (retryLookup && !productQuery) : !categoryId)) {
+        notice(coaLookup ? "请填写重新检索使用的产品名或代码。" : "请选择需要发送的产品系列。", "error");
+        return;
+      }
+      const coaConfirm = retryLookup
+        ? "确认已补充或更正标准英文 COA，并用该产品信息重新检索？"
+        : "确认该产品目前没有可提供的 COA，并转到人工回复？系统不会虚构或自动发送缺失附件。";
+      if (!confirm(coaLookup ? coaConfirm : "确认该产品系列？Agent 将据此生成可核对的 AI 邮件草稿；邮件不会立即发送，仍需你再次确认。")) return;
+      $("#answer-assistance").disabled = true;
+      try {
+        const result = await api(`/admin/assistance-requests/${request.id}/answer`, {
+          method:"POST",
+          body:JSON.stringify(coaLookup ? {
+            coa_resolution:coaResolution,
+            product_query:productQuery || null,
+            cas_number:retryLookup ? ($("#assistance-coa-cas").value.trim() || null) : null,
+            note:$("#assistance-note").value.trim(),
+          } : {
+            category_id:categoryId,
+            note:$("#assistance-note").value.trim(),
+          }),
+        });
+        notice(result.resume_job_id
+          ? `答案已保存，恢复任务 #${result.resume_job_id} 已排队。完成后请核对下方 AI 草稿并再次确认发送。`
+          : "已记录暂无 COA，请在下方核对并发送人工回复。", "ok");
+        if (!coaLookup) {
+          $("#reply-subject").value = "";
+          $("#reply-body").value = "";
+          $("#draft-state").textContent = "正在根据所选产品系列生成 AI 草稿；尚未创建发件任务。";
+        }
+        if (coaLookup && !retryLookup) {
+          $("#reply-subject").value = "";
+          $("#reply-body").value = "";
+        }
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#answer-assistance").disabled = false;
+      }
+    });
+    $("#generate-draft").addEventListener("click", async () => {
+      const button = $("#generate-draft");
+      const previousSubject = $("#reply-subject").value;
+      const previousBody = $("#reply-body").value;
+      let completed = false;
+      button.disabled = true;
+      button.textContent = "生成中…";
+      notice("正在分析客户邮件…");
+      try {
+        const response = await fetch(`/admin/handoffs/${id}/draft-preview/stream`, {
+          method: "POST",
+          headers: {"Accept": "application/x-ndjson"},
+        });
+        await readNdjson(response, async (event) => {
+          if (event.type === "status") {
+            $("#draft-state").textContent = event.message || "正在生成…";
+            notice(event.message || "正在生成…");
+          } else if (event.type === "subject") {
+            $("#reply-subject").value = event.value || "";
+          } else if (event.type === "body_reset") {
+            $("#reply-body").value = "";
+          } else if (event.type === "body_block") {
+            const body = $("#reply-body");
+            body.value += `${body.value ? "\n\n" : ""}${event.value || ""}`;
+            body.scrollTop = body.scrollHeight;
+          } else if (event.type === "complete") {
+            completed = true;
+            $("#reply-subject").value = event.preview?.subject || $("#reply-subject").value;
+            $("#reply-body").value = event.preview?.body_text || $("#reply-body").value;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "AI 草稿生成失败");
+          }
+        });
+        if (!completed) throw new Error("AI 草稿流提前结束，未保存结果");
+        notice("AI 草稿预览已生成并保存；没有创建发件任务或钉钉通知。");
+        await load();
+      } catch (error) {
+        $("#reply-subject").value = previousSubject;
+        $("#reply-body").value = previousBody;
+        notice(error.message, "error");
+      } finally {
+        button.textContent = "生成 / 重新生成 AI 草稿预览";
+        button.disabled = state?.status !== "OPEN" || !state?.case || Boolean(state?.approved_outbox);
+      }
+    });
+    $("#send").addEventListener("click", async () => {
+      const preparedCoa = state?.facts?.prepared_coa;
+      const preparedProductList = state?.facts?.prepared_product_list;
+      const preparedQuote = state?.facts?.prepared_quote;
+      const preparedMultiQuote = state?.facts?.prepared_multi_quote;
+      const attachmentNotice = preparedCoa
+        ? `系统会从 NAS 重新校验并附加 ${preparedCoa.filename}。`
+        : preparedProductList
+          ? "系统会重新校验当前启用的产品目录，并按客户要求生成附件。"
+          : preparedQuote
+            ? "系统会重新校验当前价格政策、商业数据周期和报价历史。"
+            : preparedMultiQuote
+              ? "系统会逐项重新校验产品、价格政策、商业数据周期、报价轮次和 COA。"
+          : "";
+      if (!confirm(`确认以当前内容回复客户？${attachmentNotice}邮件将进入发件队列并记录你的账号。`)) return;
+      if (preparedCoa || preparedProductList || preparedQuote || preparedMultiQuote) {
+        $("#send").disabled = true;
+        try {
+          const preparedEndpoint = preparedCoa
+            ? "approve-coa-draft"
+            : preparedProductList
+              ? "approve-product-list-draft"
+              : preparedQuote
+                ? "approve-quote-draft"
+                : "approve-multi-quote-draft";
+          const response = await fetch(`/admin/handoffs/${id}/${preparedEndpoint}`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({
+              subject:$("#reply-subject").value,
+              body_text:$("#reply-body").value,
+              note:$("#reply-note").value,
+              resume_automation:$("#resume").checked,
+            }),
+          });
+          if (!response.ok) throw new Error(await responseError(response));
+          notice("资料已重新校验，人工确认回复已加入发件队列。");
+          await load();
+        } catch (error) {
+          notice(error.message, "error");
+          $("#send").disabled = false;
+        }
+        return;
+      }
+      const form = new FormData();
+      form.append("subject", $("#reply-subject").value);
+      form.append("body_text", $("#reply-body").value);
+      form.append("note", $("#reply-note").value);
+      form.append("resume_automation", String($("#resume").checked));
+      for (const file of $("#reply-attachments").files) form.append("attachments", file);
+      $("#send").disabled = true;
+      try {
+        const response = await fetch(`/admin/handoffs/${id}/send-with-attachments`, {method:"POST", body:form});
+        if (!response.ok) {
+          throw new Error(await responseError(response));
+        }
+        notice("人工回复已加入发件队列。");
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#send").disabled = false;
+      }
+    });
+    $("#suppress-recipient").addEventListener("click", async () => {
+      if (!confirm("确认将这个具体邮箱标记为不可投递？系统会跳过后续自动发信并暂停关联案例。")) return;
+      await post(`/admin/handoffs/${id}`, {action:"suppress_recipient", note:$("#reply-note").value}, "地址已抑制，处理单已关闭，案例已暂停。");
+    });
+    $("#replace-recipient").addEventListener("click", async () => {
+      const email = $("#replacement-email").value.trim();
+      if (!email) {
+        notice("请输入替代邮箱。", "error");
+        return;
+      }
+      const oldEmail = $("#failed-recipient").textContent;
+      if (!confirm(`确认停用 ${oldEmail}，并将当前案例改用 ${email}？同公司其他邮箱和其他案例不会被修改。`)) return;
+      $("#replace-recipient").disabled = true;
+      try {
+        const result = await api(`/admin/handoffs/${id}/replace-recipient`, {
+          method:"POST",
+          body:JSON.stringify({
+            email,
+            name:$("#replacement-name").value.trim(),
+            note:$("#reply-note").value.trim(),
+            resume_case:$("#replacement-resume").checked,
+          }),
+        });
+        notice(`旧邮箱已停用，替代邮箱 ${result.email} 已关联到当前案例。`);
+        await load();
+      } catch (error) {
+        notice(error.message, "error");
+        $("#replace-recipient").disabled = false;
+      }
+    });
+    for (const [selector, action, message] of [["#takeover","takeover","案例已设为人工接管。"],["#pause","pause","案例已暂停。"],["#resume-case","resume","案例已恢复。"],["#resolve","resolve","处理单已关闭。"]]) {
+      $(selector).addEventListener("click", () => post(`/admin/handoffs/${id}`, {action, note:$("#reply-note").value}, message));
+    }
+    load();
+  </script>
+</body>
+</html>

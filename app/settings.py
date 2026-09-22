@@ -1,0 +1,351 @@
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from app.delivery.deliverability import validate_address_format
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    database_url: str = "postgresql+asyncpg://sales_agent:sales_agent_demo_password@db:5432/sales_agent"
+    demo_mode: bool = True
+    ai_provider: Literal["stub", "anthropic"] = "stub"
+    anthropic_model: str = "claude-opus-4-8"
+    anthropic_api_key: str | None = None
+    rag_enabled: bool = False
+    rag_index_path: Path = Path("runtime/rag_history/email_rag_index.json")
+    rag_top_k: int = 4
+    rag_min_similarity: float = 0.25
+
+    # Local NAS knowledge base. Customer retrieval is deny-by-default and only
+    # sees documents classified as customer_ready by the policy/approval flow.
+    nas_knowledge_enabled: bool = False
+    nas_knowledge_root: Path = Path(r"\\FILESERVER\SHARED_DATA")
+    nas_knowledge_policy_path: Path = Path("config/nas_knowledge_policy.yaml")
+    nas_knowledge_output_dir: Path = Path("runtime/nas_knowledge")
+    nas_knowledge_poll_seconds: int = 300
+    nas_knowledge_max_file_mb: int = 50
+    nas_knowledge_file_timeout_seconds: int = 5
+
+    # Deny-by-default catalog of one standard English COA per product. This is
+    # intentionally separate from broad NAS knowledge retrieval because a COA
+    # is an attachment-selection workflow, not a free-form RAG answer.
+    coa_catalog_enabled: bool = False
+    coa_catalog_root: Path = Path(
+        r"\\FILESERVER\SHARED_DATA\product-data\product-documents"
+    )
+    coa_catalog_path: Path = Path("runtime/coa_catalog/catalog.json")
+    coa_product_catalog_path: Path = Path("config/product_catalog.yaml")
+    # Catalog lookup and background NAS traversal are separate controls so a
+    # prebuilt catalog can be used safely across a high-latency network path.
+    coa_catalog_scan_enabled: bool = True
+    coa_catalog_poll_seconds: int = 300
+    coa_catalog_max_file_mb: int = 50
+    coa_catalog_file_timeout_seconds: int = 15
+    coa_auto_send_enabled: bool = False
+    product_list_auto_send_enabled: bool = False
+    quote_auto_send_enabled: bool = False
+
+    # Inbound lifecycle/qualification classification is safe to record by
+    # default. Automatic mutation remains observation-only until the production
+    # dry-run is reviewed; an authenticated reviewer may still apply one
+    # explicitly confirmed email while the global apply switch is disabled.
+    inbound_disposition_enabled: bool = True
+    inbound_disposition_ai_enabled: bool = True
+    inbound_disposition_ai_min_confidence: float = Field(default=0.80, ge=0, le=1)
+    inbound_disposition_ai_batch_enabled: bool = True
+    inbound_disposition_ai_max_batch: int = Field(default=250, ge=1, le=1000)
+    inbound_disposition_ai_batch_poll_seconds: int = Field(default=20, ge=5, le=300)
+    inbound_disposition_ai_batch_max_attempts: int = Field(default=3, ge=1, le=10)
+    inbound_disposition_internal_domains: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "example.com",
+            "example.org",
+            "example.net",
+        ]
+    )
+    inbound_disposition_apply_enabled: bool = False
+    referral_auto_contact_enabled: bool = False
+
+    # Optional, bounded web research used only when a known customer explicitly
+    # requests a product list and neither CRM nor imported Excel data identifies
+    # one catalog category.  Research and autonomous use are separate switches
+    # so production can run in observation mode first.
+    company_research_enabled: bool = False
+    company_research_auto_send_enabled: bool = False
+    company_research_cache_days: int = 90
+    company_research_max_searches: int = 2
+    company_research_min_sources: int = 2
+    company_research_min_identity_confidence: float = 0.90
+    company_research_min_category_confidence: float = 0.85
+    company_research_min_score_gap: float = 0.15
+
+    mail_transport: Literal["file", "smtp"] = "file"
+    mail_from: str = "sales-agent@example.com"
+    gmail_address: str | None = None
+    gmail_app_password: str | None = None
+    imap_host: str = "imap.gmail.com"
+    imap_port: int = 993
+    imap_sync_enabled: bool = False
+    imap_folder: str = "INBOX"
+    imap_sent_folder: str = "[Gmail]/Sent Mail"
+    imap_poll_seconds: int = 60
+    imap_batch_size: int = 50
+    imap_daily_download_limit_mb: int = 1500
+    imap_max_backoff_seconds: int = 1800
+    job_lease_seconds: int = 900
+    outbox_lease_seconds: int = 600
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 465
+    smtp_starttls: bool = False
+
+    dingtalk_transport: Literal["log", "webhook"] = "log"
+    dingtalk_webhook_url: str | None = None
+
+    commercial_gate_enabled: bool = True
+    quote_ignore_inventory: bool = False
+    commercial_data_provider: Literal["database"] = "database"
+    commercial_scope: str = "default"
+    commercial_timezone: str = "UTC"
+    commercial_open_hour: int = 9
+    business_timezone: str = "UTC"
+    business_open_hour: int = 9
+    commercial_refresh_check_seconds: int = 60
+    commercial_retry_minutes: int = 15
+    commercial_update_url: str | None = None
+    crm_review_url_template: str | None = None
+
+    reactivation_enabled: bool = True
+    reactivation_check_seconds: int = 10
+    reactivation_max_sends_per_day: int = 5
+    reactivation_default_inactive_days: int = 365
+    reactivation_default_second_days: int = 90
+
+    safe_mode: bool = True
+    auto_send_enabled: bool = False
+    recipient_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["internal@example.com"])
+    max_sends_per_hour: int = 5
+    max_sends_per_day: int = 20
+    min_send_interval_seconds: int = 120
+    send_interval_jitter_seconds: int = 180
+    gmail_transient_cooldown_seconds: int = 600
+    gmail_daily_cooldown_seconds: int = 86400
+    email_preflight_enabled: bool = True
+    mx_check_enabled: bool = True
+    mx_cache_ttl_hours: int = 168
+    mx_lookup_timeout_seconds: int = 5
+    mx_temporary_retry_minutes: int = 30
+
+    admin_username: str = "admin"
+    admin_password: str = "change-me-locally"
+    public_base_url: str = "http://localhost:8000"
+    runtime_dir: Path = Path("runtime")
+    content_dir: Path = Path("config/content")
+
+    intent_confidence_threshold: float = 0.80
+    product_confidence_threshold: float = 0.85
+    numeric_confidence_threshold: float = 0.90
+
+    @field_validator(
+        "ai_provider",
+        "mail_transport",
+        "dingtalk_transport",
+        "commercial_data_provider",
+        mode="before",
+    )
+    @classmethod
+    def normalize_mode(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("recipient_allowlist", mode="before")
+    @classmethod
+    def split_allowlist(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
+    @field_validator("recipient_allowlist")
+    @classmethod
+    def normalize_allowlist_addresses(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for address in value:
+            result = validate_address_format(address)
+            if not result.valid:
+                raise ValueError(f"allowlist entry must be a valid email address: {address}")
+            if result.normalized not in normalized:
+                normalized.append(result.normalized)
+        return normalized
+
+    @field_validator("inbound_disposition_internal_domains", mode="before")
+    @classmethod
+    def split_internal_domains(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
+    @field_validator("inbound_disposition_internal_domains")
+    @classmethod
+    def normalize_internal_domains(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw_domain in value:
+            domain = raw_domain.strip().casefold().strip(".")
+            result = validate_address_format(f"internal-check@{domain}")
+            if not domain or "@" in domain or not result.valid:
+                raise ValueError(
+                    "INBOUND_DISPOSITION_INTERNAL_DOMAINS entries must be domains"
+                )
+            normalized_domain = result.normalized.rpartition("@")[2]
+            if normalized_domain not in normalized:
+                normalized.append(normalized_domain)
+        if not normalized:
+            raise ValueError("INBOUND_DISPOSITION_INTERNAL_DOMAINS cannot be empty")
+        return normalized
+
+    @field_validator("gmail_app_password", mode="before")
+    @classmethod
+    def normalize_google_app_password(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.replace(" ", "") or None
+        return value
+
+    @field_validator("anthropic_model")
+    @classmethod
+    def exact_default_model(cls, value: str) -> str:
+        if not value.startswith("claude-"):
+            raise ValueError("ANTHROPIC_MODEL must be an exact Claude model identifier")
+        return value
+
+    @field_validator("rag_top_k")
+    @classmethod
+    def valid_rag_top_k(cls, value: int) -> int:
+        if not 1 <= value <= 10:
+            raise ValueError("RAG_TOP_K must be between 1 and 10")
+        return value
+
+    @field_validator("rag_min_similarity")
+    @classmethod
+    def valid_rag_min_similarity(cls, value: float) -> float:
+        if not -1 <= value <= 1:
+            raise ValueError("RAG_MIN_SIMILARITY must be between -1 and 1")
+        return value
+
+    @field_validator(
+        "company_research_min_identity_confidence",
+        "company_research_min_category_confidence",
+        "company_research_min_score_gap",
+    )
+    @classmethod
+    def valid_company_research_confidence(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("company research confidence thresholds must be between 0 and 1")
+        return value
+
+    @field_validator("company_research_max_searches")
+    @classmethod
+    def valid_company_research_max_searches(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("COMPANY_RESEARCH_MAX_SEARCHES must be between 1 and 5")
+        return value
+
+    @field_validator("company_research_min_sources")
+    @classmethod
+    def valid_company_research_min_sources(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("COMPANY_RESEARCH_MIN_SOURCES must be between 1 and 5")
+        return value
+
+    @field_validator("business_timezone")
+    @classmethod
+    def valid_business_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("BUSINESS_TIMEZONE must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("commercial_timezone")
+    @classmethod
+    def valid_commercial_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("COMMERCIAL_TIMEZONE must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("business_open_hour")
+    @classmethod
+    def valid_business_open_hour(cls, value: int) -> int:
+        if not 0 <= value <= 23:
+            raise ValueError("BUSINESS_OPEN_HOUR must be between 0 and 23")
+        return value
+
+    @field_validator("commercial_open_hour")
+    @classmethod
+    def valid_commercial_open_hour(cls, value: int) -> int:
+        if not 0 <= value <= 23:
+            raise ValueError("COMMERCIAL_OPEN_HOUR must be between 0 and 23")
+        return value
+
+    @field_validator("imap_batch_size")
+    @classmethod
+    def valid_imap_batch_size(cls, value: int) -> int:
+        if not 1 <= value <= 1000:
+            raise ValueError("IMAP_BATCH_SIZE must be between 1 and 1000")
+        return value
+
+    @field_validator(
+        "imap_poll_seconds",
+        "imap_daily_download_limit_mb",
+        "imap_max_backoff_seconds",
+        "max_sends_per_hour",
+        "max_sends_per_day",
+        "gmail_transient_cooldown_seconds",
+        "gmail_daily_cooldown_seconds",
+        "mx_cache_ttl_hours",
+        "mx_lookup_timeout_seconds",
+        "mx_temporary_retry_minutes",
+        "commercial_refresh_check_seconds",
+        "commercial_retry_minutes",
+        "reactivation_check_seconds",
+        "reactivation_max_sends_per_day",
+        "reactivation_default_inactive_days",
+        "reactivation_default_second_days",
+        "company_research_cache_days",
+        "nas_knowledge_poll_seconds",
+        "nas_knowledge_max_file_mb",
+        "nas_knowledge_file_timeout_seconds",
+        "coa_catalog_poll_seconds",
+        "coa_catalog_max_file_mb",
+        "coa_catalog_file_timeout_seconds",
+    )
+    @classmethod
+    def positive_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("rate and bandwidth limits must be positive")
+        return value
+
+    @field_validator("min_send_interval_seconds", "send_interval_jitter_seconds")
+    @classmethod
+    def nonnegative_interval(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("send intervals cannot be negative")
+        return value
+
+    def ensure_runtime(self) -> None:
+        (self.runtime_dir / "demo_outbox").mkdir(parents=True, exist_ok=True)
+        (self.runtime_dir / "inbound_archive").mkdir(parents=True, exist_ok=True)
+        (self.runtime_dir / "mail_archive").mkdir(parents=True, exist_ok=True)
+        self.nas_knowledge_output_dir.mkdir(parents=True, exist_ok=True)
+        self.coa_catalog_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    settings = Settings()
+    settings.ensure_runtime()
+    return settings

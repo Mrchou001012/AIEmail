@@ -1,0 +1,222 @@
+"""Handoff prepared preview workflow."""
+
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ai import InboundAnalysis, generic_product_list_requested
+from app.catalogs.product_list_drafting import generate_product_list_ai_preview
+from app.catalogs.product_list_service import (
+    official_product_catalog_attachment,
+    official_product_catalog_sha256,
+)
+from app.coa.coa_preview import prepare_detected_coa_preview
+from app.common.email_identity import reply_contact_name as _reply_contact_name
+from app.common.service_core import (
+    _all_products_catalog_category,
+    _catalog_category_breakdown,
+    _customer_payment_term,
+    _payment_details_requested,
+    _payment_term_sentence,
+)
+from app.db import EmailMessage, Handoff, Product, ProductCategory, SalesCase
+from app.domain import HandoffReason, Intent
+from app.settings import Settings
+
+
+async def _prepared_handoff_draft_preview(
+    session: AsyncSession,
+    *,
+    handoff: Handoff,
+    source_email: EmailMessage,
+    sales_case: SalesCase,
+    analysis: InboundAnalysis,
+    actor: str,
+    settings: Settings,
+) -> dict[str, Any] | None:
+    """Use deterministic prepared work before falling back to free-form AI.
+
+    The review button used to discard prepared catalog/quote/COA facts and send
+    an empty commercial-facts object to the model.  Besides producing vague
+    holding replies, that made an old product-list handoff look as though the
+    application had no catalog.  This helper upgrades generic legacy catalog
+    handoffs in place and preserves every already-prepared typed draft.
+    """
+
+    stored_facts = dict(handoff.extracted_facts or {})
+    if analysis.intent == Intent.COA_REQUEST or analysis.coa_requested:
+        result = await prepare_detected_coa_preview(
+            session,
+            handoff=handoff,
+            email_row=source_email,
+            sales_case=sales_case,
+            analysis=analysis,
+            analysis_metadata={},
+            actor=actor,
+            settings=settings,
+            persist=False,
+        )
+        return result["preview"]
+    stored_preview = stored_facts.get("ai_draft_preview")
+    prepared_keys = (
+        "prepared_coa",
+        "prepared_product_list",
+        "prepared_quote",
+        "prepared_multi_quote",
+    )
+    has_prepared_work = any(isinstance(stored_facts.get(key), dict) for key in prepared_keys)
+    request_text = f"{source_email.subject}\n{source_email.body_text}"
+    generic_catalog_request = bool(analysis.product_list_requested and generic_product_list_requested(request_text))
+
+    if not has_prepared_work and not generic_catalog_request:
+        return None
+
+    prepared_product_list = stored_facts.get("prepared_product_list")
+    if generic_catalog_request and not isinstance(prepared_product_list, dict):
+        catalog_file = official_product_catalog_attachment()
+        prepared_product_list = {
+            "scope": "official_catalog",
+            "category_id": None,
+            "category_key": "all_products",
+            "category_name": "All Products",
+            "product_ids": [],
+            "product_codes": [],
+            "file_format": "pdf",
+            "attachment_kind": "official_catalog_pdf",
+            "attachment_filename": catalog_file.filename,
+            "attachment_sha256": official_product_catalog_sha256(catalog_file),
+        }
+        stored_facts["prepared_product_list"] = prepared_product_list
+
+    missing_business_facts: list[str] = []
+    if isinstance(prepared_product_list, dict):
+        if prepared_product_list.get("scope") == "official_catalog":
+            category = _all_products_catalog_category()
+            products = []
+        elif prepared_product_list.get("scope") == "all":
+            category = _all_products_catalog_category()
+            products = list(
+                (
+                    await session.scalars(
+                        select(Product)
+                        .join(ProductCategory, Product.category_id == ProductCategory.id)
+                        .where(
+                            Product.active.is_(True),
+                            Product.catalog_visible.is_(True),
+                            ProductCategory.active.is_(True),
+                        )
+                        .order_by(
+                            ProductCategory.sort_order,
+                            Product.sort_order,
+                            Product.id,
+                        )
+                    )
+                ).all()
+            )
+        else:
+            category_id = int(prepared_product_list.get("category_id") or 0)
+            loaded_category = await session.get(ProductCategory, category_id)
+            if loaded_category is None or not loaded_category.active:
+                raise ValueError("已准备的产品分类不存在或已经停用")
+            category = loaded_category
+            products = list(
+                (
+                    await session.scalars(
+                        select(Product)
+                        .where(
+                            Product.category_id == category.id,
+                            Product.active.is_(True),
+                            Product.catalog_visible.is_(True),
+                        )
+                        .order_by(Product.sort_order, Product.id)
+                    )
+                ).all()
+            )
+        if not products and prepared_product_list.get("scope") != "official_catalog":
+            raise ValueError("已准备的产品清单中没有启用的产品")
+
+        catalog_file = official_product_catalog_attachment()
+        attachment_filename = catalog_file.filename
+        contact_name = _reply_contact_name(
+            sales_case.contact.name,
+            source_email.body_text,
+        )
+        payment_requested = _payment_details_requested(request_text)
+        payment_term: str | None = None
+        payment_term_source: str | None = None
+        payment_term_quote_id: int | None = None
+        payment_sentence: str | None = None
+        if payment_requested:
+            payment = await _customer_payment_term(
+                session,
+                customer_id=sales_case.customer_id,
+            )
+            payment_term = payment.term
+            payment_term_source = payment.source
+            payment_term_quote_id = payment.quote_id
+            payment_sentence = _payment_term_sentence(payment)
+
+        official_scope = prepared_product_list.get("scope") in {
+            "all",
+            "official_catalog",
+        }
+        prepared_product_list = {
+            **prepared_product_list,
+            "product_ids": [] if official_scope else [product.id for product in products],
+            "product_codes": [] if official_scope else [product.code for product in products],
+            "product_count": None if official_scope else len(products),
+            "category_breakdown": (
+                []
+                if official_scope
+                else await _catalog_category_breakdown(session, products)
+            ),
+            "file_format": "pdf",
+            "scope": "official_catalog" if official_scope else prepared_product_list.get("scope"),
+            "attachment_kind": "official_catalog_pdf",
+            "attachment_filename": attachment_filename,
+            "attachment_sha256": official_product_catalog_sha256(catalog_file),
+            "payment_requested": payment_requested,
+            "payment_term": payment_term,
+            "payment_term_source": payment_term_source,
+            "payment_term_quote_id": payment_term_quote_id,
+            "missing_business_facts": missing_business_facts,
+        }
+        stored_facts["prepared_product_list"] = prepared_product_list
+        handoff.reason_code = HandoffReason.PRODUCT_LIST_REVIEW.value
+        handoff.summary = "AI product catalog draft prepared; human approval is required"
+        stored_preview = await generate_product_list_ai_preview(
+            settings=settings,
+            subject=source_email.subject,
+            contact_name=contact_name,
+            customer_message=source_email.body_text,
+            category=category,
+            products=products,
+            attachment_filename=attachment_filename,
+            actor=actor,
+            payment_sentence=payment_sentence,
+        )
+
+    if not isinstance(stored_preview, dict):
+        return None
+    subject = str(stored_preview.get("subject") or "").strip()
+    body_text = str(stored_preview.get("body_text") or "").strip()
+    if not subject or not body_text:
+        return None
+
+    generated_at = datetime.now(UTC)
+    preview_facts = {
+        **stored_preview,
+        "subject": subject[:998],
+        "body_text": body_text[:50_000],
+        "generated_at": generated_at.isoformat(),
+        "generated_by": actor,
+        "delivery_created": False,
+        "rag_enabled": False,
+        "rag_matches": [],
+        "missing_business_facts": missing_business_facts,
+    }
+    stored_facts["ai_draft_preview"] = preview_facts
+    handoff.extracted_facts = stored_facts
+    return preview_facts

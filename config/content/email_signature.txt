@@ -1,0 +1,12 @@
+Best regards,
+
+Demo Sales Team
+Example Chemicals Ltd.
+sales@example.com
+https://example.com/
+
+This is a fictional signature for local development. Replace CONTENT_DIR with
+an access-controlled company content directory before production use.
+
+This message and any attachments may be confidential. If you received it in
+error, notify the sender and delete it.

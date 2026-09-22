@@ -1,0 +1,44 @@
+# Fictional aliases for public tests and local demonstrations.
+products:
+  - code: DEMO-P100
+    aliases: [DEMO P100, P100, Coupling Agent 100]
+  - code: DEMO-P101
+    aliases: [DEMO P101, P101, Coupling Agent 101]
+  - code: DEMO-P200
+    aliases: [DEMO P200, P200, Intermediate 200]
+  - code: DEMO-P300
+    aliases: [DEMO P300, P300, Reagent 300]
+  - code: DEMO-P301
+    aliases: [DEMO P301, P301, Reagent 301]
+  - code: DEMO-P302
+    aliases: [DEMO P302, P302, Reagent 302]
+  - code: DEMO-P303
+    aliases: [DEMO P303, P303, Reagent 303]
+  - code: DEMO-P304
+    aliases: [DEMO P304, P304, Reagent 304]
+  - code: DEMO-P400
+    aliases: [DEMO P400, P400, General Reagent 400]
+  - code: DEMO-P500
+    aliases: [DEMO P500, P500, Treatment Agent 500]
+  - code: DEMO-P800
+    aliases: [DEMO P800, P800, Silicone Fluid 800]
+  - code: DEMO-BCP
+    aliases: [BCP, Reagent B]
+  - code: DEMO-MTMS
+    aliases: [MTMS, Additive 02]
+  - code: DEMO-AO-01
+    aliases: [AO-01, Polymer Additive 01]
+  - code: DEMO-REVIEW
+    aliases: [REVIEW, Manual Review Product]
+  - code: DEMO-GRADE-A(98%)
+    aliases:
+      - DEMO-GRADE-A
+      - DEMO-GRADE-A-98
+      - DEMO-GRADE-A 98%
+      - GRADE-A
+      - GRADE-A(98%)
+  - code: DEMO-GRADE-A(99%)
+    aliases:
+      - DEMO-GRADE-A-99
+      - DEMO-GRADE-A 99%
+      - GRADE-A(99%)

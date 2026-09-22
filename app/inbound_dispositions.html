@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <title>AIEmail 来信处置审计</title>
+  <style>
+    :root { color-scheme:light; --bg:#f5f7fb; --card:#fff; --ink:#172033; --muted:#667085; --line:#dce2eb; --blue:#175cd3; --red:#b42318; --green:#067647; --amber:#b54708; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--blue); text-decoration:none; }
+    button,select,input { font:inherit; }
+    .shell { max-width:1680px; margin:0 auto; padding:24px; }
+    .top,.toolbar,.summary { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:24px; }
+    .sub { color:var(--muted); }
+    .notice { margin:16px 0; padding:12px 14px; border:1px solid #fedf89; border-radius:10px; background:#fffaeb; color:#7a2e0e; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:0 4px 18px rgba(16,24,40,.04); overflow:hidden; }
+    .toolbar { padding:14px 16px; border-bottom:1px solid var(--line); }
+    .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button,select { border:1px solid #c7d0dd; border-radius:9px; padding:8px 11px; background:#fff; color:var(--ink); }
+    button { border:0; cursor:pointer; background:var(--blue); color:#fff; font-weight:700; }
+    button:disabled { opacity:.5; cursor:wait; }
+    button.secondary { background:#eef4ff; color:#1849a9; }
+    button.danger { background:#fff1f0; color:var(--red); }
+    .action-stack { display:flex; gap:8px; align-items:center; justify-content:flex-end; flex-wrap:wrap; }
+    .action-stack label { display:flex; gap:6px; align-items:flex-start; font-size:12px; color:var(--muted); }
+    .summary { justify-content:flex-start; padding:12px 16px; border-bottom:1px solid var(--line); }
+    .pill { display:inline-flex; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:#eef4ff; color:#1849a9; white-space:nowrap; }
+    .pill.good { background:#ecfdf3; color:var(--green); }
+    .pill.warn { background:#fffaeb; color:var(--amber); }
+    .pill.bad { background:#fff1f0; color:var(--red); }
+    .result-list { overflow:auto; max-height:72vh; }
+    .result-card { padding:16px; border-bottom:1px solid #e7ebf1; }
+    .result-card:last-child { border-bottom:0; }
+    .result-card:hover { background:#fbfcfe; }
+    .result-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+    .result-head > .action-stack { flex:0 1 420px; max-width:42%; }
+    .result-title { min-width:0; }
+    .result-title-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .result-title strong { font-size:16px; }
+    .result-meta { color:var(--muted); margin-top:4px; overflow-wrap:anywhere; }
+    .result-grid { display:grid; grid-template-columns:minmax(220px,1fr) minmax(240px,1.15fr) minmax(240px,1.15fr); gap:12px; margin-top:14px; }
+    .result-panel { min-width:0; padding:12px; border:1px solid #e7ebf1; border-radius:10px; background:#fff; overflow-wrap:anywhere; }
+    .result-panel h3 { margin:0 0 8px; color:#475467; font-size:12px; letter-spacing:.04em; }
+    .pill-list { display:flex; gap:6px; flex-wrap:wrap; }
+    .pill-list .pill { white-space:normal; overflow-wrap:anywhere; }
+    .record-details { margin-top:10px; }
+    .record-details summary { cursor:pointer; color:var(--blue); font-weight:700; }
+    .record-details[open] summary { margin-bottom:8px; }
+    .message-preview { padding:10px; border-radius:8px; background:#f8fafc; white-space:pre-wrap; overflow-wrap:anywhere; color:#344054; }
+    .action-details { width:100%; text-align:right; }
+    .action-details summary { cursor:pointer; color:var(--muted); font-size:12px; }
+    .muted { color:var(--muted); font-size:12px; margin-top:3px; }
+    .empty { padding:32px; text-align:center; color:var(--muted); }
+    code { font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    @media (max-width:1100px) { .result-grid { grid-template-columns:1fr 1fr; } }
+    @media (max-width:720px) { .shell { padding:12px; } .result-list { max-height:none; } .result-head { display:block; } .result-head > .action-stack { max-width:none; } .action-stack { justify-content:flex-start; margin-top:12px; } .result-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <h1>来信处置审计</h1>
+        <div class="sub">用当前规则重新判断历史非退信邮件，预览准备执行的客户资料动作。</div>
+      </div>
+      <div><a href="/admin/contacts">客户邮箱管理</a> · <a href="/dashboard">运行看板</a></div>
+    </header>
+    <div class="notice" id="safety-notice">批量扫描固定为 dry-run。只有逐封点击“确认应用”才会修改资料；有阻断项时必须再次明确确认。联系新负责人默认关闭，撤销也会在发现后续变化或邮件已进入发送时自动阻断。</div>
+    <section class="card">
+      <div class="toolbar">
+        <div class="controls">
+          <label>扫描数量 <select id="limit"><option>100</option><option selected>500</option><option>1000</option><option>5000</option></select></label>
+          <label><input id="include-business" type="checkbox"> 包含普通业务邮件</label>
+          <label><input id="include-history" type="checkbox"> 包含历史同步邮件</label>
+          <button id="run" type="button">运行审计</button>
+          <button id="retry" type="button" hidden>仅重试 AI 失败项</button>
+          <label>历史批次 <select id="batch-history"><option value="">正在加载…</option></select></label>
+          <button id="view-batch" class="secondary" type="button">查看批次</button>
+          <button id="refresh-batches" class="secondary" type="button">刷新批次</button>
+        </div>
+        <div class="sub" id="status">尚未运行</div>
+      </div>
+      <div class="summary" id="summary"></div>
+      <div class="result-list" id="rows"><div class="empty">点击“运行审计”查看结果</div></div>
+    </section>
+  </main>
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+    const labels = {TEMPORARY_ABSENCE:"临时休假",DEPARTED:"离职",CONTACT_REFERRAL:"推荐新联系人",FORWARDED_TO_COLLEAGUE:"已转发同事",CONTACT_IDENTITY_MISMATCH:"联系人身份不匹配",NON_TARGET:"非目标客户",UNCERTAIN:"无法确定",AUTOMATED_ACKNOWLEDGEMENT:"普通自动回复",SYSTEM_NOTIFICATION:"系统通知",BUSINESS:"普通业务"};
+    const blockerLabels = {CUSTOMER_NOT_RESOLVED:"未找到可修改的客户",SENDER_CONTACT_NOT_UNIQUE:"未唯一识别发件联系人",RETURN_DATE_NOT_RELIABLE:"缺少可靠返岗日期，不能安全暂停联系人",ORIGINAL_CONTACT_NOT_VERIFIED:"无法确认需要停用的原联系人",NO_REPLACEMENT_CONTACT:"未识别到有效的新联系人邮箱",CROSS_DOMAIN_REACTIVATION_PARENT_REQUIRES_REVIEW:"回复来自不同公司域名，必须核对父邮件和客户关系",QUOTED_PARENT_REQUIRES_REVIEW:"邮件缺少线程头，已通过正文引用恢复父邮件，必须人工核对",PARENT_RESOLVED_DEPARTURE_REQUIRES_REVIEW:"离职对象由父邮件恢复，必须人工核对",CROSS_DOMAIN_DEPARTURE_REQUIRES_CONTACT_SELECTION:"离职回复与原联系人域名不同，不能自动确定客户关系"};
+    const actionLabels = {IGNORE_AUTOREPLY:"忽略自动回复",PAUSE_CONTACT:"暂停联系人",RECORD_EXPIRED_ABSENCE:"记录已结束休假",REVIEW_RETURN_DATE:"复核返岗日期",SUPPRESS_DEPARTED_CONTACT:"停用离职联系人",SAVE_REFERRALS:"保存推荐联系人",KEEP_VERIFIED_REPLY_CONTACT:"保留已验证回复人",CREATE_REPLY_CONTACT:"创建回复联系人",CONTINUE_BUSINESS_PIPELINE:"继续业务流程",CREATE_REVIEW_CASE:"创建待审核案例",WAIT_FOR_FORWARDED_REPLY:"等待被转发人回复",REVIEW_NEW_CONTACT_OUTREACH:"复核新联系人触达",QUEUE_REFERRAL_OUTREACH:"加入新联系人发件队列",MARK_CUSTOMER_NON_TARGET:"标记非目标客户",STOP_REACTIVATION:"停止后续唤醒",REVIEW_CONTACT_IDENTITY:"复核联系人身份",REVIEW_CLASSIFICATION:"复核分类"};
+    const blockerText = (values) => (values || []).map((value) => blockerLabels[value] || value).join("、");
+    const batchStorageKey = "aiemail.inboundDispositionBatchId";
+    let plansByEmail = new Map();
+    let activeBatchId = null;
+    let latestBatchId = null;
+    let renderedData = null;
+    let pollTimer = null;
+    function rememberBatch(batchId) {
+      const normalized = Number(batchId);
+      if (!Number.isInteger(normalized) || normalized <= 0) return;
+      activeBatchId = normalized;
+      if ([...$("#batch-history").options].some((option) => Number(option.value) === normalized)) {
+        $("#batch-history").value = String(normalized);
+      }
+      try { window.localStorage.setItem(batchStorageKey, String(normalized)); } catch (_) { /* URL recovery remains available. */ }
+      const url = new URL(window.location.href);
+      url.searchParams.set("batch_id", String(normalized));
+      window.history.replaceState({}, "", url);
+    }
+    function recoverBatchId() {
+      const fromUrl = Number(new URL(window.location.href).searchParams.get("batch_id"));
+      if (Number.isInteger(fromUrl) && fromUrl > 0) return fromUrl;
+      try {
+        const fromStorage = Number(window.localStorage.getItem(batchStorageKey));
+        if (Number.isInteger(fromStorage) && fromStorage > 0) return fromStorage;
+      } catch (_) { /* No persisted batch is available. */ }
+      return null;
+    }
+    async function loadSwitches() {
+      try {
+        const response = await fetch("/admin/status");
+        if (!response.ok) return;
+        const status = await response.json();
+        $("#safety-notice").insertAdjacentHTML("beforeend", `<div class="muted">当前开关：AI语义判断 ${status.inbound_disposition_ai_enabled ? "已开启" : "已关闭"} · 自动写入 ${status.inbound_disposition_apply_enabled ? "已开启" : "已关闭"} · 新联系人自动联系 ${status.referral_auto_contact_enabled ? "已开启" : "已关闭"} · 总自动发送 ${status.auto_send_enabled ? "已开启" : "已关闭"}</div>`);
+      } catch (_) { /* The audit remains safe when status display is unavailable. */ }
+    }
+    function batchOptionLabel(batch) {
+      const created = batch.created_at ? new Date(batch.created_at).toLocaleString("zh-CN", {hour12:false}) : "时间未知";
+      return `#${batch.id} · ${batch.status} · ${batch.total_count} 封 · ${created}`;
+    }
+    async function loadBatchHistory(selectedBatchId = activeBatchId) {
+      const select = $("#batch-history");
+      const button = $("#refresh-batches");
+      button.disabled = true;
+      try {
+        const response = await fetch("/admin/inbound-dispositions/batches?limit=50");
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const batches = (await response.json()).batches || [];
+        latestBatchId = batches.length ? Number(batches[0].id) : null;
+        select.innerHTML = batches.length
+          ? batches.map((batch) => `<option value="${batch.id}">${esc(batchOptionLabel(batch))}</option>`).join("")
+          : '<option value="">暂无历史批次</option>';
+        select.disabled = batches.length === 0;
+        $("#view-batch").disabled = batches.length === 0;
+        if (selectedBatchId && batches.some((batch) => Number(batch.id) === Number(selectedBatchId))) {
+          select.value = String(selectedBatchId);
+        }
+        if (renderedData) render(renderedData);
+      } catch (error) {
+        select.innerHTML = '<option value="">批次列表加载失败</option>';
+        select.disabled = true;
+        $("#view-batch").disabled = true;
+        $("#status").textContent = `批次列表加载失败：${error.message}`;
+      }
+    }
+    function pills(values, kind = "") { return (values || []).map((value) => `<span class="pill ${kind}">${esc(value)}</span>`).join(" "); }
+    function actionPills(values) { return pills((values || []).map((value) => actionLabels[value] || value), "good"); }
+    function operationCell(row) {
+      const action = row.latest_action;
+      if (action?.status === "APPLIED") {
+        const queued = (action.applied_actions || []).includes("QUEUE_REFERRAL_OUTREACH");
+        const queueState = queued ? '<span class="pill warn">已加入新联系人发件队列</span>' : "";
+        const details = `<details class="action-details"><summary>查看执行记录</summary><div class="pill-list">${actionPills(action.applied_actions)}</div><div class="muted">${esc(action.applied_by)} · ${esc(action.applied_at)}</div></details>`;
+        return `<div class="action-stack"><span class="pill good">已应用 #${action.id}</span>${queueState}<button class="danger rollback" data-action-id="${action.id}" type="button">撤销</button>${details}</div>`;
+      }
+      if (row.disposition_type === "BUSINESS") return '<div class="action-stack"><span class="muted">继续原业务流程</span></div>';
+      if (["CONTACT_IDENTITY_MISMATCH", "UNCERTAIN"].includes(row.disposition_type)) return '<div class="action-stack"><span class="pill warn">需要人工复核</span></div>';
+      if (row.can_apply === false) return `<div class="action-stack"><span class="pill bad">当前无法应用</span><div class="muted">请先解决：${esc(blockerText(row.application_blockers))}</div></div>`;
+      if (row.batch_id && latestBatchId === null) return '<div class="action-stack"><span class="muted">正在确认批次状态…</span></div>';
+      if (row.batch_id && Number(row.batch_id) !== latestBatchId) return '<div class="action-stack"><span class="pill">历史批次只读</span></div>';
+      const canOfferOutreach = (row.referral_candidates || []).some((item) => item.auto_contact_eligible);
+      const outreach = canOfferOutreach ? `<label><input class="outreach" data-email-id="${row.email_id}" type="checkbox"> 同时加入新联系人自动发件队列（总开关开启时可能立即发送）</label>` : "";
+      const history = action?.status === "ROLLED_BACK" ? `<span class="pill warn">曾撤销 #${action.id}</span>` : "";
+      return `<div class="action-stack">${history}${outreach}<button class="apply" data-email-id="${row.email_id}" data-batch-id="${row.batch_id || ""}" type="button">确认应用</button></div>`;
+    }
+    function render(data) {
+      renderedData = data;
+      if (data.batch_id) rememberBatch(data.batch_id);
+      const ai = data.ai_summary || {};
+      const progress = data.batch_id ? ` · 批次 #${data.batch_id} ${data.batch_status} · AI成功 ${ai.succeeded || 0} / 失败 ${ai.failed || 0} / 待处理 ${ai.pending || 0}` : "";
+      $("#status").textContent = `扫描 ${data.scanned_count} 封，候选 ${data.candidate_count} 封 · ${data.mode}${progress}`;
+      const aiSummary = data.batch_id ? `<span class="pill good">AI成功 ${ai.succeeded || 0}</span><span class="pill ${ai.failed ? "bad" : ""}">AI失败 ${ai.failed || 0}</span><span class="pill">规则直判 ${ai.rule_only || 0}</span><span class="pill">重试轮次 ${ai.retry_count || 0}</span>` : "";
+      $("#summary").innerHTML = aiSummary + Object.entries(data.counts || {}).map(([key,value]) => `<span class="pill">${esc(labels[key] || key)} ${value}</span>`).join("");
+      $("#retry").hidden = !(data.complete && ai.retry_available);
+      const plans = data.plans || [];
+      plansByEmail = new Map(plans.map((row) => [Number(row.email_id), row]));
+      $("#rows").innerHTML = plans.length ? plans.map((row) => {
+        const blocked = (row.blockers || []).length > 0;
+        const contact = row.contact_id ? `#${row.contact_id}${row.contact_email ? ` · ${row.contact_email}` : ""}` : "未唯一识别联系人";
+        const senderContact = row.sender_contact_id && row.sender_contact_id !== row.contact_id ? `<div class="muted">发件联系人 #${row.sender_contact_id}</div>` : "";
+        const customer = row.customer_id ? `#${row.customer_id}${row.customer_name ? ` · ${row.customer_name}` : ""}` : "未识别客户";
+        const parentResolution = row.contact_resolution_source === "EXACT_REACTIVATION_PARENT"
+          ? `<div class="muted">关联依据：精确匹配唤醒父邮件 ${esc(row.reactivation_parent_message_id || "")}</div>`
+          : row.contact_resolution_source === "QUOTED_OUTBOUND_PARENT"
+            ? `<div class="muted">关联依据：正文完整引用已发送邮件 #${esc(row.parent_email_id || "")}</div>`
+            : "";
+        const replyCandidate = row.reply_contact_candidate_email ? `<div class="muted">新发件联系人候选：${esc(row.reply_contact_candidate_name || "Customer")} · ${esc(row.reply_contact_candidate_email)}</div>` : "";
+        const refs = (row.replacement_emails || []).length ? `<div class="muted">推荐：${esc(row.replacement_emails.join(", "))}</div>` : "";
+        const safety = blocked
+          ? `<div class="pill-list">${pills((row.blockers || []).map((value) => blockerLabels[value] || value), "bad")}</div>`
+          : '<span class="pill good">可安全处理</span>';
+        const modelMeta = `${row.classifier_source === "anthropic" ? "AI" : "规则"}置信度 ${esc(row.confidence)}${row.classifier_model ? ` · ${esc(row.classifier_model)}` : ""}`;
+        const evidence = (row.evidence || []).length ? `<div class="muted">判断依据：${esc(row.evidence.join(" ｜ "))}</div>` : "";
+        return `<article class="result-card">
+          <div class="result-head">
+            <div class="result-title">
+              <div class="result-title-line"><span class="pill ${blocked ? "warn" : "good"}">${esc(labels[row.disposition_type] || row.disposition_type)}</span><strong>#${row.email_id} · ${esc(row.subject)}</strong>${row.ai_failed ? '<span class="pill bad">AI失败·规则兜底</span>' : ""}${row.needs_attention ? '<span class="pill warn">重点复核</span>' : ""}</div>
+              <div class="result-meta">${esc(row.from_address)} · ${esc(row.received_at)}</div>
+              <div class="muted">${modelMeta}${(row.normalization_notes || []).length ? ` · 归一化：${esc(row.normalization_notes.join(" ｜ "))}` : ""}</div>
+            </div>
+            ${operationCell(row)}
+          </div>
+          <div class="result-grid">
+            <section class="result-panel"><h3>客户与联系人</h3><div>客户 ${esc(customer)}</div><div>处置联系人 ${esc(contact)}</div>${senderContact}${parentResolution}${replyCandidate}${refs}<div class="muted">案例 ${esc(row.case_id || "无")}</div></section>
+            <section class="result-panel"><h3>准备执行</h3><div class="pill-list">${actionPills(row.proposed_actions)}</div><div class="muted">${esc(row.reason)}</div></section>
+            <section class="result-panel"><h3>安全检查</h3>${safety}${row.ai_failed ? `<div class="muted">AI错误：${esc(row.ai_error_type || "UNKNOWN")}；建议先重试并重点核对原文。</div>` : ""}<div class="muted">${row.unavailable_until ? (row.absence_already_ended ? `休假已于 ${esc(row.unavailable_until)} 结束，不会暂停联系人` : `暂停至 ${esc(row.unavailable_until)}`) : ""}</div></section>
+          </div>
+          <details class="record-details"><summary>查看判断依据与邮件正文</summary>${evidence}<div class="message-preview">${esc(row.body_preview)}</div></details>
+        </article>`;
+      }).join("") : '<div class="empty">没有匹配的处置候选</div>';
+    }
+    async function runAudit() {
+      stopPolling();
+      const button = $("#run"); button.disabled = true; $("#status").textContent = "正在分析…";
+      const query = new URLSearchParams({
+        limit:$("#limit").value,
+        include_business:String($("#include-business").checked),
+        include_synced_history:String($("#include-history").checked),
+      });
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/backfill?${query}`, {method:"POST"});
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const data = await response.json();
+        render(data);
+        await loadBatchHistory(data.batch_id);
+        if (data.batch_id && !data.complete) schedulePoll(data.batch_id);
+      } catch (error) {
+        $("#status").textContent = `失败：${error.message}`;
+      } finally { button.disabled = false; }
+    }
+    async function pollBatch(batchId) {
+      if (activeBatchId && Number(activeBatchId) !== Number(batchId)) return;
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/batches/${batchId}`);
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const data = await response.json();
+        render(data);
+        if (!data.complete) schedulePoll(batchId);
+        else await loadBatchHistory(batchId);
+      } catch (error) {
+        $("#status").textContent = `批次状态查询失败：${error.message}`;
+        schedulePoll(batchId);
+      }
+    }
+    function schedulePoll(batchId) {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(() => pollBatch(batchId), 5000);
+    }
+    function stopPolling() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    async function viewSelectedBatch() {
+      const batchId = Number($("#batch-history").value);
+      if (!Number.isInteger(batchId) || batchId <= 0) return;
+      stopPolling();
+      rememberBatch(batchId);
+      $("#status").textContent = `正在加载批次 #${batchId}…`;
+      await pollBatch(batchId);
+    }
+    async function retryFailed() {
+      if (!activeBatchId) return;
+      const button = $("#retry"); button.disabled = true;
+      try {
+        const response = await fetch(`/admin/inbound-dispositions/batches/${activeBatchId}/retry`, {method:"POST"});
+        if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+        const data = await response.json();
+        render(data);
+        schedulePoll(activeBatchId);
+      } catch (error) {
+        $("#status").textContent = `失败项重试启动失败：${error.message}`;
+      } finally { button.disabled = false; }
+    }
+    $("#run").addEventListener("click", runAudit);
+    $("#retry").addEventListener("click", retryFailed);
+    $("#view-batch").addEventListener("click", viewSelectedBatch);
+    $("#batch-history").addEventListener("change", viewSelectedBatch);
+    $("#refresh-batches").addEventListener("click", () => loadBatchHistory(activeBatchId));
+    $("#rows").addEventListener("click", async (event) => {
+      const applyButton = event.target.closest("button.apply");
+      const rollbackButton = event.target.closest("button.rollback");
+      if (!applyButton && !rollbackButton) return;
+      const button = applyButton || rollbackButton;
+      button.disabled = true;
+      try {
+        if (applyButton) {
+          const emailId = Number(applyButton.dataset.emailId);
+          const batchId = Number(applyButton.dataset.batchId) || null;
+          const row = plansByEmail.get(emailId);
+          if (!row) throw new Error("审计结果已过期，请重新运行");
+          const blockers = row.blockers || [];
+          const outreach = document.querySelector(`input.outreach[data-email-id="${emailId}"]`)?.checked || false;
+          let warning = blockers.length
+            ? `这封邮件存在以下阻断项：\n\n${blockers.map((value) => blockerLabels[value] || value).join("\n")}\n\n确认你已人工核实并仍要应用？`
+            : `确认对邮件 #${emailId} 应用“${labels[row.disposition_type] || row.disposition_type}”处置？`;
+          if (outreach) warning += "\n\n你还选择了加入新联系人自动发件队列；若系统发送总开关已开启，邮件可能立即发出。";
+          if (!window.confirm(warning)) return;
+          const response = await fetch(`/admin/inbound-dispositions/emails/${emailId}/apply`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({expected_disposition_type:row.disposition_type,expected_plan_token:row.plan_token,acknowledged_blockers:blockers,queue_referral_outreach:outreach,batch_id:batchId}),
+          });
+          if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+          $("#status").textContent = `邮件 #${emailId} 已应用，可从本页撤销`;
+        } else {
+          const actionId = Number(rollbackButton.dataset.actionId);
+          const reason = window.prompt("请输入撤销原因（至少 3 个字符）：", "人工复核后撤销");
+          if (reason === null) return;
+          if (reason.trim().length < 3) throw new Error("撤销原因至少需要 3 个字符");
+          const response = await fetch(`/admin/inbound-dispositions/actions/${actionId}/rollback`, {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({reason:reason.trim()}),
+          });
+          if (!response.ok) throw new Error((await response.json()).detail || `${response.status} ${response.statusText}`);
+          $("#status").textContent = `处置动作 #${actionId} 已撤销`;
+        }
+        if (activeBatchId) await pollBatch(activeBatchId);
+        else await runAudit();
+      } catch (error) {
+        $("#status").textContent = `操作失败：${error.message}`;
+      } finally { button.disabled = false; }
+    });
+    loadSwitches();
+    const recoveredBatchId = recoverBatchId();
+    loadBatchHistory(recoveredBatchId);
+    if (recoveredBatchId) {
+      rememberBatch(recoveredBatchId);
+      $("#status").textContent = `正在恢复批次 #${recoveredBatchId}…`;
+      pollBatch(recoveredBatchId);
+    }
+  </script>
+</body>
+</html>

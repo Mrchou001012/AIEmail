@@ -1,0 +1,10 @@
+From: Alex Buyer <internal@example.com>
+To: sales-agent@example.com
+Subject: Re: Industrial Widget 100 quotation
+Message-ID: <demo-sample@example.com>
+In-Reply-To: <replace-with-outbound-message-id@example.com>
+References: <replace-with-outbound-message-id@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+PRODUCT WIDGET-100. Please arrange a sample and confirm delivery.

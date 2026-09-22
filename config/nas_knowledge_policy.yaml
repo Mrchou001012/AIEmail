@@ -1,0 +1,78 @@
+version: 1
+
+# Public demonstration policy. Real directory names and classification rules
+# must be supplied through NAS_KNOWLEDGE_POLICY_PATH in a private environment.
+rules:
+  - pattern: "#recycle/**"
+    classification: excluded
+    reason: recycle-bin content is not a knowledge source
+  - pattern: "mail-exports/**"
+    classification: excluded
+    reason: raw mailbox data requires a separate controlled pipeline
+  - pattern: "finance/**"
+    classification: excluded
+    reason: commercial and accounting records are out of scope
+  - pattern: "people/**"
+    classification: excluded
+    reason: personnel records are out of scope
+  - pattern: "internal-technical/**"
+    classification: internal
+    reason: internal technical material requires human review
+  - pattern: "public-product-documents/**"
+    classification: customer_candidate
+    reason: public collateral candidate pending content checks
+  - pattern: "legal/**"
+    classification: review_required
+    reason: legal documents require purpose-specific approval
+  - pattern: "**"
+    classification: review_required
+    reason: no explicit public rule
+
+excluded_extensions:
+  - .7z
+  - .apk
+  - .bat
+  - .bin
+  - .cab
+  - .cmd
+  - .com
+  - .dll
+  - .dmg
+  - .exe
+  - .gz
+  - .img
+  - .iso
+  - .jar
+  - .lnk
+  - .msi
+  - .ps1
+  - .rar
+  - .scr
+  - .sys
+  - .tar
+  - .tmp
+  - .vbs
+  - .xz
+  - .zip
+
+extractable_extensions:
+  - .csv
+  - .docx
+  - .eml
+  - .htm
+  - .html
+  - .json
+  - .md
+  - .pdf
+  - .pptx
+  - .tsv
+  - .txt
+  - .xlsx
+  - .yaml
+  - .yml
+
+sensitive_markers:
+  - "(?i)\\b(?:unit price|target price|payment terms|invoice|purchase order|proforma)\\b"
+  - "(?i)\\b(?:customer|client|buyer|consignee|shipper)\\s*(?:name|address|email|contact|code)?\\s*:"
+  - "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b"
+  - "(?:报价|底价|成本|利润|毛利|付款条件|采购订单|销售订单|发票|客户名称|客户地址|收货人|配方|实验记录|供应商)"

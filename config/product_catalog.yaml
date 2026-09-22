@@ -1,0 +1,147 @@
+# Fictional public catalog used by tests and the local demo.
+# Load the real catalog from a private path during controlled deployment.
+categories:
+  - key: industrial_silanes
+    name: Industrial Materials
+    name_zh: 工业材料
+    sort_order: 10
+  - key: pharmaceutical
+    name: Specialty Chemicals
+    name_zh: 特种化学品
+    sort_order: 20
+  - key: rubber_plastics
+    name: Polymer Additives
+    name_zh: 聚合物助剂
+    sort_order: 30
+  - key: acetylacetone_salts
+    name: General Reagents
+    name_zh: 通用试剂
+    sort_order: 40
+  - key: silicone_oil
+    name: Process Fluids
+    name_zh: 工艺流体
+    sort_order: 50
+
+products:
+  - category: industrial_silanes
+    code: DEMO-P100
+    name: Industrial Coupling Agent 100
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: industrial_silanes
+    code: DEMO-P101
+    name: Industrial Coupling Agent 101
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: industrial_silanes
+    code: DEMO-P500
+    name: Industrial Treatment Agent 500
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: industrial_silanes
+    code: DEMO-P200
+    name: Industrial Intermediate 200
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: industrial_silanes
+    code: DEMO-GRADE-A(98%)
+    catalog_code: DEMO-GRADE-A
+    name: Demonstration Grade A
+    brand: Demo
+    cas_no: null
+    content: 98%
+    series: Demonstration Series
+  - category: industrial_silanes
+    code: DEMO-GRADE-A(99%)
+    catalog_code: DEMO-GRADE-A
+    name: Demonstration Grade A
+    brand: Demo
+    cas_no: null
+    content: 99%
+    series: Demonstration Series
+    catalog_visible: false
+  - category: pharmaceutical
+    code: DEMO-P300
+    name: Laboratory Reagent 300
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-P301
+    name: Laboratory Reagent 301
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-P302
+    name: Laboratory Reagent 302
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-P303
+    name: Laboratory Reagent 303
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-P304
+    name: Laboratory Reagent 304
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-BCP
+    name: Laboratory Reagent B
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: pharmaceutical
+    code: DEMO-REVIEW
+    name: Manual Review Product
+    brand: Demo
+    cas_no: null
+    content: Review required
+    series: Demonstration Series
+  - category: rubber_plastics
+    code: DEMO-AO-01
+    name: Polymer Additive 01
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: rubber_plastics
+    code: DEMO-MTMS
+    name: Polymer Additive 02
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: acetylacetone_salts
+    code: DEMO-P400
+    name: General Reagent 400
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series
+  - category: silicone_oil
+    code: DEMO-P800
+    name: Silicone Fluid 800
+    brand: Demo
+    cas_no: null
+    content: Demo grade
+    series: Demonstration Series

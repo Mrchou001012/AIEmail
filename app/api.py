@@ -1,0 +1,4297 @@
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import secrets
+import tempfile
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from typing import Annotated, Any, Literal
+from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.catalogs.product_catalog import DEFAULT_CATALOG_PATH, import_product_catalog
+from app.catalogs.product_list_service import (
+    prepared_product_list_attachment,
+    product_list_missing_business_facts,
+    queue_prepared_product_list_reply,
+)
+from app.catalogs.products import canonical_product_code, product_text_key
+from app.coa.coa_catalog import COACatalog, COACatalogScanner
+from app.coa.coa_service import queue_prepared_coa_reply
+from app.common.demo_service import seed_demo_data
+from app.common.service_core import active_policy
+from app.db import (
+    AgentRun,
+    AgentStep,
+    AIInvocation,
+    AssistanceRequest,
+    AuditEvent,
+    CaseStatus,
+    CommercialDataCycle,
+    Contact,
+    Customer,
+    DeliveryStatus,
+    EmailAddressStatus,
+    EmailMessage,
+    Handoff,
+    InventorySnapshot,
+    Job,
+    JobStatus,
+    MailboxCursor,
+    MailboxDailyUsage,
+    MailboxThrottle,
+    Outbox,
+    PricePolicy,
+    Product,
+    ProductCategory,
+    Quote,
+    ReactivationCampaign,
+    ReactivationRecipient,
+    SalesCase,
+    db_health,
+    get_session,
+)
+from app.delivery.contact_delivery_service import (
+    add_customer_contact_endpoint,
+    replace_handoff_recipient,
+    resolve_deliverability_handoff,
+    suppress_contact_endpoint,
+)
+from app.dispositions.disposition_batches import (
+    batch_item_disposition,
+    create_disposition_batch,
+    disposition_batch_result,
+    list_disposition_batches,
+    retry_failed_disposition_batch,
+)
+from app.dispositions.disposition_service import (
+    apply_email_disposition,
+    backfill_inbound_dispositions,
+    build_disposition_plan,
+    classify_email_disposition,
+    rollback_email_disposition,
+)
+from app.domain import money
+from app.handoffs.agent_runtime import (
+    answer_coa_lookup_assistance,
+    answer_product_category_assistance,
+    assistance_request_payload,
+    finalize_handoff_agent_run,
+)
+from app.handoffs.forwarding_service import forward_handoff_email, list_forward_recipients, save_forward_recipient
+from app.handoffs.handoff_preview import generate_handoff_draft_preview, stream_handoff_draft_preview
+from app.handoffs.handoff_service import assign_handoff_case, create_case_for_handoff, update_handoff_case_product
+from app.handoffs.human_reply_service import queue_human_reply
+from app.history import reconcile_email_history
+from app.imports import generate_templates, import_customers, import_prices
+from app.inbound.email_ingestion import ingest_raw_email
+from app.inbound.inquiry_matching import _product_lookup_conditions
+from app.jobs import enqueue_job
+from app.mail import (
+    MAX_OUTBOUND_ATTACHMENT_BYTES,
+    MAX_OUTBOUND_ATTACHMENT_COUNT,
+    MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES,
+    OutboundAttachment,
+    extract_email_display,
+    extract_email_resource,
+    parse_mime,
+)
+from app.nas_knowledge import (
+    Classification,
+    LocalKnowledgeBase,
+    NASKnowledgeScanner,
+    ScanPaths,
+    list_documents,
+    read_scan_summary,
+    set_classification_override,
+)
+from app.quotations.commercial import (
+    commercial_update_link,
+    get_or_create_current_cycle,
+    lock_commercial_scope,
+)
+from app.quotations.manual_quote_service import quote_with_manual_price
+from app.quotations.prepared_quote_service import queue_prepared_multi_quote_reply, queue_prepared_quote_reply
+from app.reactivation import (
+    ALLOWED_TEMPLATE_FIELDS,
+    REPLY_FILTERS,
+    cancel_campaign,
+    default_templates,
+    pause_campaign,
+    resume_campaign,
+    scan_campaign_candidates,
+    start_campaign,
+    validate_template,
+)
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+security = HTTPBasic()
+DASHBOARD_PATH = Path(__file__).with_name("dashboard.html")
+FAVICON_PATH = Path(__file__).with_name("favicon.ico")
+HANDOFF_REVIEW_PATH = Path(__file__).with_name("handoff_review.html")
+COMMERCIAL_UPDATE_PATH = Path(__file__).with_name("commercial_update.html")
+REACTIVATION_PATH = Path(__file__).with_name("reactivation.html")
+CONTACTS_PATH = Path(__file__).with_name("contacts.html")
+INBOUND_DISPOSITIONS_PATH = Path(__file__).with_name("inbound_dispositions.html")
+RECORDS_PATH = Path(__file__).with_name("records.html")
+ADMIN_SHARED_CSS_PATH = Path(__file__).with_name("admin_shared.css")
+HANDOFF_PRICE_LINES_JS_PATH = Path(__file__).with_name("handoff_price_lines.js")
+RECORDS_REQUESTS_JS_PATH = Path(__file__).with_name("records_requests.js")
+MAX_EMAIL_DISPLAY_ARCHIVE_BYTES = 30 * 1024 * 1024
+
+
+def require_admin(
+    credentials: Annotated[HTTPBasicCredentials, Depends(security)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str:
+    valid_user = secrets.compare_digest(credentials.username, settings.admin_username)
+    valid_password = secrets.compare_digest(credentials.password, settings.admin_password)
+    if not (valid_user and valid_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid administration credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+Admin = Annotated[str, Depends(require_admin)]
+Session = Annotated[AsyncSession, Depends(get_session)]
+
+
+def require_demo_mode(settings: Annotated[Settings, Depends(get_settings)]) -> None:
+    if not settings.demo_mode:
+        raise HTTPException(status_code=404, detail="Demo endpoints are disabled")
+
+
+DemoMode = Annotated[None, Depends(require_demo_mode)]
+
+
+class DemoOutreachRequest(BaseModel):
+    recipient: EmailStr = "internal@example.com"
+    quantity: int = Field(default=100, ge=1, le=1_000_000)
+
+
+class CaseOutreachRequest(BaseModel):
+    quantity: int = Field(ge=1, le=1_000_000)
+
+
+class HandoffUpdate(BaseModel):
+    action: str
+    note: str = ""
+
+
+class HandoffAssignmentRequest(BaseModel):
+    case_id: int = Field(gt=0)
+
+
+class HandoffCaseRequest(BaseModel):
+    contact_id: int = Field(gt=0)
+    product_id: int | None = Field(default=None, gt=0)
+    currency: str = Field(min_length=3, max_length=3)
+
+
+class HandoffCaseProductRequest(BaseModel):
+    product_id: int = Field(gt=0)
+
+
+class AssistanceAnswer(BaseModel):
+    category_id: int | None = Field(default=None, gt=0)
+    coa_resolution: Literal["RETRY_LOOKUP", "NO_COA_AVAILABLE"] | None = None
+    product_query: str | None = Field(default=None, min_length=1, max_length=255)
+    cas_number: str | None = Field(default=None, max_length=32)
+    note: str = Field(default="", max_length=2_000)
+
+
+class NASClassificationUpdate(BaseModel):
+    path: str = Field(min_length=1, max_length=2_000)
+    classification: Classification
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class HandoffReplyRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=998)
+    body_text: str = Field(min_length=1, max_length=50_000)
+    note: str = Field(default="", max_length=2_000)
+    resume_automation: bool = False
+
+
+class PreparedCOAReplyRequest(HandoffReplyRequest):
+    pass
+
+
+class ManualPriceQuoteLine(BaseModel):
+    product_id: int = Field(gt=0)
+    standard_price: Decimal = Field(gt=0, le=1_000_000_000)
+    quantity: int = Field(gt=0)
+
+
+class ManualPriceQuoteRequest(BaseModel):
+    lines: list[ManualPriceQuoteLine] = Field(min_length=1, max_length=20)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+    note: str = Field(default="", max_length=2_000)
+
+
+class ForwardHandoffRequest(BaseModel):
+    recipient: EmailStr
+    note: str = Field(default="", max_length=2_000)
+
+
+class ForwardRecipientCreateRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="", max_length=255)
+
+
+class ContactEndpointCreateRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="Customer", min_length=1, max_length=255)
+    note: str = Field(default="", max_length=2_000)
+
+
+class ContactEndpointSuppressRequest(BaseModel):
+    note: str = Field(default="", max_length=2_000)
+
+
+class HandoffRecipientReplacementRequest(BaseModel):
+    email: EmailStr
+    name: str = Field(default="", max_length=255)
+    note: str = Field(default="", max_length=2_000)
+    resume_case: bool = False
+
+
+class InventoryItemRequest(BaseModel):
+    product_code: str = Field(min_length=1, max_length=64)
+    availability: Literal["AVAILABLE", "OUT_OF_STOCK"]
+    quantity: Decimal | None = Field(default=None, ge=0)
+    warehouse: str | None = Field(default=None, max_length=128)
+    external_id: str | None = Field(default=None, max_length=255)
+
+
+class InventoryConfirmationRequest(BaseModel):
+    price_source_ref: str = Field(min_length=1, max_length=255)
+    items: list[InventoryItemRequest] = Field(min_length=1, max_length=10_000)
+    source_system: str = Field(default="manual", min_length=1, max_length=64)
+    source_ref: str | None = Field(default=None, max_length=255)
+
+
+class CommercialProductUpdateRequest(BaseModel):
+    template_policy_id: int = Field(gt=0)
+    product_code: str = Field(min_length=1, max_length=64)
+    currency: Literal["INR"] = "INR"
+    standard_price: Decimal = Field(gt=0, le=1_000_000_000)
+    availability: Literal["AVAILABLE", "OUT_OF_STOCK"]
+    quantity: Decimal | None = Field(default=None, ge=0, le=1_000_000_000)
+    warehouse: str | None = Field(default=None, max_length=128)
+
+
+class CommercialUpdateRequest(BaseModel):
+    expected_cycle_id: int = Field(gt=0)
+    expected_price_source_ref: str | None = Field(default=None, max_length=255)
+    source_ref: str = Field(min_length=1, max_length=255)
+    items: list[CommercialProductUpdateRequest] = Field(min_length=1, max_length=10_000)
+
+
+class ReactivationCampaignCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    subject_template: str = Field(min_length=1, max_length=998)
+    body_template: str = Field(min_length=1, max_length=20_000)
+    min_inactive_days: int = Field(default=365, ge=30, le=3650)
+    reply_filter: Literal["ANY", "NEVER_REPLIED", "PREVIOUSLY_REPLIED"] = "ANY"
+    daily_limit: int = Field(default=5, ge=1, le=100)
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+    send_window_start_hour: int = Field(default=9, ge=0, le=22)
+    send_window_end_hour: int = Field(default=17, ge=1, le=23)
+    start_date: date | None = None
+    max_reactivations: int = Field(default=2, ge=1, le=10)
+    second_reactivation_days: int = Field(default=90, ge=30, le=3650)
+    require_consent_basis: bool = True
+
+
+class ReactivationSelectionRequest(BaseModel):
+    recipient_ids: list[int] = Field(min_length=1, max_length=5000)
+    selected: bool
+
+
+class InboundDispositionApplyRequest(BaseModel):
+    expected_disposition_type: str = Field(min_length=1, max_length=64)
+    expected_plan_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    acknowledged_blockers: list[str] = Field(default_factory=list, max_length=20)
+    queue_referral_outreach: bool = False
+    batch_id: int | None = Field(default=None, gt=0)
+
+
+class InboundDispositionRollbackRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=2_000)
+
+
+def _validate_inbound_disposition_confirmation(
+    plan: dict[str, Any],
+    *,
+    expected_disposition_type: str,
+    expected_plan_token: str,
+    acknowledged_blockers: Sequence[str],
+) -> str | None:
+    if plan.get("plan_token") != expected_plan_token:
+        return "Disposition plan changed since review; reload before applying"
+    if plan["disposition_type"] != expected_disposition_type:
+        return "Disposition changed since review; reload the plan before applying"
+    if plan["disposition_type"] == "BUSINESS":
+        return "Business mail must continue through the case workflow"
+    application_blockers = list(plan.get("application_blockers") or [])
+    if application_blockers:
+        return (
+            "Disposition cannot be applied until required data is resolved: "
+            + ", ".join(application_blockers)
+        )
+    latest_action = plan.get("latest_action") or {}
+    if latest_action.get("status") == "APPLIED":
+        return "This disposition already has an active applied action"
+    blockers = set(plan["blockers"])
+    acknowledged = set(acknowledged_blockers)
+    missing = sorted(blockers - acknowledged)
+    unknown = sorted(acknowledged - blockers)
+    if missing:
+        return "All current blockers require explicit acknowledgement: " + ", ".join(missing)
+    if unknown:
+        return "Acknowledged blockers no longer match the current plan: " + ", ".join(unknown)
+    return None
+
+
+def _dashboard_headers(*, allow_remote_images: bool = False) -> dict[str, str]:
+    image_sources = "'self' data: https:" if allow_remote_images else "'self' data:"
+    return {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            f"img-src {image_sources}; frame-ancestors 'none'"
+        ),
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+    }
+
+
+@router.get("/health")
+async def health() -> JSONResponse:
+    database_ok = await db_health()
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if database_ok else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"status": "ok" if database_ok else "degraded", "database": database_ok},
+    )
+
+
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(
+        FAVICON_PATH,
+        media_type="image/x-icon",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.get("/admin/static/admin-shared.css", include_in_schema=False)
+async def admin_shared_css() -> FileResponse:
+    return FileResponse(
+        ADMIN_SHARED_CSS_PATH,
+        media_type="text/css",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/admin/static/handoff-price-lines.js", include_in_schema=False)
+async def handoff_price_lines_js() -> FileResponse:
+    return FileResponse(
+        HANDOFF_PRICE_LINES_JS_PATH,
+        media_type="text/javascript",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/admin/static/records-requests.js", include_in_schema=False)
+async def records_requests_js() -> FileResponse:
+    return FileResponse(
+        RECORDS_REQUESTS_JS_PATH,
+        media_type="text/javascript",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def dashboard(_: Admin) -> HTMLResponse:
+    return HTMLResponse(DASHBOARD_PATH.read_text(encoding="utf-8"), headers=_dashboard_headers())
+
+
+@router.get(
+    "/admin/commercial/current/update",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def commercial_update_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        COMMERCIAL_UPDATE_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+@router.get("/admin/reactivation", response_class=HTMLResponse, include_in_schema=False)
+async def reactivation_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        REACTIVATION_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+@router.get("/admin/contacts", response_class=HTMLResponse, include_in_schema=False)
+async def contacts_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        CONTACTS_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+async def _reactivation_history_ready(
+    session: AsyncSession,
+    settings: Settings,
+) -> tuple[bool, list[dict[str, Any]]]:
+    folders = {settings.imap_folder, settings.imap_sent_folder}
+    rows = (
+        (
+            await session.execute(
+                select(MailboxCursor).where(MailboxCursor.folder.in_(folders))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_folder = {row.folder: row for row in rows}
+    details = [
+        {
+            "folder": folder,
+            "present": folder in by_folder,
+            "history_complete": bool(by_folder.get(folder) and by_folder[folder].history_complete),
+            "last_uid": by_folder[folder].last_uid if folder in by_folder else None,
+        }
+        for folder in sorted(folders)
+    ]
+    return all(item["history_complete"] for item in details), details
+
+
+async def _reactivation_campaign_summary(
+    session: AsyncSession,
+    campaign: ReactivationCampaign,
+) -> dict[str, Any]:
+    counts = {
+        status_value: count
+        for status_value, count in (
+            await session.execute(
+                select(ReactivationRecipient.status, func.count())
+                .where(ReactivationRecipient.campaign_id == campaign.id)
+                .group_by(ReactivationRecipient.status)
+            )
+        ).all()
+    }
+    selected = await session.scalar(
+        select(func.count())
+        .select_from(ReactivationRecipient)
+        .where(
+            ReactivationRecipient.campaign_id == campaign.id,
+            ReactivationRecipient.selected.is_(True),
+        )
+    )
+    exclusion_counts = {
+        reason: count
+        for reason, count in (
+            await session.execute(
+                select(ReactivationRecipient.exclusion_reason, func.count())
+                .where(
+                    ReactivationRecipient.campaign_id == campaign.id,
+                    ReactivationRecipient.exclusion_reason.is_not(None),
+                )
+                .group_by(ReactivationRecipient.exclusion_reason)
+                .order_by(func.count().desc(), ReactivationRecipient.exclusion_reason)
+            )
+        ).all()
+    }
+    return {
+        "id": campaign.id,
+        "name": campaign.name,
+        "status": campaign.status,
+        "subject_template": campaign.subject_template,
+        "body_template": campaign.body_template,
+        "min_inactive_days": campaign.min_inactive_days,
+        "reply_filter": campaign.reply_filter,
+        "daily_limit": campaign.daily_limit,
+        "timezone": campaign.timezone,
+        "send_window_start_hour": campaign.send_window_start_hour,
+        "send_window_end_hour": campaign.send_window_end_hour,
+        "start_date": campaign.start_date.isoformat(),
+        "max_reactivations": campaign.max_reactivations,
+        "second_reactivation_days": campaign.second_reactivation_days,
+        "require_consent_basis": bool(
+            (campaign.metadata_json or {}).get("require_consent_basis", True)
+        ),
+        "counts": counts,
+        "exclusion_counts": exclusion_counts,
+        "selected_count": int(selected or 0),
+        "created_at": campaign.created_at.isoformat(),
+        "started_at": campaign.started_at.isoformat() if campaign.started_at else None,
+        "paused_at": campaign.paused_at.isoformat() if campaign.paused_at else None,
+        "completed_at": campaign.completed_at.isoformat() if campaign.completed_at else None,
+        "metadata": campaign.metadata_json or {},
+    }
+
+
+@router.get("/admin/reactivation/defaults")
+async def reactivation_defaults(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    subject, body = default_templates(settings)
+    history_ready, history_folders = await _reactivation_history_ready(session, settings)
+    pending_inbound = await session.scalar(
+        select(func.count())
+        .select_from(Job)
+        .where(
+            Job.kind == "process_inbound",
+            Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+        )
+    )
+    return {
+        "subject_template": subject,
+        "body_template": body,
+        "min_inactive_days": settings.reactivation_default_inactive_days,
+        "second_reactivation_days": settings.reactivation_default_second_days,
+        "daily_limit": settings.reactivation_max_sends_per_day,
+        "timezone": settings.business_timezone,
+        "start_date": datetime.now(UTC).astimezone(ZoneInfo(settings.business_timezone)).date().isoformat(),
+        "send_window_start_hour": settings.business_open_hour,
+        "send_window_end_hour": min(23, settings.business_open_hour + 8),
+        "allowed_template_fields": sorted(ALLOWED_TEMPLATE_FIELDS),
+        "reply_filters": sorted(REPLY_FILTERS),
+        "history_ready": history_ready,
+        "history_folders": history_folders,
+        "pending_inbound_jobs": int(pending_inbound or 0),
+        "runtime": {
+            "reactivation_enabled": settings.reactivation_enabled,
+            "auto_send_enabled": settings.auto_send_enabled,
+            "mail_transport": settings.mail_transport,
+            "safe_mode": settings.safe_mode,
+            "max_reactivation_sends_per_day": settings.reactivation_max_sends_per_day,
+        },
+    }
+
+
+@router.get("/admin/reactivation/campaigns")
+async def reactivation_campaigns(_: Admin, session: Session) -> dict[str, Any]:
+    rows = (
+        (
+            await session.execute(
+                select(ReactivationCampaign)
+                .order_by(ReactivationCampaign.id.desc())
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {"campaigns": [await _reactivation_campaign_summary(session, row) for row in rows]}
+
+
+@router.post("/admin/reactivation/campaigns", status_code=201)
+async def create_reactivation_campaign(
+    request: ReactivationCampaignCreate,
+    admin: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    history_ready, _ = await _reactivation_history_ready(session, settings)
+    if not history_ready:
+        raise HTTPException(409, "Gmail Inbox and Sent history must finish syncing before candidate selection")
+    if not settings.reactivation_enabled:
+        raise HTTPException(409, "Historical-customer reactivation is disabled")
+    if request.daily_limit > settings.reactivation_max_sends_per_day:
+        raise HTTPException(
+            400,
+            f"daily_limit cannot exceed REACTIVATION_MAX_SENDS_PER_DAY={settings.reactivation_max_sends_per_day}",
+        )
+    if request.send_window_end_hour <= request.send_window_start_hour:
+        raise HTTPException(400, "send window end hour must be later than its start hour")
+    try:
+        ZoneInfo(request.timezone)
+        validate_template(request.subject_template)
+        validate_template(request.body_template)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    start_on = request.start_date or datetime.now(UTC).astimezone(ZoneInfo(request.timezone)).date()
+    campaign = ReactivationCampaign(
+        name=request.name.strip(),
+        status="DRAFT",
+        subject_template=request.subject_template.strip(),
+        body_template=request.body_template.strip(),
+        min_inactive_days=request.min_inactive_days,
+        reply_filter=request.reply_filter,
+        daily_limit=request.daily_limit,
+        timezone=request.timezone,
+        send_window_start_hour=request.send_window_start_hour,
+        send_window_end_hour=request.send_window_end_hour,
+        start_date=start_on,
+        max_reactivations=request.max_reactivations,
+        second_reactivation_days=request.second_reactivation_days,
+        created_by=admin,
+        metadata_json={"require_consent_basis": request.require_consent_basis},
+    )
+    session.add(campaign)
+    await session.flush()
+    scan = await scan_campaign_candidates(session, campaign)
+    return {"campaign": await _reactivation_campaign_summary(session, campaign), "scan": scan}
+
+
+@router.get("/admin/reactivation/campaigns/{campaign_id}")
+async def reactivation_campaign_detail(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+    limit: int = Query(default=250, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    eligibility: Literal["all", "eligible", "excluded"] = Query(default="all"),
+    recipient_status: str | None = Query(default=None, max_length=32),
+    search: str | None = Query(default=None, max_length=200),
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    filters = [ReactivationRecipient.campaign_id == campaign.id]
+    if eligibility == "eligible":
+        filters.append(ReactivationRecipient.eligible.is_(True))
+    elif eligibility == "excluded":
+        filters.append(ReactivationRecipient.eligible.is_(False))
+    if recipient_status:
+        filters.append(ReactivationRecipient.status == recipient_status.strip().upper())
+    if search and search.strip():
+        term = f"%{search.strip().casefold()}%"
+        filters.append(
+            or_(
+                func.lower(Customer.company_name).like(term),
+                func.lower(Contact.name).like(term),
+                func.lower(Contact.email).like(term),
+            )
+        )
+    total = await session.scalar(
+        select(func.count())
+        .select_from(ReactivationRecipient)
+        .join(Contact, ReactivationRecipient.contact_id == Contact.id)
+        .join(Customer, ReactivationRecipient.customer_id == Customer.id)
+        .where(*filters)
+    )
+    rows = (
+        await session.execute(
+            select(ReactivationRecipient, Contact, Customer, Outbox)
+            .join(Contact, ReactivationRecipient.contact_id == Contact.id)
+            .join(Customer, ReactivationRecipient.customer_id == Customer.id)
+            .outerjoin(Outbox, ReactivationRecipient.outbox_id == Outbox.id)
+            .where(*filters)
+            .order_by(
+                ReactivationRecipient.eligible.desc(),
+                ReactivationRecipient.last_contact_at,
+                ReactivationRecipient.id,
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    recipients = []
+    for recipient, contact, customer, outbox in rows:
+        recipients.append(
+            {
+                "id": recipient.id,
+                "customer_id": customer.id,
+                "company_name": customer.company_name,
+                "contact_id": contact.id,
+                "contact_name": contact.name,
+                "email": contact.email,
+                "case_id": recipient.case_id,
+                "outbox_id": recipient.outbox_id,
+                "outbox_status": outbox.status.value if outbox else None,
+                "outbox_available_at": (
+                    outbox.available_at.isoformat() if outbox and outbox.available_at else None
+                ),
+                "outbox_last_error": outbox.last_error if outbox else None,
+                "status": recipient.status,
+                "eligible": recipient.eligible,
+                "selected": recipient.selected,
+                "exclusion_reason": recipient.exclusion_reason,
+                "has_ever_replied": recipient.has_ever_replied,
+                "latest_direction": recipient.latest_direction,
+                "last_contact_at": recipient.last_contact_at.isoformat() if recipient.last_contact_at else None,
+                "last_inbound_at": recipient.last_inbound_at.isoformat() if recipient.last_inbound_at else None,
+                "last_outbound_at": recipient.last_outbound_at.isoformat() if recipient.last_outbound_at else None,
+                "previous_reactivation_count": recipient.previous_reactivation_count,
+                "scheduled_for": recipient.scheduled_for.isoformat() if recipient.scheduled_for else None,
+                "sent_at": recipient.sent_at.isoformat() if recipient.sent_at else None,
+                "replied_at": recipient.replied_at.isoformat() if recipient.replied_at else None,
+                "snapshot": recipient.snapshot_json or {},
+            }
+        )
+    return {
+        "campaign": await _reactivation_campaign_summary(session, campaign),
+        "recipients": recipients,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/selection")
+async def update_reactivation_selection(
+    campaign_id: int,
+    request: ReactivationSelectionRequest,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    if campaign.status != "DRAFT":
+        raise HTTPException(409, "Recipient selection is locked after a campaign starts")
+    rows = (
+        (
+            await session.execute(
+                select(ReactivationRecipient).where(
+                    ReactivationRecipient.campaign_id == campaign.id,
+                    ReactivationRecipient.id.in_(request.recipient_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(rows) != len(set(request.recipient_ids)):
+        raise HTTPException(400, "One or more recipients do not belong to this campaign")
+    if request.selected and any(not row.eligible for row in rows):
+        raise HTTPException(409, "Excluded recipients cannot be selected")
+    for row in rows:
+        row.selected = request.selected
+        row.status = "SELECTED" if request.selected else "CANDIDATE"
+    await session.commit()
+    return {"updated": len(rows), "selected": request.selected}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/refresh")
+async def refresh_reactivation_candidates(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        result = await scan_campaign_candidates(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"scan": result, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/start")
+async def start_reactivation_campaign(
+    campaign_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    pending_inbound = await session.scalar(
+        select(func.count())
+        .select_from(Job)
+        .where(
+            Job.kind == "process_inbound",
+            Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+        )
+    )
+    if pending_inbound:
+        raise HTTPException(
+            409,
+            f"There are {pending_inbound} inbound emails waiting; let AI/handoff processing finish before starting bulk outreach",
+        )
+    try:
+        scheduled = await start_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"scheduled": scheduled, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/pause")
+async def pause_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        stopped = await pause_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"stopped_pending": stopped, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/resume")
+async def resume_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    try:
+        restored = await resume_campaign(session, campaign)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"restored_pending": restored, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.post("/admin/reactivation/campaigns/{campaign_id}/cancel")
+async def cancel_reactivation_campaign(campaign_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    campaign = await session.get(ReactivationCampaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(404, "Reactivation campaign not found")
+    cancelled = await cancel_campaign(session, campaign)
+    return {"cancelled": cancelled, "campaign": await _reactivation_campaign_summary(session, campaign)}
+
+
+@router.get("/admin/dashboard/data")
+async def dashboard_data(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    since_day = now - timedelta(hours=24)
+
+    inbound_24h = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.direction == "INBOUND",
+            EmailMessage.received_at >= since_day,
+        )
+    )
+    sent_24h = await session.scalar(
+        select(func.count()).select_from(Outbox).where(Outbox.sent_at >= since_day)
+    )
+    pending_outbox = await session.scalar(
+        select(func.count()).select_from(Outbox).where(
+            Outbox.status.in_([DeliveryStatus.PENDING, DeliveryStatus.CLAIMED, DeliveryStatus.FAILED])
+        )
+    )
+    open_handoffs = await session.scalar(
+        select(func.count()).select_from(Handoff).where(Handoff.status == "OPEN")
+    )
+    failed_jobs = await session.scalar(
+        select(func.count()).select_from(Job).where(Job.status == "FAILED")
+    )
+    unmatched_history = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_(None),
+        )
+    )
+    unmatched_history_cases = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.case_id.is_(None),
+        )
+    )
+    customer_matched_case_unmatched = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_not(None),
+            EmailMessage.case_id.is_(None),
+        )
+    )
+    bounced_24h = await session.scalar(
+        select(func.count()).select_from(EmailMessage).where(
+            EmailMessage.is_bounce.is_(True),
+            EmailMessage.received_at >= since_day,
+        )
+    )
+    suppressed_addresses = await session.scalar(
+        select(func.count()).select_from(EmailAddressStatus).where(
+            EmailAddressStatus.suppressed.is_(True)
+        )
+    )
+
+    case_status_counts = await session.execute(
+        select(SalesCase.status, func.count()).group_by(SalesCase.status)
+    )
+    email_rows = (
+        (
+            await session.execute(
+                select(EmailMessage).order_by(EmailMessage.received_at.desc(), EmailMessage.id.desc()).limit(40)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    outbox_rows = (
+        (
+            await session.execute(
+                select(Outbox).order_by(Outbox.created_at.desc(), Outbox.id.desc()).limit(30)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    handoff_rows = (
+        (
+            await session.execute(
+                select(Handoff).order_by(Handoff.created_at.desc(), Handoff.id.desc()).limit(30)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    job_rows = (
+        (
+            await session.execute(
+                select(Job).order_by(Job.created_at.desc(), Job.id.desc()).limit(30)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    audit_rows = (
+        (
+            await session.execute(
+                select(AuditEvent).order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc()).limit(40)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mailbox_rows = (
+        (
+            await session.execute(
+                select(MailboxCursor).order_by(MailboxCursor.mailbox, MailboxCursor.folder)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    quote_rows = await _admin_latest_quote_rows(session)
+    ai_failure_count = await session.scalar(
+        select(func.count()).select_from(AIInvocation).where(AIInvocation.success.is_(False))
+    )
+    mailbox_usage = None
+    mailbox_throttle = None
+    if settings.gmail_address:
+        mailbox_usage = await session.get(MailboxDailyUsage, (settings.gmail_address, now.date()))
+        mailbox_throttle = await session.get(MailboxThrottle, settings.gmail_address.lower())
+
+    return {
+        "generated_at": now.isoformat(),
+        "runtime": {
+            "demo_mode": settings.demo_mode,
+            "ai_provider": settings.ai_provider,
+            "mail_transport": settings.mail_transport,
+            "dingtalk_transport": settings.dingtalk_transport,
+            "safe_mode": settings.safe_mode,
+            "auto_send_enabled": settings.auto_send_enabled,
+            "imap_sync_enabled": settings.imap_sync_enabled,
+            "company_research_enabled": settings.company_research_enabled,
+            "company_research_auto_send_enabled": (
+                settings.company_research_auto_send_enabled
+            ),
+            "rate_limits": {
+                "max_sends_per_hour": settings.max_sends_per_hour,
+                "max_sends_per_day": settings.max_sends_per_day,
+                "min_send_interval_seconds": settings.min_send_interval_seconds,
+                "max_send_interval_seconds": (
+                    settings.min_send_interval_seconds + settings.send_interval_jitter_seconds
+                ),
+                "imap_poll_seconds": settings.imap_poll_seconds,
+                "imap_batch_size": settings.imap_batch_size,
+                "imap_daily_download_limit_mb": settings.imap_daily_download_limit_mb,
+                "imap_downloaded_today_mb": round(
+                    (mailbox_usage.imap_download_bytes if mailbox_usage else 0) / 1024 / 1024,
+                    2,
+                ),
+                "cooldown_active": bool(
+                    mailbox_throttle
+                    and mailbox_throttle.cooldown_until
+                    and mailbox_throttle.cooldown_until > now
+                ),
+                "cooldown_until": (
+                    mailbox_throttle.cooldown_until.isoformat()
+                    if mailbox_throttle and mailbox_throttle.cooldown_until
+                    else None
+                ),
+                "cooldown_reason": mailbox_throttle.reason if mailbox_throttle else None,
+            },
+            "credentials": {
+                "ai": bool(settings.anthropic_api_key),
+                "gmail": bool(settings.gmail_address and settings.gmail_app_password),
+                "dingtalk": bool(settings.dingtalk_webhook_url),
+            },
+        },
+        "metrics": {
+            "inbound_24h": int(inbound_24h or 0),
+            "sent_24h": int(sent_24h or 0),
+            "pending_outbox": int(pending_outbox or 0),
+            "open_handoffs": int(open_handoffs or 0),
+            "failed_jobs": int(failed_jobs or 0),
+            "unmatched_history": int(unmatched_history or 0),
+            "unmatched_history_cases": int(unmatched_history_cases or 0),
+            "customer_matched_case_unmatched": int(customer_matched_case_unmatched or 0),
+            "ai_failures": int(ai_failure_count or 0),
+            "bounced_24h": int(bounced_24h or 0),
+            "suppressed_addresses": int(suppressed_addresses or 0),
+        },
+        "cases_by_status": {status_key.value: count for status_key, count in case_status_counts.all()},
+        "mailboxes": [
+            {
+                "mailbox": row.mailbox,
+                "folder": row.folder,
+                "last_uid": row.last_uid,
+                "history_cutoff_uid": row.history_cutoff_uid,
+                "history_complete": row.history_complete,
+                "updated_at": row.updated_at.isoformat(),
+            }
+            for row in mailbox_rows
+        ],
+        "emails": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "customer_id": row.customer_id,
+                "contact_id": row.contact_id,
+                "direction": row.direction,
+                "from": row.from_address,
+                "to": row.to_addresses,
+                "subject": row.subject,
+                "received_at": row.received_at.isoformat(),
+                "is_history": row.is_history,
+                "is_automated_reply": row.is_automated_reply,
+                "automated_reply_type": row.automated_reply_type,
+                "automated_reply_handled_at": (
+                    row.automated_reply_handled_at.isoformat()
+                    if row.automated_reply_handled_at
+                    else None
+                ),
+                "is_bounce": row.is_bounce,
+                "bounce_type": row.bounce_type,
+                "bounce_handled_at": row.bounce_handled_at.isoformat() if row.bounce_handled_at else None,
+                "folder": row.mailbox_folder,
+                "attachments": len(row.attachment_metadata),
+            }
+            for row in email_rows
+        ],
+        "outbox": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "recipient": row.recipient,
+                "message_id": row.message_id,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "last_error": row.last_error,
+                "created_at": row.created_at.isoformat(),
+                "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+            }
+            for row in outbox_rows
+        ],
+        "handoffs": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "reason": row.reason_code,
+                "summary": row.summary,
+                "status": row.status,
+                "dingtalk_status": row.dingtalk_status,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in handoff_rows
+        ],
+        "jobs": [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "max_attempts": row.max_attempts,
+                "last_error": row.last_error,
+                "created_at": row.created_at.isoformat(),
+                "updated_at": row.updated_at.isoformat(),
+            }
+            for row in job_rows
+        ],
+        "quotes": [
+            {
+                "id": quote.id,
+                "case_id": quote.case_id,
+                "company": company,
+                "product": product_code,
+                "round": quote.round_number,
+                "unit_price": str(quote.unit_price),
+                "currency": quote.currency,
+                "quantity": quote.quantity,
+                "incoterm": quote.incoterm,
+                "valid_until": quote.valid_until.isoformat(),
+                "created_at": quote.created_at.isoformat(),
+            }
+            for quote, company, product_code in quote_rows
+        ],
+        "audit": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "actor": row.actor,
+                "event_type": row.event_type,
+                "data": row.data,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in audit_rows
+        ],
+    }
+
+
+@router.get("/admin/emails/{email_id}")
+async def email_detail(email_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    row = await session.get(EmailMessage, email_id)
+    if row is None:
+        raise HTTPException(404, "Email not found")
+    body_limit = 30_000
+    return {
+        "id": row.id,
+        "case_id": row.case_id,
+        "customer_id": row.customer_id,
+        "contact_id": row.contact_id,
+        "direction": row.direction,
+        "folder": row.mailbox_folder,
+        "from": row.from_address,
+        "to": row.to_addresses,
+        "subject": row.subject,
+        "message_id": row.message_id,
+        "in_reply_to": row.in_reply_to,
+        "references": row.references_json,
+        "attachments": row.attachment_metadata,
+        "received_at": row.received_at.isoformat(),
+        "is_history": row.is_history,
+        "is_automated_reply": row.is_automated_reply,
+        "automated_reply_type": row.automated_reply_type,
+        "automated_reply_metadata": row.automated_reply_metadata,
+        "automated_reply_handled_at": (
+            row.automated_reply_handled_at.isoformat()
+            if row.automated_reply_handled_at
+            else None
+        ),
+        "disposition_type": row.disposition_type,
+        "disposition_confidence": (
+            str(row.disposition_confidence)
+            if row.disposition_confidence is not None
+            else None
+        ),
+        "disposition_metadata": row.disposition_metadata,
+        "disposition_handled_at": (
+            row.disposition_handled_at.isoformat()
+            if row.disposition_handled_at
+            else None
+        ),
+        "is_bounce": row.is_bounce,
+        "bounce_type": row.bounce_type,
+        "bounce_metadata": row.bounce_metadata,
+        "bounce_handled_at": row.bounce_handled_at.isoformat() if row.bounce_handled_at else None,
+        "body_text": row.body_text[:body_limit],
+        "body_truncated": len(row.body_text) > body_limit,
+    }
+
+
+def _email_archive_path(row: EmailMessage) -> Path:
+    archive_folder = "mail_archive" if row.is_history else "inbound_archive"
+    return get_settings().runtime_dir / archive_folder / f"{row.raw_sha256}.eml"
+
+
+def _read_email_archive(row: EmailMessage) -> bytes:
+    archive_path = _email_archive_path(row)
+    try:
+        archive_size = archive_path.stat().st_size
+        if archive_size > MAX_EMAIL_DISPLAY_ARCHIVE_BYTES:
+            raise HTTPException(413, "Original email archive is too large to display")
+        raw = archive_path.read_bytes()
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(404, "Original email MIME archive is unavailable") from exc
+    if hashlib.sha256(raw).hexdigest() != row.raw_sha256:
+        raise HTTPException(409, "Original email MIME archive failed integrity verification")
+    return raw
+
+
+def _ordinary_email_attachments(raw: bytes, email_id: int) -> list[dict[str, Any]]:
+    prefix = f"/admin/emails/{email_id}/resources"
+    result: list[dict[str, Any]] = []
+    for item in parse_mime(raw).attachments:
+        if item.get("inline_content") is True:
+            continue
+        digest = str(item.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            continue
+        result.append(
+            {
+                "filename": str(item.get("filename") or "unnamed"),
+                "content_type": str(
+                    item.get("detected_content_type")
+                    or item.get("content_type")
+                    or "application/octet-stream"
+                ),
+                "size": int(item.get("size") or 0),
+                "view_url": f"{prefix}/{digest}?disposition=inline",
+                "download_url": f"{prefix}/{digest}?disposition=attachment",
+            }
+        )
+    return result
+
+
+@router.get("/admin/emails/{email_id}/display")
+async def email_display(email_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    row = await session.get(EmailMessage, email_id)
+    if row is None:
+        raise HTTPException(404, "Email not found")
+    try:
+        raw = _read_email_archive(row)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return {
+            "body_text": row.body_text,
+            "body_html": None,
+            "attachments": [],
+            "remote_images": [],
+            "archive_available": False,
+            "notice": "Original MIME archive is unavailable; showing stored plain text.",
+        }
+    try:
+        display = extract_email_display(
+            raw,
+            resource_url_prefix=f"/admin/emails/{row.id}/resources",
+        )
+    except (ValueError, LookupError, RecursionError):
+        return {
+            "body_text": row.body_text,
+            "body_html": None,
+            "attachments": _ordinary_email_attachments(raw, row.id),
+            "remote_images": [],
+            "archive_available": True,
+            "notice": "HTML could not be rendered safely; showing plain text.",
+        }
+    return {
+        "body_text": display.body_text or row.body_text,
+        "body_html": display.body_html,
+        "attachments": _ordinary_email_attachments(raw, row.id),
+        "remote_images": [
+            {"token": image.token, "url": image.url, "alt": image.alt}
+            for image in display.remote_images
+        ],
+        "archive_available": True,
+        "notice": None,
+    }
+
+
+def _safe_resource_filename(filename: str, digest: str) -> str:
+    basename = re.split(r"[\\/]", filename)[-1]
+    basename = re.sub(r"[\x00-\x1f\x7f]", "", basename).strip()
+    return basename[:255] or f"attachment-{digest[:12]}"
+
+
+def _resource_response_media_type(content_type: str, payload: bytes) -> str | None:
+    normalized = content_type.strip().casefold()
+    if normalized in {
+        "image/avif",
+        "image/bmp",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/tiff",
+        "image/webp",
+    }:
+        return normalized
+    if normalized == "application/pdf" and payload.startswith(b"%PDF-"):
+        return normalized
+    if normalized in {"text/plain", "text/csv"}:
+        return f"{normalized}; charset=utf-8"
+    return None
+
+
+@router.get("/admin/emails/{email_id}/resources/{digest}")
+async def email_resource(
+    email_id: int,
+    digest: str,
+    _: Admin,
+    session: Session,
+    disposition: Literal["inline", "attachment"] = Query(default="attachment"),
+) -> Response:
+    row = await session.get(EmailMessage, email_id)
+    if row is None:
+        raise HTTPException(404, "Email not found")
+    resource = extract_email_resource(_read_email_archive(row), digest)
+    if resource is None:
+        raise HTTPException(404, "Email resource not found")
+
+    preview_media_type = _resource_response_media_type(resource.content_type, resource.payload)
+    actual_disposition = "inline" if disposition == "inline" and preview_media_type else "attachment"
+    media_type = preview_media_type or "application/octet-stream"
+    filename = _safe_resource_filename(resource.filename, digest)
+    ascii_filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename) or f"attachment-{digest[:12]}"
+    content_disposition = (
+        f'{actual_disposition}; filename="{ascii_filename}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=resource.payload,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "Content-Disposition": content_disposition,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/admin/outbox/{outbox_id}")
+async def outbox_detail(outbox_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    row = await session.get(Outbox, outbox_id)
+    if row is None:
+        raise HTTPException(404, "Outbox record not found")
+    message_limit = 30_000
+    recipient_status = await session.get(EmailAddressStatus, row.recipient.strip().casefold())
+    return {
+        "id": row.id,
+        "case_id": row.case_id,
+        "recipient": row.recipient,
+        "message_id": row.message_id,
+        "status": row.status.value,
+        "attempts": row.attempts,
+        "last_error": row.last_error,
+        "created_at": row.created_at.isoformat(),
+        "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        "approval_handoff_id": row.approval_handoff_id,
+        "human_approved_by": row.human_approved_by,
+        "human_approved_at": row.human_approved_at.isoformat() if row.human_approved_at else None,
+        "recipient_deliverability": (
+            {
+                "format_valid": recipient_status.format_valid,
+                "preflight_status": recipient_status.preflight_status,
+                "last_preflight_at": (
+                    recipient_status.last_preflight_at.isoformat()
+                    if recipient_status.last_preflight_at
+                    else None
+                ),
+                "suppressed": recipient_status.suppressed,
+                "suppression_reason": recipient_status.suppression_reason,
+                "last_bounce_type": recipient_status.last_bounce_type,
+                "last_bounce_at": (
+                    recipient_status.last_bounce_at.isoformat()
+                    if recipient_status.last_bounce_at
+                    else None
+                ),
+            }
+            if recipient_status
+            else None
+        ),
+        "raw_message": row.raw_message[:message_limit],
+        "message_truncated": len(row.raw_message) > message_limit,
+    }
+
+
+async def _admin_latest_quote_rows(
+    session: AsyncSession,
+) -> list[tuple[Quote, str, str | None]]:
+    """Latest quotations with a display product code.
+
+    Multi-product cases have no single case product, so the product is taken
+    from the quote row itself; single-product rows keep using the case product
+    for backward compatibility.
+    """
+    return (
+        (
+            await session.execute(
+                select(Quote, Customer.company_name, Product.code)
+                .join(SalesCase, Quote.case_id == SalesCase.id)
+                .join(Customer, SalesCase.customer_id == Customer.id)
+                .outerjoin(
+                    Product,
+                    or_(
+                        and_(
+                            Quote.product_id.is_not(None),
+                            Quote.product_id == Product.id,
+                        ),
+                        and_(
+                            Quote.product_id.is_(None),
+                            SalesCase.product_id == Product.id,
+                        ),
+                    ),
+                )
+                .order_by(Quote.created_at.desc(), Quote.id.desc())
+                .limit(30)
+            )
+        )
+        .all()
+    )
+
+
+@router.get("/admin/status")
+async def admin_status(_: Admin, session: Session, settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, Any]:
+    jobs = await session.execute(select(Job.status, func.count()).group_by(Job.status))
+    outbox = await session.execute(select(Outbox.status, func.count()).group_by(Outbox.status))
+    handoffs = await session.scalar(select(func.count()).select_from(Handoff).where(Handoff.status == "OPEN"))
+    return {
+        "demo_mode": settings.demo_mode,
+        "ai_provider": settings.ai_provider,
+        "mail_transport": settings.mail_transport,
+        "dingtalk_transport": settings.dingtalk_transport,
+        "safe_mode": settings.safe_mode,
+        "auto_send_enabled": settings.auto_send_enabled,
+        "coa_auto_send_enabled": settings.coa_auto_send_enabled,
+        "product_list_auto_send_enabled": settings.product_list_auto_send_enabled,
+        "quote_auto_send_enabled": settings.quote_auto_send_enabled,
+        "inbound_disposition_enabled": settings.inbound_disposition_enabled,
+        "inbound_disposition_ai_enabled": settings.inbound_disposition_ai_enabled,
+        "inbound_disposition_ai_batch_enabled": (
+            settings.inbound_disposition_ai_batch_enabled
+        ),
+        "inbound_disposition_ai_min_confidence": (
+            settings.inbound_disposition_ai_min_confidence
+        ),
+        "inbound_disposition_apply_enabled": (
+            settings.inbound_disposition_apply_enabled
+        ),
+        "referral_auto_contact_enabled": settings.referral_auto_contact_enabled,
+        "imap_sync_enabled": settings.imap_sync_enabled,
+        "company_research_enabled": settings.company_research_enabled,
+        "company_research_auto_send_enabled": (
+            settings.company_research_auto_send_enabled
+        ),
+        "credentials_present": {
+            "anthropic": bool(settings.anthropic_api_key),
+            "gmail": bool(settings.gmail_address and settings.gmail_app_password),
+            "dingtalk": bool(settings.dingtalk_webhook_url),
+        },
+        "jobs": {str(key.value): count for key, count in jobs.all()},
+        "outbox": {str(key.value): count for key, count in outbox.all()},
+        "open_handoffs": handoffs or 0,
+    }
+
+
+def _configured_nas_scanner(settings: Settings) -> NASKnowledgeScanner:
+    return NASKnowledgeScanner(
+        root=settings.nas_knowledge_root,
+        policy_path=settings.nas_knowledge_policy_path,
+        output_dir=settings.nas_knowledge_output_dir,
+        max_extract_bytes=settings.nas_knowledge_max_file_mb * 1024 * 1024,
+        extraction_timeout_seconds=settings.nas_knowledge_file_timeout_seconds,
+    )
+
+
+@router.get(
+    "/admin/inbound-dispositions",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def inbound_dispositions_page(_: Admin) -> HTMLResponse:
+    return HTMLResponse(
+        INBOUND_DISPOSITIONS_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+def _configured_coa_scanner(settings: Settings) -> COACatalogScanner:
+    return COACatalogScanner(
+        root=settings.coa_catalog_root,
+        output_path=settings.coa_catalog_path,
+        product_catalog_path=settings.coa_product_catalog_path,
+        max_file_bytes=settings.coa_catalog_max_file_mb * 1024 * 1024,
+        extraction_timeout_seconds=settings.coa_catalog_file_timeout_seconds,
+    )
+
+
+@router.get("/admin/knowledge/nas/status")
+async def nas_knowledge_status(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    return {
+        "enabled": settings.nas_knowledge_enabled,
+        "poll_seconds": settings.nas_knowledge_poll_seconds,
+        "root": str(settings.nas_knowledge_root),
+        "scan": read_scan_summary(settings.nas_knowledge_output_dir),
+    }
+
+
+@router.post("/admin/knowledge/nas/scan")
+async def scan_nas_knowledge(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_configured_nas_scanner(settings).scan)
+
+
+@router.get("/admin/knowledge/nas/documents")
+async def nas_knowledge_documents(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    classification: Classification | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2_000),
+) -> dict[str, Any]:
+    rows = list_documents(
+        settings.nas_knowledge_output_dir,
+        classification=classification,
+        limit=limit,
+    )
+    return {"count": len(rows), "documents": rows}
+
+
+@router.post("/admin/knowledge/nas/classification")
+async def update_nas_knowledge_classification(
+    request: NASClassificationUpdate,
+    admin: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    manifest = ScanPaths.in_directory(settings.nas_knowledge_output_dir).manifest
+    known_paths = (
+        {
+            str(row.get("path"))
+            for row in json.loads(manifest.read_text(encoding="utf-8")).get("documents", [])
+        }
+        if manifest.exists()
+        else set()
+    )
+    normalized = request.path.replace("\\", "/").lstrip("/")
+    if normalized not in known_paths:
+        raise HTTPException(404, "Document is not present in the latest NAS inventory")
+    override = set_classification_override(
+        output_dir=settings.nas_knowledge_output_dir,
+        relative_path=normalized,
+        classification=request.classification,
+        reason=request.reason,
+        actor=admin,
+    )
+    scan = await asyncio.to_thread(_configured_nas_scanner(settings).scan)
+    return {"path": normalized, "override": override, "scan": scan}
+
+
+@router.get("/admin/knowledge/nas/search")
+async def search_nas_knowledge(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    query: str = Query(min_length=2, max_length=2_000),
+    audience: Literal["customer", "internal"] = Query(default="customer"),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    index_path = ScanPaths.in_directory(settings.nas_knowledge_output_dir).index
+    if not index_path.exists():
+        raise HTTPException(409, "NAS knowledge index has not been built")
+    matches = LocalKnowledgeBase(index_path).search(query, audience=audience, top_k=limit)
+    return {
+        "audience": audience,
+        "matches": [
+            {
+                "path": match.path,
+                "chunk": match.chunk,
+                "score": round(match.score, 4),
+                "classification": match.classification.value,
+                "text": match.text,
+            }
+            for match in matches
+        ],
+    }
+
+
+@router.get("/admin/coa/status")
+async def coa_catalog_status(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    payload = (
+        json.loads(settings.coa_catalog_path.read_text(encoding="utf-8"))
+        if settings.coa_catalog_path.exists()
+        else {}
+    )
+    return {
+        "enabled": settings.coa_catalog_enabled,
+        "scan_enabled": settings.coa_catalog_scan_enabled,
+        "auto_send_enabled": settings.coa_auto_send_enabled,
+        "poll_seconds": settings.coa_catalog_poll_seconds,
+        "root": str(settings.coa_catalog_root),
+        "catalog_path": str(settings.coa_catalog_path),
+        "scan": {
+            key: value
+            for key, value in payload.items()
+            if key not in {"entries", "review"}
+        },
+    }
+
+
+@router.post("/admin/coa/scan")
+async def scan_coa_catalog(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    payload = await asyncio.to_thread(_configured_coa_scanner(settings).scan)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"entries", "review"}
+    }
+
+
+@router.get("/admin/coa/find")
+async def find_coa(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    query: str = Query(default="", max_length=500),
+    cas_number: str | None = Query(default=None, max_length=50),
+) -> dict[str, Any]:
+    if not query.strip() and not (cas_number or "").strip():
+        raise HTTPException(422, "Provide a product name/alias or CAS number")
+    if not settings.coa_catalog_path.exists():
+        raise HTTPException(409, "COA catalog has not been built")
+    return COACatalog(settings.coa_catalog_path).find(
+        query,
+        cas_number=cas_number,
+    ).as_dict()
+
+
+@router.get("/admin/coa/review")
+async def coa_catalog_review(
+    _: Admin,
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=200, ge=1, le=2_000),
+) -> dict[str, Any]:
+    if not settings.coa_catalog_path.exists():
+        raise HTTPException(409, "COA catalog has not been built")
+    catalog = COACatalog(settings.coa_catalog_path)
+    return {"count": len(catalog.review), "review": list(catalog.review[:limit])}
+
+
+@router.get("/admin/history/status")
+async def history_status(_: Admin, session: Session) -> dict[str, Any]:
+    direction_counts = await session.execute(
+        select(EmailMessage.direction, func.count())
+        .where(EmailMessage.is_history.is_(True))
+        .group_by(EmailMessage.direction)
+    )
+    case_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(EmailMessage.is_history.is_(True), EmailMessage.case_id.is_(None))
+    )
+    customer_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(EmailMessage.is_history.is_(True), EmailMessage.contact_id.is_(None))
+    )
+    customer_matched_case_unmatched = await session.scalar(
+        select(func.count())
+        .select_from(EmailMessage)
+        .where(
+            EmailMessage.is_history.is_(True),
+            EmailMessage.contact_id.is_not(None),
+            EmailMessage.case_id.is_(None),
+        )
+    )
+    cursors = (
+        (
+            await session.execute(
+                select(MailboxCursor).order_by(MailboxCursor.mailbox, MailboxCursor.folder)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "history_messages": {direction: count for direction, count in direction_counts.all()},
+        # Compatibility field: this was historically the case-level count.
+        "unmatched_history_messages": case_unmatched or 0,
+        "customer_unmatched_history_messages": customer_unmatched or 0,
+        "case_unmatched_history_messages": case_unmatched or 0,
+        "customer_matched_case_unmatched_messages": customer_matched_case_unmatched or 0,
+        "folders": [
+            {
+                "mailbox": cursor.mailbox,
+                "folder": cursor.folder,
+                "last_uid": cursor.last_uid,
+                "history_cutoff_uid": cursor.history_cutoff_uid,
+                "history_complete": cursor.history_complete,
+            }
+            for cursor in cursors
+        ],
+    }
+
+
+@router.post("/admin/history/reconcile")
+async def history_reconcile(_: Admin, session: Session) -> dict[str, int]:
+    result = await reconcile_email_history(session)
+    return result.__dict__
+
+
+@router.get("/admin/inbound-dispositions/emails/{email_id}/plan")
+async def inbound_disposition_plan(
+    email_id: int,
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    row = await session.get(EmailMessage, email_id)
+    if row is None or row.direction != "INBOUND":
+        raise HTTPException(404, "Inbound email was not found")
+    if row.is_bounce:
+        raise HTTPException(409, "Bounce messages do not use business dispositions")
+    return await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+    )
+
+
+@router.post("/admin/inbound-dispositions/emails/{email_id}/apply")
+async def inbound_disposition_apply(
+    email_id: int,
+    request: InboundDispositionApplyRequest,
+    admin: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    row = await session.scalar(
+        select(EmailMessage)
+        .where(
+            EmailMessage.id == email_id,
+            EmailMessage.direction == "INBOUND",
+        )
+        .with_for_update()
+    )
+    if row is None:
+        raise HTTPException(404, "Inbound email was not found")
+    if row.is_bounce:
+        raise HTTPException(409, "Bounce messages do not use business dispositions")
+    if not settings.inbound_disposition_enabled:
+        raise HTTPException(409, "INBOUND_DISPOSITION_ENABLED must be true")
+
+    if request.batch_id is not None:
+        try:
+            reviewed = await batch_item_disposition(
+                session,
+                batch_id=request.batch_id,
+                email_id=email_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if reviewed is None:
+            raise HTTPException(
+                409,
+                "The reviewed batch result is unavailable or still processing",
+            )
+        disposition, _ = reviewed
+    else:
+        disposition = await classify_email_disposition(row, settings=settings)
+    initial_plan = await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+    if initial_plan.get("customer_id") is not None:
+        await session.scalar(
+            select(Customer)
+            .where(Customer.id == initial_plan["customer_id"])
+            .with_for_update()
+        )
+    contact_ids = sorted(
+        {
+            int(contact_id)
+            for contact_id in (
+                initial_plan.get("contact_id"),
+                initial_plan.get("sender_contact_id"),
+            )
+            if contact_id is not None
+        }
+    )
+    if contact_ids:
+        await session.execute(
+            select(Contact).where(Contact.id.in_(contact_ids)).with_for_update()
+        )
+    # Rebuild after acquiring every mutable CRM lock. If another reviewer
+    # changed state while this request was waiting, the plan token now differs.
+    plan = await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+    confirmation_error = _validate_inbound_disposition_confirmation(
+        plan,
+        expected_disposition_type=request.expected_disposition_type,
+        expected_plan_token=request.expected_plan_token,
+        acknowledged_blockers=request.acknowledged_blockers,
+    )
+    if confirmation_error:
+        raise HTTPException(409, confirmation_error)
+
+    await apply_email_disposition(
+        session,
+        row,
+        settings=settings,
+        allow_referral_outreach=request.queue_referral_outreach,
+        actor=f"admin:{admin}",
+        force_manual=True,
+        disposition=disposition,
+    )
+    await session.flush()
+    if row.disposition_handled_at is None:
+        raise HTTPException(
+            409,
+            "The reviewed action could not be applied with the currently resolved data",
+        )
+    await session.commit()
+    return await build_disposition_plan(
+        session,
+        row,
+        settings=settings,
+        disposition=disposition,
+    )
+
+
+@router.post("/admin/inbound-dispositions/actions/{action_id}/rollback")
+async def inbound_disposition_rollback(
+    action_id: int,
+    request: InboundDispositionRollbackRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        result = await rollback_email_disposition(
+            session,
+            action_id=action_id,
+            actor=f"admin:{admin}",
+            reason=request.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    row = await session.get(EmailMessage, result["email_id"])
+    result["plan"] = await build_disposition_plan(session, row) if row else None
+    return result
+
+
+@router.post("/admin/inbound-dispositions/backfill")
+async def inbound_disposition_backfill(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=1000, ge=1, le=5000),
+    include_business: bool = Query(default=False),
+    include_synced_history: bool = Query(default=False),
+) -> dict[str, Any]:
+    try:
+        if (
+            settings.inbound_disposition_ai_enabled
+            and settings.inbound_disposition_ai_batch_enabled
+            and settings.ai_provider == "anthropic"
+        ):
+            batch = await create_disposition_batch(
+                session,
+                settings=settings,
+                created_by=f"admin:{_}",
+                limit=limit,
+                include_business=include_business,
+                include_synced_history=include_synced_history,
+            )
+            if batch.status not in {"SUCCEEDED", "PARTIAL_FAILED", "FAILED"}:
+                await enqueue_job(
+                    session,
+                    "inbound_disposition_batch",
+                    {"batch_id": batch.id},
+                    f"inbound-disposition-batch:{batch.id}",
+                )
+            result = await disposition_batch_result(
+                session,
+                batch.id,
+                settings=settings,
+            )
+            if result is None:
+                raise ValueError("Created disposition batch could not be reloaded")
+            return result
+        return await backfill_inbound_dispositions(
+            session,
+            apply=False,
+            limit=limit,
+            include_business=include_business,
+            include_synced_history=include_synced_history,
+            settings=settings,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/admin/inbound-dispositions/batches")
+async def inbound_disposition_batch_history(
+    _: Admin,
+    session: Session,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    batches = await list_disposition_batches(session, limit=limit)
+    return {"count": len(batches), "batches": batches}
+
+
+@router.get("/admin/inbound-dispositions/batches/{batch_id}")
+async def inbound_disposition_batch_status(
+    batch_id: int,
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    result = await disposition_batch_result(session, batch_id, settings=settings)
+    if result is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    return result
+
+
+@router.post("/admin/inbound-dispositions/batches/{batch_id}/retry")
+async def inbound_disposition_batch_retry(
+    batch_id: int,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        batch = await retry_failed_disposition_batch(session, batch_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if batch is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    await enqueue_job(
+        session,
+        "inbound_disposition_batch",
+        {"batch_id": batch.id},
+        f"inbound-disposition-batch-retry:{batch.id}:{batch.retry_count}",
+    )
+    result = await disposition_batch_result(session, batch.id)
+    if result is None:
+        raise HTTPException(404, "Inbound disposition batch was not found")
+    return result
+
+
+@router.post("/admin/demo/seed")
+async def demo_seed(_: Admin, __: DemoMode, session: Session) -> dict[str, int]:
+    return await seed_demo_data(session)
+
+
+@router.post("/admin/demo/outreach", status_code=202)
+async def demo_outreach(request: DemoOutreachRequest, _: Admin, __: DemoMode, session: Session) -> dict[str, Any]:
+    job = await enqueue_job(
+        session,
+        "demo_outreach",
+        request.model_dump(mode="json"),
+        f"demo-outreach:{request.recipient}:{request.quantity}",
+    )
+    return {"queued": job is not None, "job_id": job.id if job else None}
+
+
+@router.post("/admin/demo/inbound", status_code=202)
+async def demo_inbound(
+    _: Admin,
+    __: DemoMode,
+    session: Session,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    if not (file.filename or "").lower().endswith(".eml"):
+        raise HTTPException(400, "Only .eml files are accepted")
+    raw = await file.read()
+    if len(raw) > 10_000_000:
+        raise HTTPException(413, "Message is too large")
+    row = await ingest_raw_email(session, raw)
+    return {"email_id": row.id if row else None, "accepted": bool(row)}
+
+
+async def _save_upload(file: UploadFile) -> Path:
+    suffix = Path(file.filename or "upload.xlsx").suffix.lower()
+    if suffix not in {".xlsx", ".csv"}:
+        raise HTTPException(400, "Only .xlsx and UTF-8 .csv files are accepted")
+    raw = await file.read()
+    if len(raw) > 10_000_000:
+        raise HTTPException(413, "Workbook is too large")
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    handle.write(raw)
+    handle.close()
+    return Path(handle.name)
+
+
+@router.post("/admin/imports/customers")
+async def customers_import(
+    _: Admin,
+    session: Session,
+    file: UploadFile = File(...),
+    apply: bool = Query(False),
+) -> dict[str, Any]:
+    path = await _save_upload(file)
+    try:
+        result = await import_customers(path, session, apply=apply)
+        return result.__dict__ | {"ok": result.ok}
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@router.post("/admin/imports/prices")
+async def prices_import(
+    actor: Admin,
+    session: Session,
+    file: UploadFile = File(...),
+    apply: bool = Query(False),
+    replace_active: bool = Query(False),
+) -> dict[str, Any]:
+    path = await _save_upload(file)
+    try:
+        result = await import_prices(
+            path,
+            session,
+            apply=apply,
+            replace_active=replace_active,
+            actor=actor,
+        )
+        return result.__dict__ | {"ok": result.ok}
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@router.get("/admin/product-categories")
+async def product_categories(_: Admin, session: Session) -> list[dict[str, Any]]:
+    rows = (
+        (
+            await session.execute(
+                select(ProductCategory)
+                .options(selectinload(ProductCategory.products))
+                .order_by(ProductCategory.sort_order, ProductCategory.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": category.id,
+            "key": category.key,
+            "name": category.name,
+            "name_zh": category.name_zh,
+            "sort_order": category.sort_order,
+            "active": category.active,
+            "product_count": sum(1 for product in category.products if product.active),
+            "products": [
+                {
+                    "code": product.code,
+                    "name": product.name,
+                    "brand": product.brand,
+                    "cas_no": product.cas_no,
+                    "content": product.content,
+                    "series": product.series,
+                    "active": product.active,
+                }
+                for product in sorted(
+                    category.products,
+                    key=lambda item: (item.sort_order or 0, item.id or 0),
+                )
+            ],
+        }
+        for category in rows
+    ]
+
+
+@router.post("/admin/catalog/import")
+async def catalog_import(
+    _: Admin,
+    session: Session,
+    apply: bool = Query(False),
+) -> dict[str, Any]:
+    result = await import_product_catalog(session, path=DEFAULT_CATALOG_PATH, apply=apply)
+    return {"apply": apply, **result}
+
+
+async def _commercial_cycle_payload(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[str, Any]:
+    priced_rows = (
+        await session.execute(
+            select(Product, PricePolicy)
+            .join(PricePolicy, PricePolicy.product_id == Product.id)
+            .where(
+                PricePolicy.commercial_cycle_id == cycle.id,
+                PricePolicy.active.is_(True),
+            )
+            .order_by(Product.code, PricePolicy.currency)
+        )
+    ).all()
+    snapshots = {
+        row.product_id: row
+        for row in (
+            (
+                await session.execute(
+                    select(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    products: dict[int, dict[str, Any]] = {}
+    for product, policy in priced_rows:
+        item = products.setdefault(
+            product.id,
+            {
+                "product_id": product.id,
+                "product_code": product.code,
+                "currencies": [],
+            },
+        )
+        item["currencies"].append(policy.currency)
+    missing_inventory: list[str] = []
+    product_payload: list[dict[str, Any]] = []
+    for product_id, item in products.items():
+        snapshot = snapshots.get(product_id)
+        if snapshot is None or snapshot.availability == "UNKNOWN":
+            missing_inventory.append(item["product_code"])
+        product_payload.append(
+            {
+                **item,
+                "inventory": (
+                    {
+                        "availability": snapshot.availability,
+                        "quantity": str(snapshot.quantity) if snapshot.quantity is not None else None,
+                        "warehouse": snapshot.warehouse,
+                        "source_system": snapshot.source_system,
+                        "external_id": snapshot.external_id,
+                        "updated_at": snapshot.updated_at.isoformat(),
+                    }
+                    if snapshot
+                    else None
+                ),
+            }
+        )
+    return {
+        "cycle_id": cycle.id,
+        "scope": cycle.scope,
+        "commercial_timezone": settings.commercial_timezone,
+        "commercial_open_hour": settings.commercial_open_hour,
+        "week_start": cycle.week_start.isoformat(),
+        "week_end": cycle.week_end.isoformat(),
+        "price_status": cycle.price_status,
+        "inventory_status": cycle.inventory_status,
+        "automation_ready": (
+            cycle.price_status == "CONFIRMED" and cycle.inventory_status == "CONFIRMED"
+        ),
+        "price_confirmed_at": (
+            cycle.price_confirmed_at.isoformat() if cycle.price_confirmed_at else None
+        ),
+        "inventory_confirmed_at": (
+            cycle.inventory_confirmed_at.isoformat() if cycle.inventory_confirmed_at else None
+        ),
+        "price_source_system": cycle.price_source_system,
+        "price_source_ref": cycle.price_source_ref,
+        "inventory_source_system": cycle.inventory_source_system,
+        "inventory_source_ref": cycle.inventory_source_ref,
+        "reminder_status": cycle.reminder_status,
+        "reminder_sent_at": cycle.reminder_sent_at.isoformat() if cycle.reminder_sent_at else None,
+        "missing_inventory_products": missing_inventory,
+        "products": product_payload,
+        "update_url": commercial_update_link(settings, cycle),
+    }
+
+
+async def _commercial_price_templates(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[int, tuple[Product, PricePolicy]]:
+    """Return one active INR rule template per product for the configured scope."""
+
+    rows = (
+        await session.execute(
+            select(Product, PricePolicy, CommercialDataCycle)
+            .join(PricePolicy, PricePolicy.product_id == Product.id)
+            .outerjoin(
+                CommercialDataCycle,
+                CommercialDataCycle.id == PricePolicy.commercial_cycle_id,
+            )
+            .where(
+                Product.active.is_(True),
+                PricePolicy.active.is_(True),
+                PricePolicy.currency == "INR",
+                or_(
+                    PricePolicy.commercial_cycle_id.is_(None),
+                    CommercialDataCycle.scope == settings.commercial_scope,
+                ),
+            )
+        )
+    ).all()
+    selected: dict[int, tuple[Product, PricePolicy]] = {}
+    priorities: dict[int, tuple[int, int]] = {}
+    for product, policy, _policy_cycle in rows:
+        priority = (int(policy.commercial_cycle_id == cycle.id), policy.id)
+        if priority > priorities.get(product.id, (-1, -1)):
+            selected[product.id] = (product, policy)
+            priorities[product.id] = priority
+    return selected
+
+
+def _commercial_decimal(value: Decimal | int) -> str:
+    return format(Decimal(value), ".4f")
+
+
+async def _commercial_editor_payload(
+    session: AsyncSession,
+    settings: Settings,
+    cycle: CommercialDataCycle,
+) -> dict[str, Any]:
+    status_payload = await _commercial_cycle_payload(session, settings, cycle)
+    templates = await _commercial_price_templates(session, settings, cycle)
+    snapshots = {
+        row.product_id: row
+        for row in (
+            (
+                await session.execute(
+                    select(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    editor_products: list[dict[str, Any]] = []
+    for product, policy in sorted(templates.values(), key=lambda item: item[0].code):
+        current = policy.commercial_cycle_id == cycle.id
+        snapshot = snapshots.get(product.id)
+        editor_products.append(
+            {
+                "product_id": product.id,
+                "product_code": product.code,
+                "product_name": product.name,
+                "unit": product.unit,
+                "margin_class": product.margin_class,
+                "currency": policy.currency,
+                "template_policy_id": policy.id,
+                "current_week_price": _commercial_decimal(policy.standard_price) if current else None,
+                "previous_price": _commercial_decimal(policy.standard_price),
+                "min_quantity": policy.min_quantity,
+                "max_quantity": policy.max_quantity,
+                "tier_1_max_multiple": (
+                    _commercial_decimal(policy.tier_1_max_multiple)
+                    if policy.tier_1_max_multiple is not None
+                    else None
+                ),
+                "tier_1_markup_pct": _commercial_decimal(policy.tier_1_markup_pct),
+                "tier_2_max_multiple": (
+                    _commercial_decimal(policy.tier_2_max_multiple)
+                    if policy.tier_2_max_multiple is not None
+                    else None
+                ),
+                "tier_2_markup_pct": _commercial_decimal(policy.tier_2_markup_pct),
+                "inventory": (
+                    {
+                        "availability": snapshot.availability,
+                        "quantity": (
+                            _commercial_decimal(snapshot.quantity)
+                            if snapshot.quantity is not None
+                            else None
+                        ),
+                        "warehouse": snapshot.warehouse,
+                    }
+                    if snapshot is not None
+                    else None
+                ),
+            }
+        )
+    configured_product_ids = set(templates)
+    manual_products = (
+        (
+            await session.execute(
+                select(Product)
+                .where(
+                    Product.active.is_(True),
+                    Product.id.not_in(configured_product_ids) if configured_product_ids else True,
+                )
+                .order_by(Product.code)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        **status_payload,
+        "editor_products": editor_products,
+        "manual_products": [
+            {
+                "product_code": product.code,
+                "product_name": product.name,
+                "reason": "未配置可复用的 INR 报价规则，请继续人工处理或导入完整价格表",
+            }
+            for product in manual_products
+        ],
+    }
+
+
+@router.get("/admin/commercial/current/editor")
+async def current_commercial_editor(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    cycle = await get_or_create_current_cycle(session, settings)
+    await session.commit()
+    return await _commercial_editor_payload(session, settings, cycle)
+
+
+@router.post("/admin/commercial/current/confirm")
+async def confirm_current_commercial_data(
+    request: CommercialUpdateRequest,
+    actor: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Atomically replace this week's prices and stock from the built-in UI."""
+
+    await lock_commercial_scope(session, settings.commercial_scope)
+    cycle = await get_or_create_current_cycle(session, settings)
+    cycle = await session.scalar(
+        select(CommercialDataCycle)
+        .where(CommercialDataCycle.id == cycle.id)
+        .with_for_update()
+    )
+    if cycle is None:
+        raise HTTPException(409, "The current commercial-data cycle no longer exists")
+    if request.expected_cycle_id != cycle.id:
+        raise HTTPException(409, "A new business week has started; reload the page")
+    if request.expected_price_source_ref != cycle.price_source_ref:
+        raise HTTPException(409, "Commercial data changed; reload before submitting again")
+
+    in_flight_quote_id = await session.scalar(
+        select(Outbox.id)
+        .join(Quote, Quote.id == Outbox.quote_id)
+        .join(CommercialDataCycle, CommercialDataCycle.id == Quote.commercial_cycle_id)
+        .where(
+            CommercialDataCycle.scope == cycle.scope,
+            Outbox.message_kind == "AUTO_QUOTE",
+            Outbox.status.in_([DeliveryStatus.CLAIMED, DeliveryStatus.UNKNOWN]),
+        )
+        .limit(1)
+    )
+    if in_flight_quote_id is not None:
+        raise HTTPException(
+            409,
+            "An automatic quotation is currently being delivered; wait briefly and try again",
+        )
+
+    templates = await _commercial_price_templates(session, settings, cycle)
+    templates_by_id = {policy.id: (product, policy) for product, policy in templates.values()}
+    requested_template_ids = [item.template_policy_id for item in request.items]
+    if len(set(requested_template_ids)) != len(requested_template_ids):
+        raise HTTPException(422, "Each product may appear only once")
+    if set(requested_template_ids) != set(templates_by_id):
+        raise HTTPException(409, "The product or pricing-rule list changed; reload the page")
+
+    prepared: list[tuple[CommercialProductUpdateRequest, Product, PricePolicy, Decimal]] = []
+    seen_products: set[int] = set()
+    for item in request.items:
+        product, template = templates_by_id[item.template_policy_id]
+        if canonical_product_code(item.product_code) != product.code or item.currency != template.currency:
+            raise HTTPException(409, "A product or currency no longer matches its pricing rule")
+        if product.id in seen_products:
+            raise HTTPException(422, "Each product may appear only once")
+        seen_products.add(product.id)
+        price = money(item.standard_price)
+        if item.availability == "AVAILABLE" and (item.quantity is None or item.quantity <= 0):
+            raise HTTPException(422, f"{product.code}: available stock requires a positive quantity")
+        prepared.append((item, product, template, price))
+
+    canonical_batch = [
+        {
+            "product_id": product.id,
+            "currency": item.currency,
+            "standard_price": str(price),
+            "availability": item.availability,
+            "quantity": str(item.quantity or 0),
+            "warehouse": (item.warehouse or "").strip(),
+        }
+        for item, product, _template, price in sorted(prepared, key=lambda row: row[1].id)
+    ]
+    source_hash = hashlib.sha256(
+        json.dumps(canonical_batch, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if (
+        cycle.price_source_ref == source_hash
+        and cycle.price_status == "CONFIRMED"
+        and cycle.inventory_status == "CONFIRMED"
+    ):
+        # Browser retries and double-clicks are idempotent. The hash covers the
+        # complete price and inventory batch, so no new policy version is needed.
+        await session.commit()
+        return await _commercial_editor_payload(session, settings, cycle)
+
+    active_policy_ids = (
+        (
+            await session.execute(
+                select(PricePolicy.id)
+                .outerjoin(
+                    CommercialDataCycle,
+                    CommercialDataCycle.id == PricePolicy.commercial_cycle_id,
+                )
+                .where(
+                    PricePolicy.active.is_(True),
+                    PricePolicy.currency == "INR",
+                    or_(
+                        PricePolicy.commercial_cycle_id.is_(None),
+                        CommercialDataCycle.scope == cycle.scope,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if active_policy_ids:
+        await session.execute(
+            update(PricePolicy)
+            .where(PricePolicy.id.in_(active_policy_ids))
+            .values(active=False)
+        )
+    await session.execute(delete(InventorySnapshot).where(InventorySnapshot.cycle_id == cycle.id))
+
+    for item, product, template, price in prepared:
+        session.add(
+            PricePolicy(
+                commercial_cycle_id=cycle.id,
+                product_id=product.id,
+                currency=item.currency,
+                standard_price=price,
+                # Counteroffers remain human-only. Matching the floor to the new
+                # base price prevents a future accidental automatic discount.
+                absolute_floor=price,
+                max_discount_pct=Decimal("0"),
+                max_negotiation_rounds=template.max_negotiation_rounds,
+                concession_step_pct=template.concession_step_pct,
+                min_quantity=template.min_quantity,
+                max_quantity=template.max_quantity,
+                tier_1_max_multiple=template.tier_1_max_multiple,
+                tier_1_markup_pct=template.tier_1_markup_pct,
+                tier_2_max_multiple=template.tier_2_max_multiple,
+                tier_2_markup_pct=template.tier_2_markup_pct,
+                quote_valid_days=template.quote_valid_days,
+                quote_valid_weekday=4,
+                standard_incoterm=template.standard_incoterm,
+                allowed_incoterms=list(template.allowed_incoterms or []),
+                standard_payment_term=template.standard_payment_term,
+                allowed_payment_terms=list(template.allowed_payment_terms or []),
+                taxes_included=template.taxes_included,
+                freight_included=template.freight_included,
+                valid_from=cycle.week_start,
+                valid_to=cycle.week_end,
+                source_hash=source_hash,
+                active=True,
+            )
+        )
+        session.add(
+            InventorySnapshot(
+                cycle_id=cycle.id,
+                product_id=product.id,
+                availability=item.availability,
+                quantity=item.quantity if item.availability == "AVAILABLE" else Decimal("0"),
+                warehouse=(item.warehouse or "").strip() or None,
+                source_system="manual_web",
+                metadata_json={"confirmed_by": actor},
+            )
+        )
+
+    now = datetime.now(UTC)
+    cycle.price_status = "CONFIRMED"
+    cycle.inventory_status = "CONFIRMED"
+    cycle.price_confirmed_at = now
+    cycle.inventory_confirmed_at = now
+    cycle.price_source_system = "manual_web"
+    cycle.inventory_source_system = "manual_web"
+    cycle.price_source_ref = source_hash
+    cycle.inventory_source_ref = request.source_ref.strip()
+    if cycle.reminder_status == "PENDING":
+        cycle.reminder_status = "NOT_REQUIRED"
+    cycle.metadata_json = {
+        **(cycle.metadata_json or {}),
+        "manual_web_source_ref": request.source_ref.strip(),
+        "manual_web_confirmed_by": actor,
+        "price_rows": len(prepared),
+        "inventory_confirmed_products": len(prepared),
+    }
+    session.add_all(
+        [
+            AuditEvent(
+                actor=actor,
+                event_type="commercial.price_replaced",
+                data={
+                    "cycle_id": cycle.id,
+                    "scope": cycle.scope,
+                    "source_hash": source_hash,
+                    "source_system": "manual_web",
+                    "source_ref": request.source_ref.strip(),
+                    "deactivated_policies": len(active_policy_ids),
+                    "new_policies": len(prepared),
+                },
+            ),
+            AuditEvent(
+                actor=actor,
+                event_type="commercial.inventory_updated",
+                data={
+                    "cycle_id": cycle.id,
+                    "complete": True,
+                    "confirmed_products": len(prepared),
+                    "expected_products": len(prepared),
+                    "source_system": "manual_web",
+                    "price_source_ref": source_hash,
+                },
+            ),
+        ]
+    )
+    await session.execute(
+        update(Job)
+        .where(
+            Job.status == JobStatus.PENDING,
+            Job.last_error.like("DEFERRED: commercial%"),
+        )
+        .values(available_at=now, updated_at=now)
+    )
+    await session.commit()
+    return await _commercial_editor_payload(session, settings, cycle)
+
+
+@router.get("/admin/commercial/current")
+async def current_commercial_cycle(
+    _: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    cycle = await get_or_create_current_cycle(session, settings)
+    await session.commit()
+    return await _commercial_cycle_payload(session, settings, cycle)
+
+
+@router.post("/admin/commercial/current/inventory")
+async def confirm_current_inventory(
+    request: InventoryConfirmationRequest,
+    actor: Admin,
+    session: Session,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    await lock_commercial_scope(session, settings.commercial_scope)
+    cycle = await get_or_create_current_cycle(session, settings)
+    cycle = await session.scalar(
+        select(CommercialDataCycle)
+        .where(CommercialDataCycle.id == cycle.id)
+        .with_for_update()
+    )
+    if cycle is None:
+        raise HTTPException(409, "The current commercial-data cycle no longer exists")
+    if cycle.price_status != "CONFIRMED":
+        raise HTTPException(409, "Apply the current week's price list before confirming inventory")
+    if not cycle.price_source_ref or request.price_source_ref != cycle.price_source_ref:
+        raise HTTPException(
+            409,
+            "The price batch changed; reload current commercial status and confirm inventory again",
+        )
+    in_flight_quote_id = await session.scalar(
+        select(Outbox.id)
+        .join(Quote, Quote.id == Outbox.quote_id)
+        .join(
+            CommercialDataCycle,
+            CommercialDataCycle.id == Quote.commercial_cycle_id,
+        )
+        .where(
+            CommercialDataCycle.scope == cycle.scope,
+            Outbox.message_kind == "AUTO_QUOTE",
+            Outbox.status.in_([DeliveryStatus.CLAIMED, DeliveryStatus.UNKNOWN]),
+        )
+        .limit(1)
+    )
+    if in_flight_quote_id is not None:
+        raise HTTPException(
+            409,
+            "Inventory update is temporarily blocked while an automatic quote "
+            f"is in flight (outbox {in_flight_quote_id})",
+        )
+
+    priced_products = (
+        (
+            await session.execute(
+                select(Product)
+                .join(PricePolicy, PricePolicy.product_id == Product.id)
+                .where(
+                    PricePolicy.commercial_cycle_id == cycle.id,
+                    PricePolicy.active.is_(True),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not priced_products:
+        raise HTTPException(409, "The current price confirmation contains no active products")
+    products_by_code = {product.code: product for product in priced_products}
+    normalized_codes = [canonical_product_code(item.product_code) for item in request.items]
+    if len(set(normalized_codes)) != len(normalized_codes):
+        raise HTTPException(422, "Each product may appear only once in an inventory confirmation")
+    unknown = sorted(set(normalized_codes) - set(products_by_code))
+    if unknown:
+        raise HTTPException(
+            422,
+            f"Inventory contains products outside the current price batch: {', '.join(unknown)}",
+        )
+
+    for item, code in zip(request.items, normalized_codes, strict=True):
+        product = products_by_code[code]
+        snapshot = await session.scalar(
+            select(InventorySnapshot).where(
+                InventorySnapshot.cycle_id == cycle.id,
+                InventorySnapshot.product_id == product.id,
+            )
+        )
+        if snapshot is None:
+            snapshot = InventorySnapshot(cycle_id=cycle.id, product_id=product.id)
+            session.add(snapshot)
+        snapshot.availability = item.availability
+        snapshot.quantity = item.quantity
+        snapshot.warehouse = item.warehouse.strip() if item.warehouse else None
+        snapshot.source_system = request.source_system.strip()
+        snapshot.external_id = item.external_id.strip() if item.external_id else None
+        snapshot.metadata_json = {"confirmed_by": actor}
+    await session.flush()
+
+    confirmed_product_ids = set(
+        (
+            await session.execute(
+                select(InventorySnapshot.product_id).where(
+                    InventorySnapshot.cycle_id == cycle.id,
+                    InventorySnapshot.availability.in_(["AVAILABLE", "OUT_OF_STOCK"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    expected_product_ids = {product.id for product in priced_products}
+    complete = expected_product_ids == confirmed_product_ids
+    now = datetime.now(UTC)
+    cycle.inventory_status = "CONFIRMED" if complete else "PENDING"
+    cycle.inventory_confirmed_at = now if complete else None
+    cycle.inventory_source_system = request.source_system.strip()
+    cycle.inventory_source_ref = request.source_ref or now.isoformat()
+    cycle.metadata_json = {
+        **(cycle.metadata_json or {}),
+        "inventory_confirmed_products": len(confirmed_product_ids),
+        "inventory_expected_products": len(expected_product_ids),
+        "inventory_confirmed_by": actor,
+    }
+    session.add(
+        AuditEvent(
+            actor=actor,
+            event_type="commercial.inventory_updated",
+            data={
+                "cycle_id": cycle.id,
+                "complete": complete,
+                "confirmed_products": len(confirmed_product_ids),
+                "expected_products": len(expected_product_ids),
+                "source_system": request.source_system,
+                "price_source_ref": request.price_source_ref,
+            },
+        )
+    )
+    if complete:
+        await session.execute(
+            update(Job)
+            .where(
+                Job.status == JobStatus.PENDING,
+                Job.last_error.like("DEFERRED: commercial%"),
+            )
+            .values(available_at=now, updated_at=now)
+        )
+    await session.commit()
+    return await _commercial_cycle_payload(session, settings, cycle)
+
+
+@router.get("/admin/cases")
+async def list_cases(_: Admin, session: Session) -> list[dict[str, Any]]:
+    rows = (
+        (
+            await session.execute(
+                select(SalesCase)
+                .options(
+                    selectinload(SalesCase.customer),
+                    selectinload(SalesCase.contact),
+                    selectinload(SalesCase.product),
+                )
+                .order_by(SalesCase.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "company": row.customer.company_name,
+            "contact": row.contact.email,
+            "product": row.product.code if row.product is not None else None,
+            "currency": row.currency,
+            "stage": row.stage.value,
+            "status": row.status.value,
+            "negotiation_round": row.negotiation_round,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/admin/cases/{case_id}/outreach", status_code=202)
+async def queue_case_outreach(
+    case_id: int,
+    request: CaseOutreachRequest,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    case = await session.get(SalesCase, case_id)
+    if case is None:
+        raise HTTPException(404, "Case not found")
+    if case.product_id is None:
+        raise HTTPException(409, "Case product has not been selected")
+    policy = await active_policy(session, case.product_id, case.currency)
+    if policy is None:
+        raise HTTPException(409, "No active price policy exists for this case currency")
+    if request.quantity < policy.min_quantity or (policy.max_quantity is not None and request.quantity > policy.max_quantity):
+        raise HTTPException(
+            422,
+            f"Quantity must be between {policy.min_quantity} and {policy.max_quantity or 'unlimited'}",
+        )
+    job = await enqueue_job(
+        session,
+        "case_outreach",
+        {"case_id": case_id, "quantity": request.quantity},
+        f"case-outreach:{case_id}",
+    )
+    return {"queued": job is not None, "job_id": job.id if job else None}
+
+
+@router.get("/admin/cases/{case_id}")
+async def case_detail(case_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    row = await session.get(SalesCase, case_id)
+    if row is None:
+        raise HTTPException(404, "Case not found")
+    quotes = (await session.execute(select(Quote).where(Quote.case_id == case_id).order_by(Quote.id))).scalars().all()
+    return {
+        "id": row.id,
+        "currency": row.currency,
+        "stage": row.stage.value,
+        "status": row.status.value,
+        "quotes": [
+            {
+                "id": quote.id,
+                "round": quote.round_number,
+                "unit_price": str(quote.unit_price),
+                "currency": quote.currency,
+                "quantity": quote.quantity,
+                "snapshot": quote.pricing_snapshot,
+            }
+            for quote in quotes
+        ],
+    }
+
+
+@router.get("/admin/contact-directory")
+async def contact_directory(
+    _: Admin,
+    session: Session,
+    query: Annotated[str, Query(max_length=320)] = "",
+) -> dict[str, Any]:
+    normalized_query = query.strip().casefold()
+    statement = (
+        select(Contact, Customer, EmailAddressStatus)
+        .join(Customer, Contact.customer_id == Customer.id)
+        .outerjoin(
+            EmailAddressStatus,
+            func.lower(Contact.email) == EmailAddressStatus.email,
+        )
+    )
+    if normalized_query:
+        pattern = f"%{normalized_query}%"
+        statement = statement.where(
+            or_(
+                func.lower(Customer.company_name).like(pattern),
+                func.lower(Contact.name).like(pattern),
+                func.lower(Contact.email).like(pattern),
+            )
+        )
+    rows = (
+        await session.execute(
+            statement.order_by(Customer.company_name, Contact.name, Contact.id).limit(
+                200
+            )
+        )
+    ).all()
+    return {
+        "query": query,
+        "limit": 200,
+        "contacts": [
+            {
+                "id": contact.id,
+                "customer_id": customer.id,
+                "company_name": customer.company_name,
+                "qualification_status": customer.qualification_status,
+                "qualification_reason": customer.qualification_reason,
+                "name": contact.name,
+                "email": contact.email,
+                "lifecycle_status": contact.lifecycle_status,
+                "unavailable_until": (
+                    contact.unavailable_until.isoformat()
+                    if contact.unavailable_until
+                    else None
+                ),
+                "suppressed": bool(
+                    contact.suppressed
+                    or (address_status is not None and address_status.suppressed)
+                ),
+                "suppression_reason": (
+                    address_status.suppression_reason if address_status else None
+                ),
+                "last_bounce_type": (
+                    address_status.last_bounce_type if address_status else None
+                ),
+                "last_bounce_at": (
+                    address_status.last_bounce_at.isoformat()
+                    if address_status and address_status.last_bounce_at
+                    else None
+                ),
+                "source_associations": len(
+                    (contact.metadata_json or {}).get("source_associations") or []
+                ),
+            }
+            for contact, customer, address_status in rows
+        ],
+    }
+
+
+@router.post("/admin/customers/{customer_id}/contacts", status_code=201)
+async def create_customer_contact_endpoint(
+    customer_id: int,
+    request: ContactEndpointCreateRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        contact, created = await add_customer_contact_endpoint(
+            session,
+            customer_id=customer_id,
+            email=str(request.email),
+            name=request.name,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "id": contact.id,
+        "customer_id": contact.customer_id,
+        "name": contact.name,
+        "email": contact.email,
+        "created": created,
+    }
+
+
+@router.post("/admin/contacts/{contact_id}/suppress")
+async def suppress_customer_contact_endpoint(
+    contact_id: int,
+    request: ContactEndpointSuppressRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        contact = await suppress_contact_endpoint(
+            session,
+            contact_id=contact_id,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "id": contact.id,
+        "customer_id": contact.customer_id,
+        "email": contact.email,
+        "suppressed": True,
+    }
+
+
+def _suggested_handoff_reply(
+    handoff: Handoff,
+    source_email: EmailMessage | None,
+    case: SalesCase | None,
+) -> dict[str, str]:
+    facts = handoff.extracted_facts or {}
+    stored_preview = facts.get("ai_draft_preview")
+    if isinstance(stored_preview, dict):
+        stored_subject = str(stored_preview.get("subject") or "").strip()
+        stored_body = str(stored_preview.get("body_text") or "").strip()
+        if stored_subject and stored_body:
+            return {
+                "subject": stored_subject[:998],
+                "body_text": stored_body[:50_000],
+            }
+    subject = (source_email.subject if source_email else "Your inquiry").strip()
+    if not subject.casefold().startswith("re:"):
+        subject = f"Re: {subject}"
+    contact_name = case.contact.name.strip() if case and case.contact.name.strip() else "Customer"
+    coa_resolution = facts.get("coa_resolution")
+    if (
+        handoff.reason_code == "COA_REVIEW"
+        and isinstance(coa_resolution, dict)
+        and coa_resolution.get("action") == "NO_COA_AVAILABLE"
+    ):
+        missing = [
+            str(item).strip()
+            for item in (facts.get("missing_coa_queries") or [])
+            if str(item).strip()
+        ]
+        product_label = ", ".join(missing) or str(
+            coa_resolution.get("product_query") or "the requested product"
+        )
+        prior_delivery = bool(facts.get("partial_coa_outbox_id"))
+        opening = (
+            "The available COA documents were sent separately. "
+            if prior_delivery
+            else ""
+        )
+        return {
+            "subject": subject[:998],
+            "body_text": (
+                f"Dear {contact_name},\n\n{opening}"
+                f"At present, we are unable to provide a COA for {product_label}. "
+                "We will be glad to update you if it becomes available."
+            )[:50_000],
+        }
+    opening_by_reason = {
+        "PRICE_NEGOTIATION": (
+            "Thank you for your feedback on our quotation. We are reviewing your pricing request "
+            "and will confirm the best available terms with you."
+        ),
+        "PACKAGING_REVIEW": (
+            "Thank you for your inquiry. We are confirming the applicable packaging details and "
+            "will update you shortly."
+        ),
+        "SHIPPING_REQUEST": (
+            "Thank you for your inquiry. We are checking the requested delivery and shipping "
+            "details before confirming them."
+        ),
+        "THREAD_AMBIGUOUS": (
+            "Thank you for your email. We are reviewing the related quotation history to make "
+            "sure we respond with the correct information."
+        ),
+        "NEW_INQUIRY_REVIEW": (
+            "Thank you for your inquiry. We are reviewing the requested product details and will "
+            "reply with the appropriate information."
+        ),
+        "PRODUCT_CATEGORY_REVIEW": (
+            "Thank you for your interest in our products. We are reviewing which product range "
+            "is most relevant to your business and will share the appropriate list."
+        ),
+        "PRODUCT_LIST_REVIEW": (
+            "Thank you for your interest in our products. Please find our relevant product list "
+            "below."
+        ),
+        "QUOTE_REVIEW": (
+            "Thank you for your inquiry. Please find our quotation details below."
+        ),
+        "COA_REVIEW": (
+            "Thank you for your request. We are confirming the correct standard Certificate of "
+            "Analysis before replying."
+        ),
+        "PERSONNEL_CHANGE": (
+            "Thank you for the update. We are reviewing the contact information before making any "
+            "changes to our records."
+        ),
+    }
+    opening = opening_by_reason.get(
+        handoff.reason_code,
+        "Thank you for your email. We are reviewing your request and will respond with the correct information.",
+    )
+    return {
+        "subject": subject[:998],
+        "body_text": f"Dear {contact_name},\n\n{opening}",
+    }
+
+
+async def _handoff_case_payload(session: AsyncSession, case_id: int | None) -> dict[str, Any] | None:
+    if case_id is None:
+        return None
+    case = await session.scalar(
+        select(SalesCase)
+        .options(
+            selectinload(SalesCase.customer),
+            selectinload(SalesCase.contact),
+            selectinload(SalesCase.product),
+        )
+        .where(SalesCase.id == case_id)
+    )
+    if case is None:
+        return None
+    latest_quote = await session.scalar(
+        select(Quote).where(Quote.case_id == case.id).order_by(Quote.round_number.desc())
+    )
+    return {
+        "id": case.id,
+        "company": case.customer.company_name,
+        "contact_name": case.contact.name,
+        "contact_email": case.contact.email,
+        "product_id": case.product_id,
+        "product": case.product.code if case.product is not None else None,
+        "product_name": case.product.name if case.product is not None else None,
+        "product_pending": case.product is None,
+        "currency": case.currency,
+        "stage": case.stage.value,
+        "status": case.status.value,
+        "latest_quote": (
+            {
+                "id": latest_quote.id,
+                "round": latest_quote.round_number,
+                "unit_price": str(latest_quote.unit_price),
+                "currency": latest_quote.currency,
+                "quantity": latest_quote.quantity,
+                "valid_until": latest_quote.valid_until.isoformat(),
+            }
+            if latest_quote
+            else None
+        ),
+    }
+
+
+@router.get("/admin/record-statuses")
+async def record_statuses(_: Admin) -> dict[str, list[str]]:
+    return {
+        "handoffs": ["OPEN", "RESOLVED"],
+        "outbox": [status.value for status in DeliveryStatus],
+        "jobs": [status.value for status in JobStatus],
+    }
+
+
+@router.get("/admin/handoff-records")
+async def list_handoff_records(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Handoff.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Handoff).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Handoff)
+                .where(*conditions)
+                .order_by(Handoff.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "reason": row.reason_code,
+                "summary": row.summary,
+                "status": row.status,
+                "dingtalk_status": row.dingtalk_status,
+                "created_at": row.created_at.isoformat(),
+                "updated_at": (
+                    row.updated_at.isoformat() if row.updated_at else None
+                ),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/handoffs")
+async def list_handoffs(_: Admin, session: Session) -> list[dict[str, Any]]:
+    """Preserve the original unpaginated handoff-list contract for old clients."""
+    rows = (
+        (await session.execute(select(Handoff).order_by(Handoff.id.desc())))
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "case_id": row.case_id,
+            "reason": row.reason_code,
+            "summary": row.summary,
+            "status": row.status,
+            "dingtalk_status": row.dingtalk_status,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/admin/outbox")
+async def list_outbox(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Outbox.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Outbox).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Outbox)
+                .where(*conditions)
+                .order_by(Outbox.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "case_id": row.case_id,
+                "recipient": row.recipient,
+                "message_kind": row.message_kind,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "last_error": row.last_error,
+                "created_at": row.created_at.isoformat(),
+                "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/jobs")
+async def list_jobs(
+    _: Admin,
+    session: Session,
+    status: str | None = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    conditions = []
+    if status:
+        conditions.append(func.lower(Job.status) == status.strip().lower())
+    total = await session.scalar(
+        select(func.count()).select_from(Job).where(*conditions)
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Job)
+                .where(*conditions)
+                .order_by(Job.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "status": row.status.value,
+                "attempts": row.attempts,
+                "max_attempts": row.max_attempts,
+                "last_error": row.last_error,
+                "available_at": (
+                    row.available_at.isoformat() if row.available_at else None
+                ),
+                "created_at": row.created_at.isoformat(),
+                "updated_at": (
+                    row.updated_at.isoformat() if row.updated_at else None
+                ),
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/admin/records", response_class=HTMLResponse, include_in_schema=False)
+async def records_page(_: Admin, session: Session) -> HTMLResponse:
+    return HTMLResponse(
+        RECORDS_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(),
+    )
+
+
+@router.get("/admin/handoffs/{handoff_id}/review", response_class=HTMLResponse, include_in_schema=False)
+async def handoff_review(handoff_id: int, _: Admin, session: Session) -> HTMLResponse:
+    if await session.get(Handoff, handoff_id) is None:
+        raise HTTPException(404, "Handoff not found")
+    return HTMLResponse(
+        HANDOFF_REVIEW_PATH.read_text(encoding="utf-8"),
+        headers=_dashboard_headers(allow_remote_images=True),
+    )
+
+
+def _price_history_payload(row: PricePolicy) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "price": str(row.standard_price),
+        "currency": row.currency,
+        "valid_from": row.valid_from.isoformat(),
+        "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+        "active": row.active,
+        "created_at": (row.created_at.isoformat() if row.created_at else None),
+    }
+
+
+async def _price_history_by_product(
+    session: AsyncSession,
+    product_ids: list[int],
+    *,
+    limit: int = 10,
+) -> dict[str, list[dict[str, Any]]]:
+    unique_ids = list(dict.fromkeys(product_ids))
+    result: dict[str, list[dict[str, Any]]] = {
+        str(product_id): [] for product_id in unique_ids
+    }
+    if not unique_ids:
+        return result
+    history_rank = func.row_number().over(
+        partition_by=PricePolicy.product_id,
+        order_by=(PricePolicy.valid_from.desc(), PricePolicy.id.desc()),
+    ).label("history_rank")
+    ranked = (
+        select(PricePolicy.id.label("policy_id"), history_rank)
+        .where(PricePolicy.product_id.in_(unique_ids))
+        .subquery()
+    )
+    rows = (
+        (
+            await session.execute(
+                select(PricePolicy)
+                .join(ranked, ranked.c.policy_id == PricePolicy.id)
+                .where(ranked.c.history_rank <= max(1, limit))
+                .order_by(
+                    PricePolicy.product_id,
+                    PricePolicy.valid_from.desc(),
+                    PricePolicy.id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        result[str(row.product_id)].append(_price_history_payload(row))
+    return result
+
+
+@router.get("/admin/handoffs/{handoff_id}")
+async def handoff_detail(handoff_id: int, _: Admin, session: Session) -> dict[str, Any]:
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise HTTPException(404, "Handoff not found")
+    source_email = (
+        await session.get(EmailMessage, handoff.source_email_id)
+        if handoff.source_email_id is not None
+        else None
+    )
+    facts_payload = dict(handoff.extracted_facts or {})
+    prepared_product_list = facts_payload.get("prepared_product_list")
+    if isinstance(prepared_product_list, dict):
+        prepared_product_ids = [
+            int(value)
+            for value in prepared_product_list.get("product_ids") or []
+            if str(value).isdigit()
+        ]
+        catalog_codes_by_id: dict[int, str] = {}
+        if prepared_product_ids:
+            catalog_code_rows = (
+                await session.execute(
+                    select(Product.id, Product.catalog_code).where(
+                        Product.id.in_(prepared_product_ids),
+                        Product.active.is_(True),
+                        Product.catalog_visible.is_(True),
+                        Product.catalog_code.is_not(None),
+                    )
+                )
+            ).all()
+            catalog_codes_by_id = {
+                int(product_id): str(catalog_code).strip()
+                for product_id, catalog_code in catalog_code_rows
+                if str(catalog_code or "").strip()
+            }
+        facts_payload["prepared_product_list"] = {
+            **prepared_product_list,
+            # Internal product codes remain in the persisted snapshot for
+            # approval-time validation. Only audited customer-facing codes are
+            # exposed separately to the review UI.
+            "catalog_codes": [
+                catalog_codes_by_id[product_id]
+                for product_id in prepared_product_ids
+                if product_id in catalog_codes_by_id
+            ],
+            "missing_business_facts": await product_list_missing_business_facts(
+                session,
+                handoff=handoff,
+                source_email=source_email,
+            ),
+        }
+    case_payload = await _handoff_case_payload(session, handoff.case_id)
+    case = None
+    if handoff.case_id is not None:
+        case = await session.scalar(
+            select(SalesCase)
+            .options(selectinload(SalesCase.contact))
+            .where(SalesCase.id == handoff.case_id)
+        )
+
+    candidate_ids = {
+        int(value)
+        for key in ("possible_related_case_ids", "recent_related_case_ids")
+        for value in handoff.extracted_facts.get(key, [])
+        if str(value).isdigit()
+    }
+    if source_email is not None:
+        sender_case_ids = (
+            (
+                await session.execute(
+                    select(SalesCase.id)
+                    .join(Contact, SalesCase.contact_id == Contact.id)
+                    .where(
+                        func.lower(Contact.email) == source_email.from_address.casefold(),
+                        SalesCase.status.not_in([CaseStatus.CLOSED_WON, CaseStatus.CLOSED_LOST]),
+                    )
+                    .limit(50)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidate_ids.update(sender_case_ids)
+    if handoff.case_id is not None:
+        candidate_ids.add(handoff.case_id)
+    candidate_cases = [
+        payload
+        for case_id in sorted(candidate_ids)
+        if (payload := await _handoff_case_payload(session, case_id)) is not None
+    ]
+
+    matching_contacts: list[Contact] = []
+    if source_email is not None:
+        matching_contacts = (
+            (
+                await session.execute(
+                    select(Contact)
+                    .where(func.lower(Contact.email) == source_email.from_address.casefold())
+                    .order_by(Contact.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    products = (
+        (
+            await session.execute(select(Product).where(Product.active.is_(True)).order_by(Product.code))
+        )
+        .scalars()
+        .all()
+    )
+    product_currency_rows = await session.execute(
+        select(PricePolicy.product_id, PricePolicy.currency).where(PricePolicy.active.is_(True))
+    )
+    currencies_by_product: dict[int, set[str]] = {}
+    for product_id, currency in product_currency_rows:
+        currencies_by_product.setdefault(product_id, set()).add(currency)
+    approved_outbox = await session.scalar(
+        select(Outbox).where(Outbox.approval_handoff_id == handoff.id)
+    )
+    agent_run = await session.scalar(
+        select(AgentRun).where(AgentRun.handoff_id == handoff.id)
+    )
+    assistance_requests: Sequence[AssistanceRequest] = []
+    agent_steps: Sequence[AgentStep] = []
+    if agent_run is not None:
+        assistance_requests = (
+            (
+                await session.execute(
+                    select(AssistanceRequest)
+                    .where(AssistanceRequest.run_id == agent_run.id)
+                    .order_by(AssistanceRequest.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        agent_steps = (
+            (
+                await session.execute(
+                    select(AgentStep)
+                    .where(AgentStep.run_id == agent_run.id)
+                    .order_by(AgentStep.sequence)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    history_product = None
+    if case is not None and case.product_id is not None:
+        history_product = await session.get(Product, case.product_id)
+    else:
+        fact_codes = [
+            str(item)
+            for item in (handoff.extracted_facts.get("product_codes") or [])
+        ]
+        if not fact_codes and handoff.extracted_facts.get("product_code"):
+            fact_codes = [str(handoff.extracted_facts["product_code"])]
+        if fact_codes:
+            history_product = await session.scalar(
+                select(Product)
+                .where(
+                    _product_lookup_conditions(fact_codes),
+                    Product.active.is_(True),
+                )
+                .order_by(Product.id)
+                .limit(1)
+            )
+    price_history: list[dict[str, Any]] = []
+    if history_product is not None:
+        history_rows = (
+            (
+                await session.execute(
+                    select(PricePolicy)
+                    .where(PricePolicy.product_id == history_product.id)
+                    .order_by(PricePolicy.valid_from.desc(), PricePolicy.id.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        price_history = [_price_history_payload(row) for row in history_rows]
+
+    suggested_lines: list[dict[str, Any]] = []
+    requested_quantity = handoff.extracted_facts.get("requested_quantity")
+    if not isinstance(requested_quantity, int):
+        requested_quantity = handoff.extracted_facts.get("quantity")
+    if case is not None and case.product_id is not None:
+        suggested_lines.append(
+            {
+                "product_id": case.product_id,
+                "quantity": (
+                    int(requested_quantity)
+                    if isinstance(requested_quantity, int)
+                    else None
+                ),
+            }
+        )
+    else:
+        code_quantities: dict[str, int | None] = {}
+        for item in handoff.extracted_facts.get("product_requests") or []:
+            if isinstance(item, dict) and item.get("product_code"):
+                qty = item.get("quantity")
+                code_quantities.setdefault(
+                    str(item["product_code"]),
+                    int(qty) if isinstance(qty, int) else None,
+                )
+        for item in handoff.extracted_facts.get("product_codes") or []:
+            code_quantities.setdefault(str(item), None)
+        if not code_quantities and handoff.extracted_facts.get("product_code"):
+            code_quantities[str(handoff.extracted_facts["product_code"])] = (
+                int(requested_quantity)
+                if isinstance(requested_quantity, int)
+                else None
+            )
+        if code_quantities:
+            suggested_rows = (
+                (
+                    await session.execute(
+                        select(Product)
+                        .where(
+                            _product_lookup_conditions(list(code_quantities)),
+                            Product.active.is_(True),
+                        )
+                        .order_by(Product.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            suggested_by_key = {
+                product_text_key(product.code): product
+                for product in suggested_rows
+            }
+            seen_product_ids: set[int] = set()
+            for code, quantity in code_quantities.items():
+                product = suggested_by_key.get(product_text_key(code))
+                if product is None or product.id in seen_product_ids:
+                    continue
+                seen_product_ids.add(product.id)
+                suggested_lines.append(
+                    {"product_id": product.id, "quantity": quantity}
+                )
+
+    selectable_product_ids = [int(product.id) for product in products]
+    price_history_by_product = await _price_history_by_product(
+        session,
+        selectable_product_ids,
+    )
+    return {
+        "id": handoff.id,
+        "case_id": handoff.case_id,
+        "source_email_id": handoff.source_email_id,
+        "reason": handoff.reason_code,
+        "summary": handoff.summary,
+        "facts": facts_payload,
+        "status": handoff.status,
+        "dingtalk_status": handoff.dingtalk_status,
+        "resolution_note": handoff.resolution_note,
+        "agent_run": (
+            {
+                "id": agent_run.id,
+                "status": agent_run.status.value,
+                "goal": agent_run.goal,
+                "current_step": agent_run.current_step,
+                "version": agent_run.version,
+                "last_error": agent_run.last_error,
+                "completed_at": (
+                    agent_run.completed_at.isoformat()
+                    if agent_run.completed_at
+                    else None
+                ),
+                "steps": [
+                    {
+                        "id": step.id,
+                        "sequence": step.sequence,
+                        "kind": step.kind,
+                        "status": step.status.value,
+                        "input": step.input_json,
+                        "output": step.output_json,
+                        "error": step.error,
+                        "started_at": (
+                            step.started_at.isoformat() if step.started_at else None
+                        ),
+                        "completed_at": (
+                            step.completed_at.isoformat()
+                            if step.completed_at
+                            else None
+                        ),
+                    }
+                    for step in agent_steps
+                ],
+            }
+            if agent_run is not None
+            else None
+        ),
+        "assistance_requests": [
+            assistance_request_payload(request)
+            for request in assistance_requests
+        ],
+        "case": case_payload,
+        "source_email": (
+            {
+                "id": source_email.id,
+                "from": source_email.from_address,
+                "to": source_email.to_addresses,
+                "subject": source_email.subject,
+                "received_at": source_email.received_at.isoformat(),
+                "body_text": source_email.body_text[:50_000],
+                "body_truncated": len(source_email.body_text) > 50_000,
+                "attachments": source_email.attachment_metadata,
+            }
+            if source_email
+            else None
+        ),
+        "candidate_cases": candidate_cases,
+        "matching_contacts": [
+            {
+                "id": contact.id,
+                "customer_id": contact.customer_id,
+                "name": contact.name,
+                "email": contact.email,
+            }
+            for contact in matching_contacts
+        ],
+        "products": [
+            {
+                "id": product.id,
+                "code": product.code,
+                "name": product.name,
+                "currencies": sorted(currencies_by_product.get(product.id, set())),
+            }
+            for product in products
+        ],
+        "price_history_product": (
+            {
+                "id": history_product.id,
+                "code": history_product.code,
+                "name": history_product.name,
+            }
+            if history_product is not None
+            else None
+        ),
+        "price_history": price_history,
+        "suggested_lines": suggested_lines,
+        "price_history_by_product": price_history_by_product,
+        "suggested_reply": _suggested_handoff_reply(handoff, source_email, case),
+        "approved_outbox": (
+            {
+                "id": approved_outbox.id,
+                "status": approved_outbox.status.value,
+                "human_approved_by": approved_outbox.human_approved_by,
+                "human_approved_at": (
+                    approved_outbox.human_approved_at.isoformat()
+                    if approved_outbox.human_approved_at
+                    else None
+                ),
+            }
+            if approved_outbox
+            else None
+        ),
+    }
+
+
+@router.post("/admin/assistance-requests/{request_id}/answer", status_code=202)
+async def answer_assistance_request(
+    request_id: int,
+    answer: AssistanceAnswer,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        if answer.category_id is not None:
+            result = await answer_product_category_assistance(
+                session,
+                request_id=request_id,
+                category_id=answer.category_id,
+                actor=admin,
+                note=answer.note,
+            )
+        elif answer.coa_resolution is not None or answer.product_query is not None:
+            result = await answer_coa_lookup_assistance(
+                session,
+                request_id=request_id,
+                product_query=answer.product_query,
+                cas_number=answer.cas_number,
+                actor=admin,
+                note=answer.note,
+                coa_resolution=answer.coa_resolution or "RETRY_LOOKUP",
+            )
+        else:
+            raise ValueError("answer requires category_id or a COA resolution")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "assistance_request_id": result.request.id,
+        "assistance_status": result.request.status.value,
+        "agent_run_id": result.run.id,
+        "agent_run_status": result.run.status.value,
+        "run_version": result.run.version,
+        "resume_job_id": result.job.id if result.job is not None else None,
+        "newly_answered": result.newly_answered,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/assign")
+async def assign_handoff(
+    handoff_id: int,
+    request: HandoffAssignmentRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        handoff = await assign_handoff_case(
+            session,
+            handoff_id=handoff_id,
+            case_id=request.case_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"id": handoff.id, "case_id": handoff.case_id, "status": handoff.status}
+
+
+@router.post("/admin/handoffs/{handoff_id}/draft-preview")
+async def generate_handoff_preview(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        return await generate_handoff_draft_preview(
+            session,
+            handoff_id=handoff_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("AI draft preview failed for handoff %s", handoff_id)
+        raise HTTPException(
+            502,
+            f"AI draft preview failed: {exc}",
+        ) from exc
+
+
+@router.post("/admin/handoffs/{handoff_id}/draft-preview/stream")
+async def stream_handoff_preview(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+) -> StreamingResponse:
+    async def events():
+        try:
+            async for event in stream_handoff_draft_preview(
+                session,
+                handoff_id=handoff_id,
+                actor=admin,
+            ):
+                yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        except Exception as exc:
+            await session.rollback()
+            logger.exception("AI draft preview stream failed for handoff %s", handoff_id)
+            message = f"AI draft preview failed: {exc}"
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": message,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/admin/handoffs/{handoff_id}/cases", status_code=201)
+async def create_handoff_case(
+    handoff_id: int,
+    request: HandoffCaseRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        case = await create_case_for_handoff(
+            session,
+            handoff_id=handoff_id,
+            contact_id=request.contact_id,
+            product_id=request.product_id,
+            currency=request.currency,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"case_id": case.id, "status": case.status.value}
+
+
+@router.post("/admin/handoffs/{handoff_id}/case-product")
+async def set_handoff_case_product(
+    handoff_id: int,
+    request: HandoffCaseProductRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        case = await update_handoff_case_product(
+            session,
+            handoff_id=handoff_id,
+            product_id=request.product_id,
+            actor=admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "case_id": case.id,
+        "product_id": case.product_id,
+        "stage": case.stage.value,
+        "status": case.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/replace-recipient")
+async def replace_handoff_email_recipient(
+    handoff_id: int,
+    request: HandoffRecipientReplacementRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        handoff, contact, created = await replace_handoff_recipient(
+            session,
+            handoff_id=handoff_id,
+            new_email=str(request.email),
+            new_name=request.name,
+            actor=admin,
+            note=request.note,
+            resume_case=request.resume_case,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "handoff_id": handoff.id,
+        "status": handoff.status,
+        "contact_id": contact.id,
+        "customer_id": contact.customer_id,
+        "email": contact.email,
+        "created": created,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/send", status_code=202)
+async def send_handoff_reply(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_human_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/price-quote", status_code=202)
+async def send_manual_price_quote(
+    handoff_id: int,
+    request: ManualPriceQuoteRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    """Human sets one price; the system persists it and sends the quotation."""
+    try:
+        outbox = await quote_with_manual_price(
+            session,
+            handoff_id=handoff_id,
+            lines=[
+                (line.product_id, line.standard_price, line.quantity)
+                for line in request.lines
+            ],
+            currency=request.currency,
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+        "product_ids": [line.product_id for line in request.lines],
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/forward", status_code=202)
+async def forward_handoff_to_salesperson(
+    handoff_id: int,
+    request: ForwardHandoffRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    """Forward the case email to a salesperson and take the case over."""
+    try:
+        outbox = await forward_handoff_email(
+            session,
+            handoff_id=handoff_id,
+            recipient=str(request.recipient),
+            actor=admin,
+            note=request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+        "recipient": str(request.recipient),
+    }
+
+
+@router.get("/admin/forward-recipients")
+async def forward_recipients(
+    _: Admin,
+    session: Session,
+    query: str = "",
+    limit: int = Query(20, ge=1, le=50),
+) -> list[dict[str, Any]]:
+    return await list_forward_recipients(session, query=query, limit=limit)
+
+
+@router.post("/admin/forward-recipients")
+async def create_forward_recipient(
+    request: ForwardRecipientCreateRequest,
+    _: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        return await save_forward_recipient(
+            session,
+            email=str(request.email),
+            name=request.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+async def _read_handoff_reply_attachments(
+    files: list[UploadFile],
+) -> tuple[OutboundAttachment, ...]:
+    if len(files) > MAX_OUTBOUND_ATTACHMENT_COUNT:
+        raise HTTPException(
+            413,
+            f"At most {MAX_OUTBOUND_ATTACHMENT_COUNT} attachments are allowed",
+        )
+    attachments: list[OutboundAttachment] = []
+    total_bytes = 0
+    for file in files:
+        try:
+            payload = await file.read(MAX_OUTBOUND_ATTACHMENT_BYTES + 1)
+        finally:
+            await file.close()
+        filename = (file.filename or "").strip()
+        if not filename:
+            raise HTTPException(400, "Every attachment must have a filename")
+        if not payload:
+            raise HTTPException(400, f"Attachment is empty: {filename}")
+        if len(payload) > MAX_OUTBOUND_ATTACHMENT_BYTES:
+            raise HTTPException(413, f"Attachment is too large: {filename}")
+        total_bytes += len(payload)
+        if total_bytes > MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES:
+            raise HTTPException(413, "Attachments exceed the total upload size limit")
+        attachments.append(
+            OutboundAttachment(
+                filename=filename,
+                content_type=file.content_type or "application/octet-stream",
+                payload=payload,
+            )
+        )
+    return tuple(attachments)
+
+
+@router.post("/admin/handoffs/{handoff_id}/send-with-attachments", status_code=202)
+async def send_handoff_reply_with_attachments(
+    handoff_id: int,
+    admin: Admin,
+    session: Session,
+    subject: Annotated[str, Form(min_length=1, max_length=998)],
+    body_text: Annotated[str, Form(min_length=1, max_length=50_000)],
+    note: Annotated[str, Form(max_length=2_000)] = "",
+    resume_automation: Annotated[bool, Form()] = False,
+    attachments: Annotated[list[UploadFile] | None, File()] = None,
+) -> dict[str, Any]:
+    uploaded = await _read_handoff_reply_attachments(attachments or [])
+    try:
+        outbox = await queue_human_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=subject,
+            body_text=body_text,
+            actor=admin,
+            note=note,
+            resume_automation=resume_automation,
+            attachments=uploaded,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-coa-draft", status_code=202)
+async def approve_prepared_coa_draft(
+    handoff_id: int,
+    request: PreparedCOAReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_coa_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-product-list-draft", status_code=202)
+async def approve_prepared_product_list_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_product_list_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.get("/admin/handoffs/{handoff_id}/prepared-product-list/download")
+async def download_prepared_product_list(
+    handoff_id: int,
+    _: Admin,
+    session: Session,
+) -> Response:
+    """Download the validated catalog preview without creating an Outbox row."""
+
+    try:
+        attachment = await prepared_product_list_attachment(
+            session,
+            handoff_id=handoff_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    encoded_filename = quote(attachment.filename, safe="")
+    return Response(
+        content=attachment.payload,
+        media_type=attachment.content_type,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-quote-draft", status_code=202)
+async def approve_prepared_quote_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_quote_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}/approve-multi-quote-draft", status_code=202)
+async def approve_prepared_multi_quote_draft(
+    handoff_id: int,
+    request: HandoffReplyRequest,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    try:
+        outbox = await queue_prepared_multi_quote_reply(
+            session,
+            handoff_id=handoff_id,
+            subject=request.subject,
+            body_text=request.body_text,
+            actor=admin,
+            note=request.note,
+            resume_automation=request.resume_automation,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "queued": outbox.status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED},
+        "outbox_id": outbox.id,
+        "status": outbox.status.value,
+    }
+
+
+@router.post("/admin/handoffs/{handoff_id}")
+async def update_handoff(
+    handoff_id: int,
+    update: HandoffUpdate,
+    admin: Admin,
+    session: Session,
+) -> dict[str, Any]:
+    handoff = await session.get(Handoff, handoff_id)
+    if handoff is None:
+        raise HTTPException(404, "Handoff not found")
+    actions = {
+        "approve",
+        "reject",
+        "resolve",
+        "pause",
+        "resume",
+        "takeover",
+        "suppress_recipient",
+    }
+    if update.action not in actions:
+        raise HTTPException(400, f"action must be one of {sorted(actions)}")
+    if update.action == "suppress_recipient":
+        try:
+            handoff = await resolve_deliverability_handoff(
+                session,
+                handoff_id=handoff.id,
+                actor=admin,
+                note=update.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"id": handoff.id, "status": handoff.status, "action": update.action}
+    handoff.status = "RESOLVED" if update.action in {"approve", "reject", "resolve"} else "OPEN"
+    handoff.resolution_note = update.note
+    if handoff.case_id:
+        case = await session.get(SalesCase, handoff.case_id)
+        if case:
+            mapping = {
+                "pause": CaseStatus.PAUSED,
+                "resume": CaseStatus.ACTIVE,
+                "takeover": CaseStatus.HUMAN_TAKEOVER,
+                "resolve": CaseStatus.ACTIVE,
+                "approve": CaseStatus.ACTIVE,
+                "reject": CaseStatus.WAITING_HUMAN,
+            }
+            case.status = mapping[update.action]
+            if update.action in {"pause", "takeover", "reject"}:
+                pending = (
+                    (
+                        await session.execute(
+                            select(Outbox).where(
+                                Outbox.case_id == case.id,
+                                Outbox.status.in_(
+                                    [
+                                        DeliveryStatus.PENDING,
+                                        DeliveryStatus.FAILED,
+                                        DeliveryStatus.CLAIMED,
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for row in pending:
+                    row.status = DeliveryStatus.CANCELLED
+                    row.last_error = f"cancelled by handoff action: {update.action}"
+    if update.action != "resume":
+        await finalize_handoff_agent_run(
+            session,
+            handoff_id=handoff.id,
+            actor=admin,
+            outcome=f"handoff-{update.action}",
+            cancelled=update.action in {"pause", "takeover", "reject"},
+        )
+    session.add(
+        AuditEvent(
+            case_id=handoff.case_id,
+            actor=admin,
+            event_type="handoff.action",
+            data={
+                "handoff_id": handoff.id,
+                "action": update.action,
+                "note": update.note,
+            },
+        )
+    )
+    await session.commit()
+    return {"id": handoff.id, "status": handoff.status, "action": update.action}
+
+
+@router.post("/admin/templates/regenerate")
+async def regenerate_templates(_: Admin) -> dict[str, str]:
+    generate_templates(Path("assets/import_templates"))
+    return {"status": "generated"}

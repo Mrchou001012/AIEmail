@@ -1,0 +1,351 @@
+import pytest
+
+from app.inbound.auto_replies import AutomatedReplyType, classify_automated_reply
+from app.inbound.inbound_disposition import (
+    InboundDispositionType,
+    classify_inbound_disposition,
+)
+
+
+def test_departed_extracts_contextual_replacement_and_forwarded_state() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Example Chemicals",
+        body=(
+            "Former Contact is no longer employed here. Please direct any future "
+            "correspondence to Replacement Contact at replacement@film-maker.example. "
+            "This email has been automatically forwarded to Replacement Contact."
+        ),
+        headers={"Auto-Submitted": "auto-replied"},
+        sender="former@film-maker.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.DEPARTED
+    assert result.replacement_emails == ("replacement@film-maker.example",)
+    assert result.forwarded_to_replacement is True
+    assert result.continue_business_processing is False
+
+
+def test_signature_address_is_not_a_replacement_contact() -> None:
+    result = classify_automated_reply(
+        subject="Re: Checking in from Example Chemicals",
+        body=(
+            "Please share your product list.\n\n"
+            "Thanks,\nTaylor Sender\nEmail: replacement@pharma-buyer.example"
+        ),
+        sender="purchasing@pharma-buyer.example",
+    )
+
+    assert result.reply_type is None
+    assert result.replacement_emails == ()
+
+
+def test_quoted_history_address_is_not_a_replacement_contact() -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Checking in from Example Chemicals",
+        body=(
+            "We will review and contact you if needed.\n\n"
+            "On Mon, 31 Aug 2026, demo.agent@example.org wrote:\n"
+            "Please contact purchasing@example.com."
+        ),
+        sender="buyer@example.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.BUSINESS
+    assert result.replacement_emails == ()
+
+
+def test_failure_notification_does_not_create_contact_referrals() -> None:
+    result = classify_inbound_disposition(
+        subject="Failure Notification",
+        body=(
+            "DO NOT REPLY TO THIS EMAIL - THIS IS AN AUTOMATED SERVER NOT "
+            "RESPONDING TO E-MAIL COMMUNICATIONS. Dear Supplier: We regret to "
+            "inform you that your e-mail was not processed. Please submit invoices "
+            "by email to ap_china@example.com, ap_hongkong@example.com, and "
+            "ap_india@example.com."
+        ),
+        sender="dfm@customer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.SYSTEM_NOTIFICATION
+    assert result.replacement_emails == ()
+
+
+def test_leave_of_absence_with_backup_stays_temporary() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Example Chemicals",
+        body=(
+            "I am currently on a leave of absence. Please contact Jared Straley "
+            "at replacement@science-buyer.example for help in directing your inquiry."
+        ),
+        sender="former@science-buyer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE
+    assert result.automated_reply_type is AutomatedReplyType.OUT_OF_OFFICE
+    assert result.replacement_emails == ("replacement@science-buyer.example",)
+
+
+def test_office_closure_stays_temporary_not_contact_change() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Example Chemicals",
+        body=(
+            "Thank you for your email. Our offices are closed from 3rd to 21st August. "
+            "We will respond upon our return. For urgent matters, please contact "
+            "mario@example.com."
+        ),
+        sender="barbara@example.com",
+    )
+
+    assert result.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE
+    assert result.return_hint == "21st August"
+
+
+def test_away_until_date_is_captured() -> None:
+    result = classify_inbound_disposition(
+        subject="Leave- Till April 30th Re: Checking in from Example Chemicals",
+        body=(
+            "I will be away from office till July 30th, 2026. In case of any "
+            "queries, please contact Replacement Contact at replacement@life-sciences.example."
+        ),
+        sender="former@life-sciences.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.TEMPORARY_ABSENCE
+    assert result.return_hint == "July 30th, 2026"
+
+
+def test_no_longer_associated_is_departed() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Example Chemicals",
+        body=(
+            "Former Contact is no longer associated with Example Health Products Ltd. "
+            "For procurement matters, kindly direct correspondence to Replacement Contact "
+            "at replacement@health-products.example."
+        ),
+        sender="former@health-products.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.DEPARTED
+    assert result.replacement_emails == ("replacement@health-products.example",)
+
+
+def test_explicit_logistics_provider_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Checking in from Example Chemicals",
+        body=(
+            "Thank you for your email. I am a logistics service provider; "
+            "if you have any shipments, we can assist you."
+        ),
+        sender="buyer@glass-maker.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "LOGISTICS_SERVICE_PROVIDER"
+
+
+def test_supplier_price_offer_is_non_target_sales_contact() -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Product inquiry",
+        body=(
+            "Dear Priya,\nThe updated price of this week could be CIF Nhava "
+            "Sheva, India USD5.40/kg, may I ask is it workable for you?\n"
+            "Looking forward to hearing from you soon."
+        ),
+        sender="buyer@chemical-trader.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_supplier_registration_outreach_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="INTRODUCTION OF EXAMPLE METAL SUPPLIER",
+        body=(
+            "Subject: Request for Supplier Registration: Stainless Steel Products. "
+            "We are leading exporters, manufacturer, and stockist of industrial "
+            "raw materials."
+        ),
+        sender="sales@metal-supplier.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_supplier_registration_subject_inside_body_is_not_treated_as_history() -> None:
+    result = classify_inbound_disposition(
+        subject="INTRODUCTION OF EXAMPLE METAL SUPPLIER",
+        body=(
+            "Kind Attn: Purchase Manager.\n\n"
+            "Subject: Request for Supplier Registration: Stainless Steel Products.\n"
+            "We are leading exporters, manufacturer, and stockist of industrial "
+            "raw materials."
+        ),
+        sender="sales@metal-supplier.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_explicit_manufacturer_sales_outreach_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="Introduction to Our Industrial Valve Solutions",
+        body=(
+            "We are a manufacturer of high-quality industrial valves. If you're "
+            "looking for reliable valve solutions, we would love to discuss how "
+            "we can support your needs."
+        ),
+        sender="sales@valves.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+def test_explicit_supplier_price_offer_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="GENERAL REAGENT OFFER",
+        body=(
+            "Presently we can offer, subject to confirmation: USD 3700/mt. "
+            "Terms CIF Nhava Sheva and shipment in three weeks."
+        ),
+        sender="marketing@supplier.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SUPPLIER_VENDOR"
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["example.com", "example.org", "example.net"],
+)
+def test_internal_sender_is_always_flagged_for_review(domain: str) -> None:
+    result = classify_inbound_disposition(
+        subject="Inquiry for DEMO-P200",
+        body="Please quote 1000 kg DEMO-P200 instead.",
+        sender=f"internal-test@{domain}",
+        internal_domains={"example.com", "example.org", "example.net"},
+    )
+
+    assert result.disposition_type is InboundDispositionType.UNCERTAIN
+    assert "INTERNAL_SENDER_REQUIRES_REVIEW" in result.normalization_notes
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Give me current best rate.",
+        "Dear Madam, May you confirm the items names? Regards, Amit",
+    ],
+)
+def test_explicit_business_request_is_stable(body: str) -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Checking in from Example Chemicals",
+        body=body,
+        sender="buyer@customer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.BUSINESS
+    assert "EXPLICIT_BUSINESS_REQUEST" in result.normalization_notes
+
+
+def test_departed_message_collects_order_and_assistance_contacts() -> None:
+    result = classify_inbound_disposition(
+        subject="Automatic reply: Checking in from Example Chemicals",
+        body=(
+            "The person you are trying to reach is no longer employed. "
+            "To place an order, please send your order to orders@order-desk.example. "
+            "If you need assistance, please send your email to Bob Clinger "
+            "help-one@distributor.example or Support Contact "
+            "help-two@distributor.example."
+        ),
+        sender="former@distributor.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.DEPARTED
+    assert result.replacement_emails == (
+        "orders@order-desk.example",
+        "help-one@distributor.example",
+        "help-two@distributor.example",
+    )
+
+
+def test_explicit_professional_service_provider_is_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="ISO Certification and Surveillance Services",
+        body=(
+            "We are a professional service provider offering ISO certification, "
+            "compliance, consultancy, and management training services."
+        ),
+        sender="sales@certification.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.NON_TARGET
+    assert result.non_target_reason == "SERVICE_PROVIDER"
+
+
+def test_rejected_named_contact_is_not_customer_level_non_target() -> None:
+    result = classify_inbound_disposition(
+        subject="RE: Checking in from Example Chemicals",
+        body=(
+            "KINDLY NOTE THERE IS NO MICHEL IN OUR COMPANY, THERE ARE MANY "
+            "FAKE COMPANIES WHO ARE USING OUR NAME, BE AWARE"
+        ),
+        sender="marketing@exporter.example",
+    )
+
+    assert (
+        result.disposition_type
+        is InboundDispositionType.CONTACT_IDENTITY_MISMATCH
+    )
+    assert result.non_target_reason is None
+
+
+def test_human_departure_and_product_request_continues_business_processing() -> None:
+    result = classify_inbound_disposition(
+        subject="Checking in from Example Chemicals",
+        body=(
+            "Ms. Pooja no longer works in our company. Please send us your product list."
+        ),
+        sender="reply@buyer-company.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.DEPARTED
+    assert result.product_list_requested is True
+    assert result.automated_transport_signal is False
+    assert result.continue_business_processing is True
+
+
+def test_human_forwarded_message_keeps_the_named_colleague_address() -> None:
+    result = classify_inbound_disposition(
+        subject="Re: Checking in from Example Chemicals",
+        body=(
+            "I have forwarded your email to our procurement colleague. "
+            "Please contact Maya at maya@customer.example for future inquiries."
+        ),
+        sender="manager@customer.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.FORWARDED_TO_COLLEAGUE
+    assert result.forwarded_to_replacement is True
+    assert result.replacement_emails == ("maya@customer.example",)
+
+
+def test_marked_copy_is_already_forwarded_even_without_body_email() -> None:
+    result = classify_inbound_disposition(
+        subject="RE: Checking in from Example Chemicals",
+        body=(
+            "Mr Girish Dalal has retired and Mr Replacement Contact is now your contact "
+            "point. I have marked copy to Morgan in this communication. Please "
+            "get in touch with him."
+        ),
+        sender="former@adhesives.example",
+    )
+
+    assert result.disposition_type is InboundDispositionType.FORWARDED_TO_COLLEAGUE
+    assert result.forwarded_to_replacement is True
+    assert result.replacement_emails == ()
